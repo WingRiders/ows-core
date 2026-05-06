@@ -2,11 +2,11 @@ mod audit;
 mod commands;
 mod vault;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ows_core::OwsError;
 use ows_signer::hd::HdError;
 use ows_signer::mnemonic::MnemonicError;
-use ows_signer::{CryptoError, SignerError};
+use ows_signer::{CryptoError, Curve, SignerError};
 
 /// Open Wallet Standard CLI
 #[derive(Parser)]
@@ -32,6 +32,21 @@ enum Commands {
     Mnemonic {
         #[command(subcommand)]
         subcommand: MnemonicCommands,
+    },
+    /// Derive a raw private key from mnemonic inputs
+    Derive {
+        /// BIP-39 mnemonic phrase
+        #[arg(long)]
+        mnemonic: String,
+        /// BIP-39 passphrase (empty by default)
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        /// Derivation path (e.g. m/44'/60'/0'/0/0)
+        #[arg(long)]
+        path: String,
+        /// Curve for derivation
+        #[arg(long, value_enum)]
+        curve: DeriveCurve,
     },
     /// Fund a wallet with USDC via MoonPay
     Fund {
@@ -341,6 +356,23 @@ enum ConfigCommands {
     Show,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DeriveCurve {
+    Secp256k1,
+    Ed25519,
+    Ed25519Bip32,
+}
+
+impl From<DeriveCurve> for Curve {
+    fn from(value: DeriveCurve) -> Self {
+        match value {
+            DeriveCurve::Secp256k1 => Curve::Secp256k1,
+            DeriveCurve::Ed25519 => Curve::Ed25519,
+            DeriveCurve::Ed25519Bip32 => Curve::Ed25519Bip32,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("{0}")]
@@ -491,6 +523,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 commands::derive::run(chain.as_deref(), index)
             }
         },
+        Commands::Derive {
+            mnemonic,
+            passphrase,
+            path,
+            curve,
+        } => commands::derive_key::run(&mnemonic, &passphrase, &path, curve.into()),
         Commands::Policy { subcommand } => match subcommand {
             PolicyCommands::Create { file } => commands::policy::create(&file),
             PolicyCommands::List => commands::policy::list(),
