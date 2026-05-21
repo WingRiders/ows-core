@@ -134,11 +134,11 @@ describe('@open-wallet-standard/core', () => {
     assert.equal(wallet.accounts.length, 12, 'should have all 12 chain accounts');
 
     // Sign on EVM (provided key's curve)
-    const evmSig = signMessage('pk-secp', 'evm', 'hello', undefined, undefined, undefined, vaultDir);
+    const evmSig = signMessage('pk-secp', 'evm', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(evmSig.signature.length > 0);
 
     // Sign on Solana (generated key's curve)
-    const solSig = signMessage('pk-secp', 'solana', 'hello', undefined, undefined, undefined, vaultDir);
+    const solSig = signMessage('pk-secp', 'solana', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(solSig.signature.length > 0);
 
     // Export returns JSON with both keys
@@ -158,15 +158,15 @@ describe('@open-wallet-standard/core', () => {
     assert.equal(wallet.accounts.length, 12);
 
     // Sign on Solana (provided key)
-    const solSig = signMessage('pk-ed', 'solana', 'hello', undefined, undefined, undefined, vaultDir);
+    const solSig = signMessage('pk-ed', 'solana', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(solSig.signature.length > 0);
 
     // Sign on EVM (generated key)
-    const evmSig = signMessage('pk-ed', 'evm', 'hello', undefined, undefined, undefined, vaultDir);
+    const evmSig = signMessage('pk-ed', 'evm', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(evmSig.signature.length > 0);
 
     // Sign on TON (same ed25519 key)
-    const tonSig = signMessage('pk-ed', 'ton', 'hello', undefined, undefined, undefined, vaultDir);
+    const tonSig = signMessage('pk-ed', 'ton', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(tonSig.signature.length > 0);
 
     deleteWallet('pk-ed', vaultDir);
@@ -186,11 +186,11 @@ describe('@open-wallet-standard/core', () => {
     assert.equal(wallet.accounts.length, 12, 'should have all 12 chain accounts');
 
     // Sign on EVM (secp256k1 key)
-    const evmSig = signMessage('pk-both', 'evm', 'hello', undefined, undefined, undefined, vaultDir);
+    const evmSig = signMessage('pk-both', 'evm', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(evmSig.signature.length > 0);
 
     // Sign on Solana (ed25519 key)
-    const solSig = signMessage('pk-both', 'solana', 'hello', undefined, undefined, undefined, vaultDir);
+    const solSig = signMessage('pk-both', 'solana', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.ok(solSig.signature.length > 0);
 
     // Export returns both provided keys
@@ -210,7 +210,7 @@ describe('@open-wallet-standard/core', () => {
     // support generic off-chain message signing without a defined convention.
     // NEAR's V1 sign_message is raw ed25519 over the bytes (NEP-413 is a follow-up).
     for (const chain of ['evm', 'solana', 'sui', 'bitcoin', 'cosmos', 'tron', 'ton', 'filecoin', 'near']) {
-      const result = signMessage('all-chain-signer', chain, 'test', undefined, undefined, undefined, vaultDir);
+      const result = signMessage('all-chain-signer', chain, 'test', undefined, undefined, undefined, undefined, vaultDir);
       assert.ok(result.signature.length > 0, `signature should be non-empty for ${chain}`);
     }
 
@@ -282,8 +282,8 @@ describe('@open-wallet-standard/core', () => {
   it('produces deterministic signatures', () => {
     createWallet('det-test', undefined, 12, vaultDir);
 
-    const sig1 = signMessage('det-test', 'evm', 'hello', undefined, undefined, undefined, vaultDir);
-    const sig2 = signMessage('det-test', 'evm', 'hello', undefined, undefined, undefined, vaultDir);
+    const sig1 = signMessage('det-test', 'evm', 'hello', undefined, undefined, undefined, undefined, vaultDir);
+    const sig2 = signMessage('det-test', 'evm', 'hello', undefined, undefined, undefined, undefined, vaultDir);
     assert.equal(sig1.signature, sig2.signature);
 
     deleteWallet('det-test', vaultDir);
@@ -299,7 +299,7 @@ describe('@open-wallet-standard/core', () => {
 
   it('rejects non-existent wallet', () => {
     assert.throws(() => getWallet('nonexistent', vaultDir));
-    assert.throws(() => signMessage('nonexistent', 'evm', 'x', undefined, undefined, undefined, vaultDir));
+    assert.throws(() => signMessage('nonexistent', 'evm', 'x', undefined, undefined, undefined, undefined, vaultDir));
   });
 
   it('rejects invalid private key hex', () => {
@@ -389,6 +389,7 @@ describe('@open-wallet-standard/core', () => {
       key.token,
       undefined,
       undefined,
+      undefined,
       vaultDir,
     );
     assert.ok(msgSig.signature.length > 0);
@@ -454,7 +455,7 @@ describe('@open-wallet-standard/core', () => {
     });
 
     // Sign on allowed chain — should succeed
-    const sig = signTypedData(wallet.id, 'base', typedDataJson, key.token, null, vaultDir);
+    const sig = signTypedData(wallet.id, 'base', typedDataJson, key.token, null, null, vaultDir);
     assert.ok(sig.signature.length > 0, 'signature should be non-empty');
     assert.ok(sig.recoveryId != null, 'recoveryId should be present for EIP-712');
 
@@ -466,7 +467,7 @@ describe('@open-wallet-standard/core', () => {
       domain: { ...JSON.parse(typedDataJson).domain, chainId: 1 },
     });
     assert.throws(
-      () => signTypedData(wallet.id, 'ethereum', ethTypedDataJson, key.token, null, vaultDir),
+      () => signTypedData(wallet.id, 'ethereum', ethTypedDataJson, key.token, null, null, vaultDir),
       (err) => err.message.includes('not in allowlist'),
     );
 
@@ -524,6 +525,7 @@ describe('@open-wallet-standard/core', () => {
       JSON.stringify(typedData),
       key.token,
       null,
+      null,
       vaultDir,
     );
     assert.ok(allowed.signature.length > 0);
@@ -537,7 +539,7 @@ describe('@open-wallet-standard/core', () => {
     };
 
     assert.throws(
-      () => signTypedData(wallet.id, 'base', JSON.stringify(deniedTypedData), key.token, null, vaultDir),
+      () => signTypedData(wallet.id, 'base', JSON.stringify(deniedTypedData), key.token, null, null, vaultDir),
       (err) => err.message.includes('not in allowed list'),
     );
 
