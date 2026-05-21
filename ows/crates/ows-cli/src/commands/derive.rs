@@ -1,5 +1,5 @@
 use ows_core::universal_wallet_chains;
-use ows_signer::{signer_for_chain, HdDeriver, Mnemonic};
+use ows_signer::{signer_for_chain, Mnemonic};
 use zeroize::Zeroize;
 
 use crate::{parse_chain, CliError};
@@ -13,10 +13,8 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
         // Derive for a single chain
         let chain = parse_chain(cs)?;
         let signer = signer_for_chain(&chain);
-        let path = signer.default_derivation_path(index);
-        let curve = signer.curve();
 
-        let key = HdDeriver::derive_from_mnemonic_cached(&mnemonic, "", &path, curve)?;
+        let key = signer.derive_key_material(&mnemonic, index)?;
         let address = signer.derive_address(key.expose())?;
 
         println!("{address}");
@@ -24,10 +22,8 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
         // Derive for all universal-wallet networks (see `ows_core::universal_wallet_chains`)
         for chain in universal_wallet_chains() {
             let signer = signer_for_chain(&chain);
-            let path = signer.default_derivation_path(index);
-            let curve = signer.curve();
 
-            let key = HdDeriver::derive_from_mnemonic_cached(&mnemonic, "", &path, curve)?;
+            let key = signer.derive_key_material(&mnemonic, index)?;
             let address = signer.derive_address(key.expose())?;
 
             println!("{} → {}", chain.chain_id, address);

@@ -7,8 +7,8 @@ use ows_core::{
     UNIVERSAL_WALLET_ACCOUNT_COUNT,
 };
 use ows_signer::{
-    decrypt, encrypt, signer_for_chain, signer_for_chain_type, CryptoEnvelope, Curve, HdDeriver,
-    Mnemonic, MnemonicStrength, SecretBytes,
+    decrypt, encrypt, signer_for_chain, signer_for_chain_type, CryptoEnvelope, Curve, Mnemonic,
+    MnemonicStrength, SecretBytes,
 };
 
 use crate::error::OwsLibError;
@@ -44,8 +44,7 @@ fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAcco
         let signer = signer_for_chain(&chain);
         // TODO: Cardano addresses are derived using multiple paths, consider storing all paths in WalletAccount
         let path = signer.default_derivation_path(index);
-        let curve = signer.curve();
-        let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve)?;
+        let key = signer.derive_key_material(mnemonic, index)?;
         let address = signer.derive_address(key.expose())?;
         let account_id = format!("{}:{}", chain.chain_id, address);
         accounts.push(WalletAccount {
@@ -174,11 +173,7 @@ pub(crate) fn secret_to_signing_key(
             })?;
             let mnemonic = Mnemonic::from_phrase(phrase)?;
             let signer = signer_for_chain_type(chain_type);
-            let path = signer.default_derivation_path(index.unwrap_or(0));
-            let curve = signer.curve();
-            Ok(HdDeriver::derive_from_mnemonic_cached(
-                &mnemonic, "", &path, curve,
-            )?)
+            Ok(signer.derive_key_material(&mnemonic, index.unwrap_or(0))?)
         }
         KeyType::PrivateKey => {
             // JSON key pair — extract the right key for this chain's curve
@@ -222,10 +217,8 @@ pub fn derive_address(
     let chain = parse_chain(chain)?;
     let mnemonic = Mnemonic::from_phrase(mnemonic_phrase)?;
     let signer = signer_for_chain(&chain);
-    let path = signer.default_derivation_path(index.unwrap_or(0));
-    let curve = signer.curve();
 
-    let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, curve)?;
+    let key = signer.derive_key_material(&mnemonic, index.unwrap_or(0))?;
     let address = signer.derive_address(key.expose())?;
     Ok(address)
 }

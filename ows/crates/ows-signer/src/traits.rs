@@ -1,4 +1,4 @@
-use crate::curve::Curve;
+use crate::{curve::Curve, HdDeriver, Mnemonic, SecretBytes};
 use ows_core::policy::TransactionContext;
 use ows_core::ChainType;
 
@@ -92,6 +92,18 @@ pub trait ChainSigner: Send + Sync {
 
     /// Returns the default BIP-44 derivation path template for this chain.
     fn default_derivation_path(&self, index: u32) -> String;
+
+    fn derive_key_material(
+        &self,
+        mnemonic: &Mnemonic,
+        index: u32,
+    ) -> Result<SecretBytes, SignerError> {
+        let path = self.default_derivation_path(index);
+        let curve = self.curve();
+        let key = HdDeriver::derive_from_mnemonic_cached(mnemonic, "", &path, curve)
+            .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))?;
+        Ok(key)
+    }
 }
 
 /// Errors that can occur during signing operations.

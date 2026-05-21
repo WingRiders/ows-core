@@ -42,10 +42,8 @@ mod integration_tests {
 
     fn derive_address_for_chain(mnemonic: &Mnemonic, chain: ChainType) -> String {
         let signer = signer_for_chain_type(chain);
-        let curve = signer.curve();
-        let path = signer.default_derivation_path(0);
 
-        let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve).unwrap();
+        let key = signer.derive_key_material(mnemonic, 0).unwrap();
         signer.derive_address(key.expose()).unwrap()
     }
 
