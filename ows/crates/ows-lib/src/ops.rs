@@ -42,6 +42,7 @@ fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAcco
     for ct in &ALL_CHAIN_TYPES {
         let chain = default_chain_for_type(*ct);
         let signer = signer_for_chain(*ct);
+        // TODO: Cardano addresses are derived using multiple paths, consider storing all paths in WalletAccount
         let path = signer.default_derivation_path(index);
         let curve = signer.curve();
         let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve)?;
@@ -57,11 +58,34 @@ fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAcco
     Ok(accounts)
 }
 
+fn random_32() -> Result<Vec<u8>, OwsLibError> {
+    let mut b = vec![0u8; 32];
+    getrandom::getrandom(&mut b)
+        .map_err(|e| OwsLibError::InvalidInput(format!("failed to generate random key: {e}")))?;
+    Ok(b)
+}
+
+fn random_ed25519_bip32_key() -> Result<[u8; ed25519_bip32::XPRV_SIZE], OwsLibError> {
+    let mut key = [0u8; ed25519_bip32::XPRV_SIZE];
+    getrandom::getrandom(&mut key).map_err(|e| {
+        OwsLibError::InvalidInput(format!("failed to generate random Ed25519-BIP32 key: {e}"))
+    })?;
+
+    Ok(ed25519_bip32::XPrv::normalize_bytes_force3rd(key).into())
+}
+
+fn random_ed25519_bip32() -> Result<Vec<u8>, OwsLibError> {
+    let payment_key = random_ed25519_bip32_key()?;
+    let stake_key = random_ed25519_bip32_key()?;
+    Ok([payment_key, stake_key].concat())
+}
+
 /// A key pair: one key per curve.
 /// Private key material is zeroized on drop.
 struct KeyPair {
     secp256k1: Vec<u8>,
     ed25519: Vec<u8>,
+    ed25519_bip32: Vec<u8>,
 }
 
 impl Drop for KeyPair {
@@ -69,6 +93,7 @@ impl Drop for KeyPair {
         use zeroize::Zeroize;
         self.secp256k1.zeroize();
         self.ed25519.zeroize();
+        self.ed25519_bip32.zeroize();
     }
 }
 
@@ -78,6 +103,7 @@ impl KeyPair {
         match curve {
             ows_signer::Curve::Secp256k1 => &self.secp256k1,
             ows_signer::Curve::Ed25519 => &self.ed25519,
+            ows_signer::Curve::Ed25519Bip32 => &self.ed25519_bip32,
         }
     }
 
@@ -86,6 +112,7 @@ impl KeyPair {
         let obj = serde_json::json!({
             "secp256k1": hex::encode(&self.secp256k1),
             "ed25519": hex::encode(&self.ed25519),
+            "ed25519_bip32": hex::encode(&self.ed25519_bip32),
         });
         obj.to_string().into_bytes()
     }
@@ -101,11 +128,17 @@ impl KeyPair {
         let ed = obj["ed25519"]
             .as_str()
             .ok_or_else(|| OwsLibError::InvalidInput("missing ed25519 key".into()))?;
+        // using an empty string as the default value for backwards compatibility with wallets that were imported with only secp256k1 and ed25519 private keys
+        let ed_bip32 = obj["ed25519_bip32"].as_str().unwrap_or("");
+
         Ok(KeyPair {
             secp256k1: hex::decode(secp)
                 .map_err(|e| OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}")))?,
             ed25519: hex::decode(ed)
                 .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
+            ed25519_bip32: hex::decode(ed_bip32).map_err(|e| {
+                OwsLibError::InvalidInput(format!("invalid ed25519_bip32 hex: {e}"))
+            })?,
         })
     }
 }
@@ -152,7 +185,17 @@ pub(crate) fn secret_to_signing_key(
             // JSON key pair — extract the right key for this chain's curve
             let keys = KeyPair::from_json_bytes(secret.expose())?;
             let signer = signer_for_chain(chain_type);
-            Ok(SecretBytes::from_slice(keys.key_for_curve(signer.curve())))
+            let key = keys.key_for_curve(signer.curve());
+
+            // if the key for the requested curve is empty, it means that the wallet was imported using private keys before the support for the requested curve was added
+            if key.is_empty() {
+                return Err(OwsLibError::InvalidInput(format!(
+                    "Private key for chain {} is empty",
+                    chain_type
+                )));
+            }
+
+            Ok(SecretBytes::from_slice(key))
         }
     }
 }
@@ -274,12 +317,11 @@ fn decode_hex_key(hex_str: &str) -> Result<Vec<u8>, OwsLibError> {
 
 /// Import a wallet from a hex-encoded private key.
 /// The `chain` parameter specifies which chain the key originates from (e.g. "evm", "solana").
-/// A random key is generated for the other curve so all 6 chains are supported.
+/// A random key is generated for each curve that is not supplied explicitly or via `private_key_hex`.
 ///
-/// Alternatively, provide both `secp256k1_key_hex` and `ed25519_key_hex` to supply
-/// explicit keys for each curve. When both are given, `private_key_hex` and `chain`
-/// are ignored. When only one curve key is given alongside `private_key_hex`, it
-/// overrides the random generation for that curve.
+/// For each curve, the key is chosen in order: `secp256k1_key_hex` / `ed25519_key_hex` /
+/// `ed25519_bip32_key_hex` if set; else `private_key_hex` when `chain` maps to that curve; else a random key.
+#[allow(clippy::too_many_arguments)]
 pub fn import_wallet_private_key(
     name: &str,
     private_key_hex: &str,
@@ -288,6 +330,7 @@ pub fn import_wallet_private_key(
     vault_path: Option<&Path>,
     secp256k1_key_hex: Option<&str>,
     ed25519_key_hex: Option<&str>,
+    ed25519_bip32_key_hex: Option<&str>,
 ) -> Result<WalletInfo, OwsLibError> {
     let passphrase = passphrase.unwrap_or("");
 
@@ -295,48 +338,45 @@ pub fn import_wallet_private_key(
         return Err(OwsLibError::WalletNameExists(name.to_string()));
     }
 
-    let keys = match (secp256k1_key_hex, ed25519_key_hex) {
-        // Both curve keys explicitly provided — use them directly
-        (Some(secp_hex), Some(ed_hex)) => KeyPair {
-            secp256k1: decode_hex_key(secp_hex)?,
-            ed25519: decode_hex_key(ed_hex)?,
-        },
-        // Existing single-key behavior
-        _ => {
-            let key_bytes = decode_hex_key(private_key_hex)?;
+    let private_key = (!private_key_hex.is_empty())
+        .then(|| decode_hex_key(private_key_hex))
+        .transpose()?;
 
-            // Determine curve from the source chain (default: secp256k1)
-            let source_curve = match chain {
-                Some(c) => {
-                    let parsed = parse_chain(c)?;
-                    signer_for_chain(parsed.chain_type).curve()
+    let source_curve = chain
+        .map(|c| parse_chain(c).map(|parsed| signer_for_chain(parsed.chain_type).curve()))
+        .transpose()?
+        .unwrap_or(ows_signer::Curve::Secp256k1);
+
+    let get_key = |key_hex: Option<&str>,
+                   curve: ows_signer::Curve,
+                   generate_random: fn() -> Result<Vec<u8>, OwsLibError>| {
+        key_hex.map(decode_hex_key).transpose()?.map_or_else(
+            || {
+                if curve == source_curve {
+                    private_key
+                        .as_ref()
+                        .cloned()
+                        .map_or_else(generate_random, Ok)
+                } else {
+                    generate_random()
                 }
-                None => ows_signer::Curve::Secp256k1,
-            };
+            },
+            Ok,
+        )
+    };
 
-            // Build key pair: provided key for its curve, random 32 bytes for the other
-            let mut other_key = vec![0u8; 32];
-            getrandom::getrandom(&mut other_key).map_err(|e| {
-                OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
-            })?;
+    let secp256k1 = get_key(secp256k1_key_hex, ows_signer::Curve::Secp256k1, random_32)?;
+    let ed25519 = get_key(ed25519_key_hex, ows_signer::Curve::Ed25519, random_32)?;
+    let ed25519_bip32 = get_key(
+        ed25519_bip32_key_hex,
+        ows_signer::Curve::Ed25519Bip32,
+        random_ed25519_bip32,
+    )?;
 
-            match source_curve {
-                ows_signer::Curve::Secp256k1 => KeyPair {
-                    secp256k1: key_bytes,
-                    ed25519: ed25519_key_hex
-                        .map(decode_hex_key)
-                        .transpose()?
-                        .unwrap_or(other_key),
-                },
-                ows_signer::Curve::Ed25519 => KeyPair {
-                    secp256k1: secp256k1_key_hex
-                        .map(decode_hex_key)
-                        .transpose()?
-                        .unwrap_or(other_key),
-                    ed25519: key_bytes,
-                },
-            }
-        }
+    let keys = KeyPair {
+        secp256k1,
+        ed25519,
+        ed25519_bip32,
     };
 
     let accounts = derive_all_accounts_from_keys(&keys)?;
@@ -379,7 +419,7 @@ pub fn delete_wallet(name_or_id: &str, vault_path: Option<&Path>) -> Result<(), 
 }
 
 /// Export a wallet's secret.
-/// Mnemonic wallets return the phrase. Private key wallets return JSON with both keys.
+/// Mnemonic wallets return the phrase. Private key wallets return JSON with all keys.
 pub fn export_wallet(
     name_or_id: &str,
     passphrase: Option<&str>,
@@ -1110,13 +1150,15 @@ mod tests {
     ) -> WalletInfo {
         let key_bytes = hex::decode(privkey_hex).unwrap();
 
-        // Generate a random ed25519 key for the other curve
+        // Generate random keys for the other curves
         let mut ed_key = vec![0u8; 32];
         getrandom::getrandom(&mut ed_key).unwrap();
+        let ed_bip32 = random_ed25519_bip32().unwrap();
 
         let keys = KeyPair {
             secp256k1: key_bytes,
             ed25519: ed_key,
+            ed25519_bip32: ed_bip32,
         };
         let accounts = derive_all_accounts_from_keys(&keys).unwrap();
         let payload = keys.to_json_bytes();
@@ -1449,6 +1491,7 @@ mod tests {
             Some(vault),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1467,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn privkey_wallet_import_both_curve_keys() {
+    fn privkey_wallet_import_secp_and_ed_curve_keys() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
 
@@ -1475,13 +1518,14 @@ mod tests {
         let ed_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 
         let info = import_wallet_private_key(
-            "pk-both",
-            "",   // ignored when both curve keys provided
-            None, // chain ignored too
+            "pk-secp-and-ed",
+            "",
+            None,
             None,
             Some(vault),
             Some(secp_key),
             Some(ed_key),
+            None, // ed25519_bip32 will be randomly generated
         )
         .unwrap();
 
@@ -1492,19 +1536,92 @@ mod tests {
         );
 
         // Sign on EVM (secp256k1)
-        let sig = sign_message("pk-both", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-secp-and-ed",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Sign on Solana (ed25519)
-        let sig =
-            sign_message("pk-both", "solana", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-secp-and-ed",
+            "solana",
+            "hello",
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
-        // Export should return both keys
-        let exported = export_wallet("pk-both", None, Some(vault)).unwrap();
+        let exported = export_wallet("pk-secp-and-ed", None, Some(vault)).unwrap();
         let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
         assert_eq!(obj["secp256k1"].as_str().unwrap(), secp_key);
         assert_eq!(obj["ed25519"].as_str().unwrap(), ed_key);
+        assert_eq!(
+            obj["ed25519_bip32"].as_str().unwrap().len(),
+            ed25519_bip32::XPRV_SIZE * 2 * 2
+        );
+    }
+
+    #[test]
+    fn privkey_wallet_import_three_explicit_curve_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let secp_key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let ed_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let ed_bip32_key = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+
+        import_wallet_private_key(
+            "pk-all-explicit",
+            "",
+            None,
+            None,
+            Some(vault),
+            Some(secp_key),
+            Some(ed_key),
+            Some(ed_bip32_key),
+        )
+        .unwrap();
+
+        let exported = export_wallet("pk-all-explicit", None, Some(vault)).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(obj["secp256k1"].as_str().unwrap(), secp_key);
+        assert_eq!(obj["ed25519"].as_str().unwrap(), ed_key);
+        assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), ed_bip32_key);
+    }
+
+    #[test]
+    fn privkey_wallet_import_single_curve_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let ed_bip32_key = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+
+        import_wallet_private_key(
+            "pk-evm-plus-bip32",
+            TEST_PRIVKEY,
+            Some("evm"),
+            None,
+            Some(vault),
+            None,
+            None, // ed25519 will be randomly generated
+            Some(ed_bip32_key),
+        )
+        .unwrap();
+
+        let exported = export_wallet("pk-evm-plus-bip32", None, Some(vault)).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(obj["secp256k1"].as_str().unwrap(), TEST_PRIVKEY);
+        assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), ed_bip32_key);
     }
 
     // ================================================================
@@ -1686,6 +1803,7 @@ mod tests {
             Some("evm"),
             None,
             Some(dir.path()),
+            None,
             None,
             None,
         )
@@ -2273,6 +2391,7 @@ mod tests {
             Some("evm"),
             None,
             Some(vault),
+            None,
             None,
             None,
         )
