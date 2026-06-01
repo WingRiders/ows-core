@@ -50,6 +50,8 @@ pub fn signer_for_chain(chain: &Chain) -> Result<Box<dyn ChainSigner>, SignerErr
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
         ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)?),
+        // Midnight signer is added in the following commit.
+        ChainType::Midnight => unimplemented!("Midnight signer not yet implemented"),
     })
 }
 
