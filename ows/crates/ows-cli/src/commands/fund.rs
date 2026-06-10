@@ -11,9 +11,15 @@ fn find_account_for_chain<'a>(
     let parsed_chain =
         parse_chain(chain).map_err(|e| CliError::InvalidArgs(format!("unknown chain: {e}")))?;
 
+    // Prefer the account derived for this exact chain, then the family's: an EVM address is the
+    // same on every EVM chain and the stored Midnight address is re-encoded per network, so one
+    // account answers for the whole family. Only Cardano derives an account per network.
+    let namespace = format!("{}:", parsed_chain.chain_type.namespace());
+
     accounts
         .iter()
         .find(|a| a.chain_id == parsed_chain.chain_id)
+        .or_else(|| accounts.iter().find(|a| a.chain_id.starts_with(&namespace)))
         .ok_or_else(|| {
             CliError::InvalidArgs(format!("wallet has no account for chain \"{chain}\""))
         })
