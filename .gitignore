@@ -1,6 +1,10 @@
 # Rust
 **/target/
-.claude
+.claude/*
+!.claude/context/
+.claude/context/*
+!.claude/context/midnight/
+.local/
 bugs/
 
 gtm

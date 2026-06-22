@@ -1,0 +1,101 @@
+# ows-core-internal
+
+WingRiders' private fork of [open-wallet-standard/core](https://github.com/open-wallet-standard/core) — a Rust workspace providing the chain-agnostic wallet/signing core for the Open Wallet Standard, plus Node (NAPI) and Python (PyO3) bindings and an `ows` CLI.
+
+## ⚠️ Fork workflow
+
+This repo is for **opening pull requests against the public upstream** — not for merging work into itself. Don't merge PRs or commits into this fork's `main`.
+
+- `origin` → `WingRiders/ows-core-internal` (set by `git clone`)
+- `upstream` → `open-wallet-standard/core` (add manually: `git remote add upstream git@github.com:open-wallet-standard/core.git`)
+- Sync: `git checkout main && git fetch upstream && git rebase upstream/main`
+
+## Build & test
+
+Prerequisites: Rust 1.94.0 (pinned in `rust-toolchain.toml`), Node ≥ 20, Python ≥ 3.9 with [Maturin](https://www.maturin.rs/).
+
+```bash
+# Rust workspace (lives under ows/)
+cd ows && cargo build --workspace --release
+cd ows && cargo test --workspace
+cd ows && cargo fmt --all
+cd ows && cargo clippy --workspace -- -D warnings
+
+# Node bindings
+cd bindings/node && npm install && npx napi build --platform --release
+cd bindings/node && npm test            # builds with --features fast-kdf, runs node --test
+
+# Python bindings
+cd bindings/python && maturin develop --release   # or --features fast-kdf for tests
+
+# README check (CI runs this — README.md is generated from readme/templates)
+./readme/generate.sh --check
+```
+
+The `fast-kdf` feature flag is for tests; release builds keep the slow scrypt KDF.
+
+## Workspace layout
+
+| Path | What |
+|------|------|
+| `ows/` | Rust workspace root (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`) |
+| `ows/crates/` | The five core crates (see below) |
+| `bindings/node/` | NAPI-RS bindings → `@open-wallet-standard/core` |
+| `bindings/node-adapters/` | Pure-TS framework adapters (viem, Solana, WDK) — no Rust |
+| `bindings/python/` | PyO3 + Maturin bindings → `open-wallet-standard` (PyPI), module `ows._native` |
+| `docs/` | Spec + SDK references (numbered `00-` … `08-` plus `quickstart.md`, `sdk-*.md`) |
+| `readme/` | Template system; `generate.sh` renders `templates/*.md` from `partials/*.md` (CI validates) |
+| `scripts/` | `build-llms-full.sh`, `set-version.sh` |
+| `website-docs/` | Static site source for [openwallet.sh](https://openwallet.sh) |
+| `skills/` | Claude Code skill bundles for OWS |
+| `CHANGELOG.md` | Keep a Changelog + SemVer |
+
+## Rust crates (`ows/crates/`)
+
+All version-locked together (currently 1.3.2):
+
+- **`ows-core`** — Types, errors, CAIP-2/CAIP-10 parsing, `ChainType` enum & `KNOWN_CHAINS` registry, policy types.
+- **`ows-signer`** — HD derivation (BIP-32 secp256k1, SLIP-10 ed25519), mnemonics, the `ChainSigner` trait, per-chain signing implementations, `zeroize`-based memory hardening, in-process key cache (5 s TTL, 32 entries).
+- **`ows-lib`** — High-level API used by FFI bindings: vault storage, key ops, policy evaluation. Wraps `ows-core` + `ows-signer`.
+- **`ows-pay`** — x402 payment client (gated API calls).
+- **`ows-cli`** — `ows` binary (clap-based). Build-time env vars `OWS_VERSION` and `OWS_GIT_COMMIT` are baked into the binary.
+
+## Chain extension points
+
+When adding or modifying a chain, these are the files that matter:
+
+- `ows/crates/ows-core/src/chain.rs` — `ChainType` variants, `KNOWN_CHAINS` entries, CAIP-2 namespace mapping, `default_coin_type()`, `from_namespace()`, `parse_chain()`.
+- `ows/crates/ows-signer/src/traits.rs` — `ChainSigner` trait (`sign`, `sign_message`, `sign_transaction`, `coin_type`, `default_derivation_path`, `extract_signable_bytes`, `encode_signed_transaction`).
+- `ows/crates/ows-signer/src/chains/` — one module per chain; register in `chains/mod.rs` and `signer_for_chain()` dispatch.
+- `ows/crates/ows-signer/src/hd.rs` — `HdDeriver`; SLIP-44 coin types live in `chain.rs::default_coin_type()`.
+- `ows/crates/ows-core/src/policy.rs` — `PolicyContext`, `TransactionContext`, `SpendingContext`. Currently account-model (`raw_hex`); chains with different transaction models extend these structs.
+- `bindings/node/src/lib.rs` and `bindings/python/src/lib.rs` — once a `ChainType` variant is registered, FFI flows through automatically; verify TS/Python type hints if added.
+- CLI: `ows/crates/ows-cli/src/main.rs` — `--chain` arg parses via `ows_core::parse_chain()`, so new entries in `KNOWN_CHAINS` are accepted automatically.
+- Docs: `docs/07-supported-chains.md` (chain families table + "Adding a New Chain" guide), `CONTRIBUTING.md`.
+
+## Conventions
+
+- **Commits:** Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`, …) per `CONTRIBUTING.md`. Lowercase, short subject.
+- **Style:** `cargo fmt --all` + `cargo clippy --workspace -- -D warnings` (no custom `rustfmt.toml`/`clippy.toml`). JS/Python follow NAPI/Maturin defaults.
+- **PRs:** small, focused, one logical change. Open against **`open-wallet-standard/core`**, not this fork.
+- **Generated files** (gitignored, regenerated by build): `index.d.ts`, `index.js`, `*.node`, `bindings/node/npm/*/*.node`, `bindings/python/.venv/`, README.md (when regenerated from templates).
+- **Vault:** wallets stored under `~/.ows/wallets/`, encrypted with scrypt + AES-GCM.
+
+## Spec & docs
+
+The OWS spec is the source of truth for behavior — read these when changing semantics:
+
+- `docs/00-specification.md` — scope, conformance
+- `docs/01-storage-format.md` — vault & keystore
+- `docs/02-signing-interface.md` — `sign`, `signAndSend`, `signMessage`
+- `docs/03-policy-engine.md` — pre-signing policies
+- `docs/04-agent-access-layer.md` — API keys, agent profiles
+- `docs/05-key-isolation.md` — in-memory key protection
+- `docs/06-wallet-lifecycle.md` — create, recover, rotate, delete
+- `docs/07-supported-chains.md` — chain registry & "Adding a New Chain"
+- `docs/08-conformance-and-security.md` — security guarantees
+- SDK references: `docs/sdk-cli.md`, `docs/sdk-node.md`, `docs/sdk-python.md`
+
+---
+
+If `.claude/context/midnight/README.md` exists, read it for current task context (Midnight integration into OWS).
