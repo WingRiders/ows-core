@@ -35,6 +35,7 @@ mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
 mod midnight_env;
+mod mip6;
 mod post_submit_sync;
 mod prover;
 mod session_cache;
@@ -351,6 +352,9 @@ pub fn prepare_balanced_sealed_from_maker_offer(
 pub use balance_sealed::{
     is_balance_sealed_maker_payload, is_proven_midnight_payload, is_sealed_midnight_payload,
     parse_maker_swap_input,
+};
+pub use mip6::{
+    encode_zswap_offer_bech32, export_mip6_offer_json_from_maker_bytes, is_mip6_offer_payload,
 };
 
 #[cfg(test)]

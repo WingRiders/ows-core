@@ -425,8 +425,7 @@ pub(crate) fn decode_midnight_transaction_input(
         });
     }
     if trimmed.starts_with("zswapoffer") {
-        let bytes =
-            parse_maker_swap_input(chain.chain_id, trimmed).map_err(pay_to_invalid)?;
+        let bytes = parse_maker_swap_input(chain.chain_id, trimmed).map_err(pay_to_invalid)?;
         return Ok(DecodedTxInput {
             bytes,
             pay_fees: true,

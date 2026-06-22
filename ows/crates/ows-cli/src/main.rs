@@ -199,6 +199,18 @@ enum SignCommands {
         #[arg(long)]
         rpc_url: Option<String>,
     },
+    /// Export a maker sealed/proven Midnight swap tx as MIP-0006 JSON (`zswapoffer…` + gives/wants)
+    ExportMip6Offer {
+        /// Chain name or CAIP-2 ID (must be a Midnight network, e.g. midnight:preview)
+        #[arg(long)]
+        chain: String,
+        /// Hex-encoded sealed or proven maker transaction bytes
+        #[arg(long)]
+        tx: String,
+        /// Pretty-print JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -462,6 +474,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 json,
                 rpc_url.as_deref(),
             ),
+            SignCommands::ExportMip6Offer { chain, tx, json } => {
+                commands::export_mip6_offer::run(&chain, &tx, json)
+            }
         },
         Commands::Fund { subcommand } => match subcommand {
             FundCommands::Deposit {

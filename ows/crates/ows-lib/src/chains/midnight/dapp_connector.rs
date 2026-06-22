@@ -29,6 +29,7 @@ use transient_crypto::encryption;
 use transient_crypto::proofs::ProofPreimage;
 
 use super::balance;
+use super::mip6;
 use super::shielded_session::{sync_shielded_wallet_state_scoped, ShieldedWalletState};
 use super::{parse_token_type, SyncCacheScope, TokenType, UnshieldedUtxo};
 
@@ -238,13 +239,13 @@ fn parse_balance_sealed_value(v: serde_json::Value) -> Result<ConnectorTxRequest
 fn parse_mip6_offer_as_balance_sealed(
     v: serde_json::Value,
 ) -> Result<ConnectorTxRequest, PayError> {
-    let tx = v
-        .get("transaction")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| err("MIP-0006 offer payload requires a transaction field"))?;
+    if !mip6::is_mip6_offer_payload(&v) {
+        return Err(err("invalid MIP-0006 offer payload"));
+    }
     Ok(ConnectorTxRequest::BalanceSealedTransaction(
         BalanceSealedTransactionRequest {
-            maker_tx: tx.to_string(),
+            // Keep full JSON so materialize can validate gives/wants/auth with chain_id.
+            maker_tx: v.to_string(),
             pay_fees: true,
         },
     ))
@@ -963,7 +964,8 @@ mod tests {
         let json = r#"{"version":1,"transaction":"zswapoffer1qq","gives":[],"wants":[]}"#;
         match parse_connector_tx_json(json).unwrap() {
             ConnectorTxRequest::BalanceSealedTransaction(b) => {
-                assert_eq!(b.maker_tx, "zswapoffer1qq");
+                assert!(b.maker_tx.contains("zswapoffer1qq"));
+                assert!(b.maker_tx.contains("\"version\":1"));
                 assert!(b.pay_fees);
             }
             other => panic!("expected balanceSealedTransaction, got {other:?}"),

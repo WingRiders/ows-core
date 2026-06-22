@@ -24,6 +24,54 @@ ows sign tx \
 
 Save the `signature` hex from the output (full sealed wire). That is the imbalanced offer for party #2.
 
+## MIP-0006 offer payloads
+
+[MIP-0006](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0006-p2p-atomic-swaps.md)
+defines a portable swap offer JSON shape (often with a bare [`zswapoffer1…`](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0005-zswap-offer-encoding.md)
+bech32 in the `transaction` field). OWS validates this before balancing:
+
+| Check | Behavior |
+|-------|----------|
+| `version` | Must be `1` |
+| `gives` / `wants` | Compared to Zswap offer deltas (positive = maker gives, negative = maker wants) |
+| `auth` (optional) | `schnorr-bip340` over RFC 8785 canonical JSON (SHA-256 digest) |
+| `transaction` | `zswapoffer…` bech32, or sealed/proven Midnight hex |
+
+Pass the full JSON as `--tx` (or inside `balanceSealedTransaction` via the dapp connector parser):
+
+```bash
+ows sign send-tx \
+  --wallet YOUR_WALLET \
+  --chain 'midnight:preview' \
+  --tx '{"version":1,"transaction":"zswapoffer1…","gives":[{"token":"0x…","amount":"500000"}],"wants":[{"token":"0x…","amount":"500000"}]}'
+```
+
+Mismatched `gives`/`wants` or invalid `auth` are rejected before any proving or signing.
+
+### Export `zswapoffer` from a maker sealed tx
+
+After party #1 runs `ows sign tx` on an imbalanced shielded `makeIntent`, export MIP-0006 JSON:
+
+```bash
+ows sign export-mip6-offer \
+  --chain 'midnight:preview' \
+  --tx MAKER_SEALED_HEX \
+  --json
+```
+
+This extracts the Zswap offer, encodes it as `zswapoffer1…` bech32 (MIP-0005) when the offer is
+compact enough for bech32, otherwise embeds the full maker sealed/proven hex in `transaction`
+(still valid MIP-0006). `gives` / `wants` are always derived from offer deltas.
+
+Shielded-only maker example (party #1 gives custom token A, wants custom token B):
+
+```bash
+ows sign tx \
+  --wallet YOUR_WALLET \
+  --chain 'midnight:preview' \
+  --tx '{"method":"makeIntent","desiredInputs":[{"kind":"shielded","type":"0xTOKEN_A","value":1000}],"desiredOutputs":[{"kind":"shielded","type":"0xTOKEN_B","value":1000,"recipient":"YOUR_SHIELDED_ADDR"}],"options":{"intentId":1,"payFees":false}}'
+```
+
 ## Party #2 — balance and submit
 
 Party #2 completes the swap with OWS using the same connector shape as Lace:
