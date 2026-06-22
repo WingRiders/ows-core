@@ -89,7 +89,7 @@ Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`
 
 Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
-For details on Midnight’s CAIP-2 / CAIP-10 mapping (including unshielded vs shielded vs DUST credentials and HRPs), see [`docs/midnight.md`](./midnight.md). Note that Midnight CAIP identifiers are currently **OWS-defined and unofficial** (no accepted Midnight namespace profile exists yet).
+For details on Midnight’s CAIP-2 / CAIP-10 mapping (including unshielded vs shielded vs DUST credentials and HRPs), see [`docs/midnight/addressing.md`](./midnight/addressing.md). Note that Midnight CAIP identifiers are currently **OWS-defined and unofficial** (no accepted Midnight namespace profile exists yet).
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 

@@ -107,7 +107,7 @@ fn preflight_sealed_tx_submit(tx: &SealedTx) -> Result<(), PayError> {
     let swap_hint = if is_swap_shaped_offer(stx) {
         " Signing/proving succeeded, but this is not submittable alone: share the sealed hex \
          with a counterparty for balanceSealedTransaction, or use a balanced makeIntent / \
-         makeTransfer. See docs/midnight-swap-intent.md"
+         makeTransfer. See docs/midnight/swap-intent.md"
     } else {
         ""
     };
@@ -130,7 +130,7 @@ fn append_balance_overspend_hint(msg: &mut String) {
         msg.push_str(&format!(
             "\n\nLedger error {LEDGER_BALANCE_CHECK_OVERSPEND} (BalanceCheckOverspend): the tx is \
              cryptographically valid but not ledger-balanced. Swap-style makeIntent offers must be \
-             completed via balanceSealedTransaction before submit (docs/midnight-swap-intent.md)."
+             completed via balanceSealedTransaction before submit (docs/midnight/swap-intent.md)."
         ));
     }
 }
