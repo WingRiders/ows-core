@@ -1,7 +1,11 @@
 //! Disk snapshot for Midnight shielded (Zswap) balance sync.
 
 use super::cache_io::{self, SyncCacheScope};
+use super::error::{PayError, PayErrorCode};
 use super::ShieldedBalances;
+use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use midnight_storage::db::InMemoryDB;
+use midnight_zswap::local::State as ZswapLocalState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -26,10 +30,15 @@ pub(super) struct ShieldedSyncSnapshot {
     pub max_zswap_id_when_saved: i64,
     #[serde(default)]
     pub saved_at_unix: u64,
+    #[serde(default)]
+    pub block_height_when_saved: i64,
     pub balances: ShieldedBalances,
     /// Unspent shielded coins after zswap replay (enables incremental resume).
     #[serde(default)]
     pub zswap_owned_coins: Vec<ZswapOwnedCoinRecord>,
+    /// Tagged-serialized `ZswapLocalState<InMemoryDB>` for fast shielded spends.
+    #[serde(default)]
+    pub zswap_state_hex: String,
 }
 
 /// One unspent coin in a zswap-ledger snapshot.
@@ -84,6 +93,33 @@ pub(super) fn try_save_snapshot(path: &Path, snap: &ShieldedSyncSnapshot) {
     cache_io::try_save(path, snap);
 }
 
+pub(super) fn decode_zswap_state(hex_s: &str) -> Result<ZswapLocalState<InMemoryDB>, PayError> {
+    let bytes = hex::decode(hex_s.strip_prefix("0x").unwrap_or(hex_s)).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("invalid zswap state hex: {e}"),
+        )
+    })?;
+    let mut reader: &[u8] = &bytes;
+    tagged_deserialize(&mut reader).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("failed to decode zswap state: {e}"),
+        )
+    })
+}
+
+pub(super) fn encode_zswap_state(state: &ZswapLocalState<InMemoryDB>) -> Result<String, PayError> {
+    let mut out = Vec::new();
+    tagged_serialize(state, &mut out).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("failed to encode zswap state: {e}"),
+        )
+    })?;
+    Ok(hex::encode(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,9 +136,11 @@ mod tests {
             highest_end_index_when_saved: 0,
             last_seen_zswap_event_id: 2815,
             max_zswap_id_when_saved: 2815,
+            block_height_when_saved: 0,
             saved_at_unix: 1,
             balances: BTreeMap::new(),
             zswap_owned_coins: vec![],
+            zswap_state_hex: String::new(),
         };
         assert!(snap.is_complete());
     }
@@ -118,9 +156,11 @@ mod tests {
             highest_end_index_when_saved: 0,
             last_seen_zswap_event_id: 100,
             max_zswap_id_when_saved: 2815,
+            block_height_when_saved: 0,
             saved_at_unix: 1,
             balances: BTreeMap::from([("0x01".into(), 1u128)]),
             zswap_owned_coins: vec![],
+            zswap_state_hex: String::new(),
         };
         assert!(!snap.is_complete());
     }

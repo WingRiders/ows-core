@@ -61,6 +61,168 @@ pub fn indexer_http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Minimal transaction metadata from the indexer HTTP API (post-submit sync).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexerTxSummary {
+    pub zswap_ledger_event_count: usize,
+    pub dust_ledger_event_count: usize,
+    pub max_zswap_ledger_event_id: Option<i64>,
+    pub max_dust_ledger_event_id: Option<i64>,
+}
+
+/// Look up a ledger transaction by hash via indexer HTTP GraphQL.
+pub async fn fetch_indexer_transaction_by_hash(
+    indexer_url: &str,
+    ledger_tx_hash: &str,
+) -> Result<Option<IndexerTxSummary>, PayError> {
+    fetch_indexer_transaction_by_hash_with_client(
+        indexer_http_client(),
+        indexer_url,
+        ledger_tx_hash,
+    )
+    .await
+}
+
+pub async fn fetch_indexer_transaction_by_hash_with_client(
+    client: &reqwest::Client,
+    indexer_url: &str,
+    ledger_tx_hash: &str,
+) -> Result<Option<IndexerTxSummary>, PayError> {
+    let bare = ledger_tx_hash.strip_prefix("0x").unwrap_or(ledger_tx_hash);
+    let q = r#"query TxByHash($offset: TransactionOffset!) {
+  transactions(offset: $offset) {
+    hash
+    zswapLedgerEvents { id }
+    dustLedgerEvents { id }
+  }
+}"#;
+    let resp = client
+        .post(indexer_url)
+        .json(&serde_json::json!({
+            "query": q,
+            "variables": { "offset": { "hash": format!("0x{bare}") } }
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            PayError::new(
+                PayErrorCode::HttpTransport,
+                format!("indexer transaction query failed: {e}"),
+            )
+        })?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer read body failed: {e}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer returned {status}: {body}"),
+        ));
+    }
+    #[derive(Deserialize)]
+    struct TxLedgerEventRef {
+        id: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct TxEvents {
+        #[serde(rename = "zswapLedgerEvents", default)]
+        zswap_ledger_events: Vec<TxLedgerEventRef>,
+        #[serde(rename = "dustLedgerEvents", default)]
+        dust_ledger_events: Vec<TxLedgerEventRef>,
+    }
+    #[derive(Deserialize)]
+    struct TxData {
+        transactions: Vec<TxEvents>,
+    }
+    let parsed: IndexerGraphqlResp<TxData> = serde_json::from_str(&body).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("invalid indexer json: {e}"),
+        )
+    })?;
+    if let Some(errs) = parsed.errors {
+        return Err(PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer GraphQL error: {errs:?}"),
+        ));
+    }
+    let Some(tx) = parsed.data.and_then(|d| d.transactions.into_iter().next()) else {
+        return Ok(None);
+    };
+    Ok(Some(IndexerTxSummary {
+        zswap_ledger_event_count: tx.zswap_ledger_events.len(),
+        dust_ledger_event_count: tx.dust_ledger_events.len(),
+        max_zswap_ledger_event_id: tx.zswap_ledger_events.iter().map(|e| e.id).max(),
+        max_dust_ledger_event_id: tx.dust_ledger_events.iter().map(|e| e.id).max(),
+    }))
+}
+
+/// Latest indexer block height (HTTP `block { height }`, ~sub-second).
+pub async fn fetch_indexer_block_height(indexer_url: &str) -> Result<i64, PayError> {
+    fetch_indexer_block_height_with_client(indexer_http_client(), indexer_url).await
+}
+
+pub async fn fetch_indexer_block_height_with_client(
+    client: &reqwest::Client,
+    indexer_url: &str,
+) -> Result<i64, PayError> {
+    let q = r#"query BlockHeight { block(offset: null) { height } }"#;
+    let resp = client
+        .post(indexer_url)
+        .json(&serde_json::json!({ "query": q }))
+        .send()
+        .await
+        .map_err(|e| {
+            PayError::new(
+                PayErrorCode::HttpTransport,
+                format!("indexer block height query failed: {e}"),
+            )
+        })?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer read body failed: {e}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer returned {status}: {body}"),
+        ));
+    }
+    #[derive(Deserialize)]
+    struct HeightBlock {
+        height: i64,
+    }
+    #[derive(Deserialize)]
+    struct HeightData {
+        block: Option<HeightBlock>,
+    }
+    let parsed: IndexerGraphqlResp<HeightData> = serde_json::from_str(&body).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("invalid indexer json: {e}"),
+        )
+    })?;
+    if let Some(errs) = parsed.errors {
+        return Err(PayError::new(
+            PayErrorCode::HttpTransport,
+            format!("indexer GraphQL error: {errs:?}"),
+        ));
+    }
+    parsed
+        .data
+        .and_then(|d| d.block)
+        .map(|b| b.height)
+        .ok_or_else(|| PayError::new(PayErrorCode::HttpTransport, "indexer did not return block"))
+}
+
 /// Latest indexer block: on-chain ledger parameters and chain timestamp (unix seconds).
 pub async fn fetch_indexer_tip(
     indexer_url: &str,

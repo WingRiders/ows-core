@@ -67,6 +67,7 @@ fn save_dust_progress_snapshot(
                 last_seen_event_id: last_seen_id,
                 max_id_when_saved: max_id.map(|m| m.max(last_seen_id)).unwrap_or(last_seen_id),
                 state_hex,
+                block_height_when_saved: super::tip_verify::block_height_for_snapshot(scope),
                 saved_at_unix: now,
             },
         );
@@ -127,19 +128,31 @@ fn dust_ws_read_timeout(
     verifying_at_tip: bool,
     attempt_events: u64,
     ws_idle: Duration,
+    purpose: SyncPurpose,
 ) -> Duration {
     if verifying_at_tip && attempt_events == 0 {
-        midnight_env::dust_verify_idle_timeout()
+        midnight_env::dust_verify_idle_timeout_for(purpose)
     } else {
         ws_idle
     }
 }
 
-fn dust_verify_attempt_limit(verifying_at_tip: bool) -> u32 {
+fn dust_verify_attempt_limit(verifying_at_tip: bool, purpose: SyncPurpose) -> u32 {
     if verifying_at_tip {
-        midnight_env::dust_verify_max_attempts()
+        midnight_env::dust_verify_max_attempts_for(purpose)
     } else {
         4
+    }
+}
+
+fn finish_dust_sync_with_session_cache(
+    state: &DustLocalState<InMemoryDB>,
+    scope: &super::cache_io::SyncCacheScope,
+    fp: &str,
+    dust_pk_hex: &str,
+) {
+    if let Ok(state_hex) = super::dust_sync_cache::encode_state(state) {
+        session_cache::put_dust_ledger_state_hex(scope, fp, dust_pk_hex, state_hex);
     }
 }
 
@@ -236,6 +249,7 @@ async fn sync_dust_local_state_inner(
     let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
     let mut start_id: i64 = midnight_env::dust_sync_start_id();
     let mut saved_max_id: i64 = 0;
+    let mut saved_block_height: i64 = 0;
     if let Some(ref path) = cache_path {
         if let Some(snap) = super::dust_sync_cache::try_load_snapshot(path) {
             if snap.indexer_fingerprint == fp
@@ -243,6 +257,7 @@ async fn sync_dust_local_state_inner(
                 && snap.dust_public_key_hex == dust_pk_hex
             {
                 saved_max_id = snap.max_id_when_saved;
+                saved_block_height = snap.block_height_when_saved;
                 if let Ok(st) = super::dust_sync_cache::decode_state(&snap.state_hex) {
                     state = st;
                     start_id = snap.last_seen_event_id.saturating_add(1);
@@ -252,6 +267,41 @@ async fn sync_dust_local_state_inner(
     }
 
     let log_progress = options.log_progress;
+    let snapshot_at_saved_tip = saved_max_id > 0 && start_id.saturating_sub(1) >= saved_max_id;
+    if super::tip_verify::snapshot_fresh_by_http_tip(
+        scope,
+        saved_block_height,
+        snapshot_at_saved_tip,
+    ) {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] dust sync: HTTP tip unchanged (block height={saved_block_height}), using snapshot"
+            );
+        }
+        finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
+        return Ok(state);
+    }
+    if snapshot_at_saved_tip
+        && super::tip_verify::indexer_block_height_matches_saved(indexer_url, saved_block_height)
+            .await
+    {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] dust sync: HTTP tip unchanged on re-check (block height={saved_block_height}), using snapshot"
+            );
+        }
+        finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
+        return Ok(state);
+    }
+    if snapshot_at_saved_tip && !options.purpose.must_catch_up_to_indexer_tip() {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] dust sync: display mode — complete on-disk snapshot, skipping WebSocket tip-verify"
+            );
+        }
+        finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
+        return Ok(state);
+    }
     let ws_idle = options.ws_idle_timeout;
     let stall_timeout = options.stall_timeout;
     let sync_started = Instant::now();
@@ -279,7 +329,8 @@ async fn sync_dust_local_state_inner(
     }
     let mut n_events: u64 = 0;
     let verifying_at_tip = saved_max_id > 0 && last_seen_id >= saved_max_id;
-    let max_attempts = dust_verify_attempt_limit(verifying_at_tip);
+    let max_attempts = dust_verify_attempt_limit(verifying_at_tip, options.purpose);
+    let verify_idle = midnight_env::dust_verify_idle_timeout_for(options.purpose);
 
     for attempt in 0..max_attempts {
         let mut ws = indexer_ws::connect_and_init(indexer_url, ws_idle, None).await?;
@@ -299,7 +350,7 @@ async fn sync_dust_local_state_inner(
         let attempt_started = Instant::now();
         loop {
             let effective_stall = if verifying_at_tip && n_events == 0 {
-                midnight_env::dust_verify_idle_timeout()
+                verify_idle
             } else {
                 stall_timeout
             };
@@ -332,16 +383,13 @@ async fn sync_dust_local_state_inner(
                 return Err(dust_stall_error(effective_stall, last_seen_id, max_id));
             }
 
-            if verifying_at_tip
-                && attempt_events == 0
-                && attempt_started.elapsed() > midnight_env::dust_verify_idle_timeout()
-            {
+            if verifying_at_tip && attempt_events == 0 && attempt_started.elapsed() > verify_idle {
                 if dust_at_chain_tip(last_seen_id, max_id) {
                     if log_progress {
                         eprintln!(
                             "[ows-midnight] dust sync: verify idle {}s, accepting saved tip \
 (last_seen_id={last_seen_id} max_id={max_id:?})",
-                            midnight_env::dust_verify_idle_timeout().as_secs()
+                            verify_idle.as_secs()
                         );
                     }
                     dropped = false;
@@ -350,14 +398,15 @@ async fn sync_dust_local_state_inner(
                 if log_progress {
                     eprintln!(
                         "[ows-midnight] dust sync: verify idle {}s with no ledger data, reconnecting…",
-                        midnight_env::dust_verify_idle_timeout().as_secs()
+                        verify_idle.as_secs()
                     );
                 }
                 dropped = true;
                 break;
             }
 
-            let read_timeout = dust_ws_read_timeout(verifying_at_tip, attempt_events, ws_idle);
+            let read_timeout =
+                dust_ws_read_timeout(verifying_at_tip, attempt_events, ws_idle, options.purpose);
             let t = match indexer_ws::read_subscription_text(&mut ws, read_timeout).await? {
                 indexer_ws::SubscriptionTextRead::Text(t) => t,
                 indexer_ws::SubscriptionTextRead::Closed => {

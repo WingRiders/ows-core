@@ -13,7 +13,7 @@ use ows_signer::{
 use super::{
     block_on, build_make_transfer_unsealed_tx, chain_needs_dust_fee_registration,
     is_balance_unsealed_payload, materialize_connector_request, parse_connector_tx_json,
-    prepare_sealed_from_unsealed, refresh_unshielded_after_submit, seal_imbalanced_unsealed,
+    post_submit_sync::refresh_after_submit, prepare_sealed_from_unsealed, seal_imbalanced_unsealed,
     submit_unshielded_tx, ConnectorTxRequest, PayError, SyncCacheScope,
 };
 use crate::error::OwsLibError;
@@ -682,8 +682,7 @@ fn run_prepare_sealed_from_unsealed(
     pay_fees: bool,
 ) -> Result<Vec<u8>, OwsLibError> {
     let indexer_url = resolve_indexer_url(chain_id)?;
-    let default_scope = SyncCacheScope::default();
-    let scope = sync_scope.unwrap_or(&default_scope);
+    let mut scope = sync_scope.cloned().unwrap_or_default();
     prepare_sealed_from_unsealed(
         chain_id,
         &indexer_url,
@@ -691,7 +690,7 @@ fn run_prepare_sealed_from_unsealed(
         shielded_seed,
         dust_seed,
         tx_bytes,
-        scope,
+        &mut scope,
         pay_fees,
     )
     .map_err(pay_to_invalid)
@@ -784,18 +783,22 @@ pub fn sign_and_send(
 
     if let Some(scope) = sync_scope {
         if let Ok(indexer_url) = resolve_indexer_url(chain.chain_id) {
-            if let Ok(key32) = <[u8; 32]>::try_from(private_key) {
-                if let Ok(sender_addr) =
-                    MidnightSigner.derive_address_for_chain_id(chain.chain_id, &key32)
-                {
-                    let _ = block_on(refresh_unshielded_after_submit(
-                        &indexer_url,
-                        &sender_addr,
-                        &tx_hash,
-                        scope,
-                    ));
-                }
-            }
+            let unshielded_address = <[u8; 32]>::try_from(private_key).ok().and_then(|key32| {
+                MidnightSigner
+                    .derive_address_for_chain_id(chain.chain_id, &key32)
+                    .ok()
+            });
+            let shielded_seed32 = shielded_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
+            let dust_seed32 = dust_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
+            let _ = block_on(refresh_after_submit(
+                &indexer_url,
+                scope,
+                &tx_hash,
+                &sealed_bytes,
+                unshielded_address.as_deref(),
+                shielded_seed32.as_ref(),
+                dust_seed32.as_ref(),
+            ));
         }
     }
 

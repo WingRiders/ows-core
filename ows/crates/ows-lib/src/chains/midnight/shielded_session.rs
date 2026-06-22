@@ -504,10 +504,12 @@ pub async fn sync_shielded_wallet_state_scoped(
                     "[ows-midnight] shielded spend: building wallet from zswapLedgerEvents replay"
                 );
             }
+            let seed_fp = super::shielded_sync_cache::shielded_seed_fingerprint(shielded_seed_32);
             super::zswap_ledger_sync::sync_shielded_wallet_from_zswap_ledger_scoped(
                 indexer_url,
                 &keys,
                 scope,
+                &seed_fp,
                 super::midnight_env::SyncPurpose::Signing,
             )
             .await?
@@ -899,9 +901,11 @@ fn maybe_save_session_snapshot(
                 highest_end_index_when_saved: highest_end.unwrap_or(highest_checked),
                 last_seen_zswap_event_id: 0,
                 max_zswap_id_when_saved: 0,
+                block_height_when_saved: 0,
                 saved_at_unix: saved_at,
                 balances: balances.clone(),
                 zswap_owned_coins: vec![],
+                zswap_state_hex: String::new(),
             },
         );
     }

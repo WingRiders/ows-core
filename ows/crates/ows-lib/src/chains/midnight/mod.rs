@@ -34,6 +34,7 @@ mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
 mod midnight_env;
+mod post_submit_sync;
 mod prover;
 mod session_cache;
 mod shielded_session;
@@ -41,6 +42,7 @@ mod shielded_sync;
 mod shielded_sync_cache;
 mod sign;
 mod submit;
+mod tip_verify;
 mod unshielded_sync;
 mod urls;
 pub mod wallet;
@@ -202,9 +204,10 @@ pub fn prepare_sealed_from_unsealed(
     shielded_seed: Option<&[u8]>,
     dust_seed: Option<&[u8]>,
     tx_bytes: &[u8],
-    sync_scope: &SyncCacheScope,
+    sync_scope: &mut SyncCacheScope,
     pay_fees: bool,
 ) -> Result<Vec<u8>, PayError> {
+    tip_verify::refresh_indexer_block_height(sync_scope, indexer_url);
     session_cache::invalidate_wallet_indexer_session_cache(indexer_url, sync_scope);
 
     let key32: [u8; 32] = sender_private_key.try_into().map_err(|_| {

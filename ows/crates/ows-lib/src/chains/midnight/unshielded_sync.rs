@@ -13,7 +13,8 @@ use std::time::Instant;
 use super::cache_io::{self, SyncCacheScope, SyncPurpose};
 use super::indexer_ws;
 use super::midnight_env::{
-    dust_verify_idle_timeout, midnight_sync_log_enabled, stall_timeout, ws_idle_timeout, SyncStream,
+    dust_verify_idle_timeout_for, midnight_sync_log_enabled, stall_timeout, ws_idle_timeout,
+    SyncStream,
 };
 use super::session_cache;
 
@@ -48,6 +49,8 @@ struct UnshieldedSyncSnapshot {
     address: String,
     last_seen_tx_id: i64,
     highest_tx_id_when_saved: i64,
+    #[serde(default)]
+    block_height_when_saved: i64,
     saved_at_unix: u64,
     utxos: Vec<UnshieldedUtxo>,
 }
@@ -134,8 +137,32 @@ fn tx_hashes_match(indexer_hash: &str, ledger_hash: &str) -> bool {
     normalize_ledger_tx_hash(indexer_hash) == normalize_ledger_tx_hash(ledger_hash)
 }
 
+/// True when `ledger_tx_hash` appears in a single unshielded sync pass for `address`.
+pub(super) async fn unshielded_tx_visible_in_indexer(
+    indexer_url: &str,
+    address: &str,
+    scope: &SyncCacheScope,
+    ledger_tx_hash: &str,
+) -> Result<bool, PayError> {
+    let target = normalize_ledger_tx_hash(ledger_tx_hash);
+    let mut tx_seen = false;
+    get_unshielded_utxos_inner(
+        indexer_url,
+        address,
+        scope,
+        SyncPurpose::Signing,
+        Some(&target),
+        &mut tx_seen,
+    )
+    .await?;
+    Ok(tx_seen)
+}
+
 /// After node submit, wait until the indexer reflects `ledger_tx_hash` for `address`,
 /// then refresh the on-disk snapshot and in-process cache.
+///
+/// Prefer [`super::post_submit_sync::refresh_after_submit`] when shielded or dust state
+/// must also be refreshed.
 pub async fn refresh_unshielded_after_submit(
     indexer_url: &str,
     address: &str,
@@ -335,6 +362,7 @@ async fn get_unshielded_utxos_inner(
 
     let mut resume_last_seen: i64 = 0;
     let mut saved_highest_tx_id: i64 = 0;
+    let mut saved_block_height: i64 = 0;
     let mut snapshot_at_saved_tip = false;
     let mut utxos: BTreeMap<(String, i64, String), UnshieldedUtxo> = BTreeMap::new();
 
@@ -351,10 +379,50 @@ async fn get_unshielded_utxos_inner(
             {
                 resume_last_seen = snap.last_seen_tx_id;
                 saved_highest_tx_id = snap.highest_tx_id_when_saved;
+                saved_block_height = snap.block_height_when_saved;
                 snapshot_at_saved_tip = snap.is_complete() && saved_highest_tx_id > 0;
                 utxos = seed_utxos_from_snapshot(&snap);
             }
         }
+    }
+
+    let log_progress = midnight_sync_log_enabled();
+    if super::tip_verify::snapshot_fresh_by_http_tip(
+        scope,
+        saved_block_height,
+        snapshot_at_saved_tip,
+    ) {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] unshielded sync: HTTP tip unchanged (block height={saved_block_height}), using snapshot"
+            );
+        }
+        let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
+        session_cache::put_unshielded(scope, &fp, address, list.clone());
+        return Ok(list);
+    }
+    if snapshot_at_saved_tip
+        && super::tip_verify::indexer_block_height_matches_saved(indexer_url, saved_block_height)
+            .await
+    {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] unshielded sync: HTTP tip unchanged on re-check (block height={saved_block_height}), using snapshot"
+            );
+        }
+        let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
+        session_cache::put_unshielded(scope, &fp, address, list.clone());
+        return Ok(list);
+    }
+    if snapshot_at_saved_tip && !purpose.must_catch_up_to_indexer_tip() {
+        if log_progress {
+            eprintln!(
+                "[ows-midnight] unshielded sync: display mode — complete on-disk snapshot, skipping WebSocket catch-up"
+            );
+        }
+        let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
+        session_cache::put_unshielded(scope, &fp, address, list.clone());
+        return Ok(list);
     }
 
     let mut last_seen: i64 = resume_last_seen;
@@ -364,8 +432,6 @@ async fn get_unshielded_utxos_inner(
     } else {
         None
     };
-
-    let log_progress = midnight_sync_log_enabled();
 
     if log_progress && resume_last_seen > 0 {
         eprintln!(
@@ -381,11 +447,13 @@ async fn get_unshielded_utxos_inner(
     let ws_idle = ws_idle_timeout(SyncStream::Unshielded);
     let sync_started = Instant::now();
     let mut last_event_at: Option<Instant> = None;
-    let verifying_at_tip = wait_for_tx_hash.is_none()
+    let short_idle_verify = wait_for_tx_hash.is_none()
         && snapshot_at_saved_tip
         && resume_last_seen > 0
-        && resume_last_seen >= saved_highest_tx_id;
-    if verifying_at_tip && log_progress {
+        && resume_last_seen >= saved_highest_tx_id
+        && !purpose.must_catch_up_to_indexer_tip();
+    let verify_idle = dust_verify_idle_timeout_for(purpose);
+    if short_idle_verify && log_progress {
         eprintln!(
             "[ows-midnight] unshielded sync: snapshot at saved tip \
 (last_seen_tx_id={resume_last_seen} highest={saved_highest_tx_id}), verifying with indexer…"
@@ -406,15 +474,15 @@ async fn get_unshielded_utxos_inner(
     let mut sync_done = false;
 
     while !sync_done {
-        let effective_stall = if verifying_at_tip && !progress_received {
-            dust_verify_idle_timeout()
+        let effective_stall = if short_idle_verify && !progress_received {
+            verify_idle
         } else {
             stall_timeout
         };
         let stall_elapsed = last_event_at.unwrap_or(sync_started).elapsed();
         if stall_elapsed > effective_stall {
             let tip_id = highest.unwrap_or(saved_highest_tx_id);
-            if verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id) {
+            if short_idle_verify && last_seen >= tip_id.max(saved_highest_tx_id) {
                 if log_progress {
                     eprintln!(
                         "[ows-midnight] unshielded sync: verify stall {}s, accepting saved tip \
@@ -435,8 +503,8 @@ indexer may be stalled",
             ));
         }
 
-        let read_timeout = if verifying_at_tip && !progress_received {
-            dust_verify_idle_timeout()
+        let read_timeout = if short_idle_verify && !progress_received {
+            verify_idle
         } else {
             ws_idle
         };
@@ -448,7 +516,7 @@ indexer may be stalled",
             indexer_ws::SubscriptionTextRead::Closed => break,
             indexer_ws::SubscriptionTextRead::IdleTimeout => {
                 let tip_id = highest.unwrap_or(saved_highest_tx_id);
-                if verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id) {
+                if short_idle_verify && last_seen >= tip_id.max(saved_highest_tx_id) {
                     if log_progress {
                         eprintln!(
                             "[ows-midnight] unshielded sync: verify idle {}s, accepting saved tip \
@@ -554,7 +622,7 @@ indexer may be stalled",
 
     if !sync_done && !unshielded_sync_done(progress_received, highest, last_seen) {
         let tip_id = highest.unwrap_or(saved_highest_tx_id);
-        if !(verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id)) {
+        if !(short_idle_verify && last_seen >= tip_id.max(saved_highest_tx_id)) {
             return Err(PayError::new(
                 PayErrorCode::HttpTransport,
                 "Midnight indexer closed the unshielded subscription before sync completed; \
@@ -577,6 +645,7 @@ try again or check indexer health."
             address: address.to_string(),
             last_seen_tx_id: last_seen,
             highest_tx_id_when_saved: highest.unwrap_or(last_seen),
+            block_height_when_saved: super::tip_verify::block_height_for_snapshot(scope),
             saved_at_unix: saved_at,
             utxos: list.clone(),
         };
@@ -669,6 +738,7 @@ mod tests {
             address: String::new(),
             last_seen_tx_id: 500,
             highest_tx_id_when_saved: 500,
+            block_height_when_saved: 0,
             saved_at_unix: 0,
             utxos: vec![],
         };

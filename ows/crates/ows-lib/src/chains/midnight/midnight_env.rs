@@ -67,8 +67,7 @@ pub enum SyncStream {
     Dust,
 }
 
-/// Why the wallet is syncing (balance display vs tx building). Both paths must reach
-/// the indexer chain tip before returning — no stale snapshot or session-cache shortcuts.
+/// Why the wallet is syncing (balance display vs tx building).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncPurpose {
     Signing,
@@ -80,14 +79,14 @@ impl SyncPurpose {
         matches!(self, Self::Display)
     }
 
-    /// Balance display and tx balancing/signing always reconnect to the indexer.
+    /// Tx building uses WebSocket tip-verify; balance display uses HTTP `block.height` when set.
     pub fn must_catch_up_to_indexer_tip(self) -> bool {
-        let _ = self;
-        true
+        !self.is_display()
     }
 }
 
-/// Max time to wait after node submit for the indexer to reflect the tx in unshielded state.
+/// Max time to wait after node submit for the indexer to reflect the tx and refresh local
+/// sync snapshots (unshielded, shielded zswap wallet, dust).
 /// Set `OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS=0` to skip (still invalidates session cache).
 pub fn post_submit_indexer_wait_timeout() -> Duration {
     Duration::from_secs(env_parse_u64(
@@ -231,7 +230,7 @@ pub fn dust_sync_start_id() -> i64 {
         .unwrap_or(0)
 }
 
-/// Idle limit while confirming a saved dust snapshot is still at chain tip.
+/// Idle limit while confirming a saved dust snapshot is still at chain tip (signing).
 /// On expiry with no new ledger events, the sync reconnects (up to several attempts).
 pub fn dust_verify_idle_timeout() -> Duration {
     Duration::from_secs(env_parse_u64(
@@ -240,9 +239,29 @@ pub fn dust_verify_idle_timeout() -> Duration {
     ))
 }
 
+/// Shorter tip-verify idle for `ows fund balance` display (default 3s vs 15s for signing).
+pub fn dust_verify_idle_timeout_for(purpose: SyncPurpose) -> Duration {
+    if purpose.is_display() {
+        Duration::from_secs(env_parse_u64(
+            &["OWS_MIDNIGHT_DUST_VERIFY_IDLE_TIMEOUT_DISPLAY_SECS"],
+            3,
+        ))
+    } else {
+        dust_verify_idle_timeout()
+    }
+}
+
 /// Max reconnect attempts when verifying a saved tip snapshot against the indexer.
 pub fn dust_verify_max_attempts() -> u32 {
     env_parse_u64(&["OWS_MIDNIGHT_DUST_VERIFY_MAX_ATTEMPTS"], 8) as u32
+}
+
+pub fn dust_verify_max_attempts_for(purpose: SyncPurpose) -> u32 {
+    if purpose.is_display() {
+        env_parse_u64(&["OWS_MIDNIGHT_DUST_VERIFY_MAX_ATTEMPTS_DISPLAY"], 2) as u32
+    } else {
+        dust_verify_max_attempts()
+    }
 }
 
 /// Per-request timeout for Midnight indexer GraphQL HTTP calls.

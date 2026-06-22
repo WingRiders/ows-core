@@ -14,7 +14,7 @@ use super::{
     block_on, chain_needs_dust_fee_registration, format_dust_specks, fund_balance_skip_dust_sync,
     get_dust_balance_for_display_scoped, get_shielded_balances_for_display_scoped,
     get_unshielded_utxos_for_display_scoped, midnight_sync_log_enabled, parse_token_type,
-    SyncCacheScope, UnshieldedUtxo,
+    shielded_sync::ShieldedDisplayBalances, UnshieldedUtxo,
 };
 use crate::error::OwsLibError;
 
@@ -51,11 +51,12 @@ fn print_addresses(
     Ok(())
 }
 
+type DustBalanceResult = Result<(usize, u128), super::PayError>;
+
 fn print_dust_status(
-    indexer_url: &str,
     unshielded_utxos: &[UnshieldedUtxo],
     dust_seed: Option<&SecretBytes>,
-    sync_scope: &SyncCacheScope,
+    dust_balance: Option<DustBalanceResult>,
 ) -> Result<(), OwsLibError> {
     eprintln!("Dust status (fees):");
 
@@ -88,7 +89,7 @@ fn print_dust_status(
         }
     }
 
-    if let Some(seed) = dust_seed {
+    if dust_seed.is_some() {
         eprintln!("  DUST seed: available");
         if fund_balance_skip_dust_sync() {
             eprintln!(
@@ -97,36 +98,17 @@ fn print_dust_status(
             eprintln!();
             return Ok(());
         }
-        if midnight_sync_log_enabled() {
-            eprintln!(
-                "  Syncing DUST ledger (resumes ~/.ows/sync/midnight/dust cache, then catches up; progress below)..."
-            );
-        }
-        let seed_arr: [u8; 32] = match seed.expose().try_into() {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("  DUST: unavailable (dust seed must be 32 bytes)");
-                return Ok(());
-            }
-        };
-
-        let chain_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        match block_on(get_dust_balance_for_display_scoped(
-            indexer_url,
-            &seed_arr,
-            chain_time,
-            sync_scope,
-        )) {
-            Ok((dust_utxo_count, dust_sum)) => {
+        match dust_balance {
+            Some(Ok((dust_utxo_count, dust_sum))) => {
                 eprintln!("  DUST UTXOs: {dust_utxo_count}");
                 let dust = format_dust_specks(dust_sum);
                 eprintln!("  DUST balance: {dust} (best-effort, wall-clock time)");
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 eprintln!("  DUST: unavailable ({e})");
+            }
+            None => {
+                eprintln!("  DUST: unavailable (dust seed must be 32 bytes)");
             }
         }
     } else {
@@ -152,22 +134,8 @@ pub fn print_fund_balance(
     .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
 
     let indexer_url = resolve_indexer_url(chain_id)?;
-    let sync_scope = sync_scope_for_wallet(wallet_name, Some(chain_id), vault_path);
-    super::session_cache::invalidate_wallet_indexer_session_cache(&indexer_url, &sync_scope);
-
-    if midnight_sync_log_enabled() {
-        eprintln!("[ows-midnight] syncing unshielded balance from indexer…");
-    }
-    let unshielded_utxos = block_on(get_unshielded_utxos_for_display_scoped(
-        &indexer_url,
-        &address,
-        &sync_scope,
-    ))
-    .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-    let mut unshielded: BTreeMap<String, u128> = BTreeMap::new();
-    for u in &unshielded_utxos {
-        *unshielded.entry(u.token_type.clone()).or_insert(0) += u.value;
-    }
+    let mut sync_scope = sync_scope_for_wallet(wallet_name, Some(chain_id), vault_path);
+    super::tip_verify::ensure_indexer_block_height(&mut sync_scope, &indexer_url);
 
     let (shielded_seed, dust_seed) = decrypt_auxiliary_seeds_with_fallback(
         wallet_name,
@@ -176,21 +144,64 @@ pub fn print_fund_balance(
         &mut prompt_passphrase,
     )?;
 
-    let shielded_report = if let Some(seed) = shielded_seed.as_ref() {
-        if midnight_sync_log_enabled() {
-            eprintln!(
-                "[ows-midnight] syncing shielded balance from indexer (may take a while on first run)…"
-            );
-        }
-        block_on(get_shielded_balances_for_display_scoped(
-            &indexer_url,
-            seed.expose(),
-            &sync_scope,
+    if midnight_sync_log_enabled() {
+        eprintln!("[ows-midnight] syncing unshielded, shielded, and dust balances in parallel…");
+    }
+
+    let dust_seed_arr: Option<[u8; 32]> =
+        dust_seed.as_ref().and_then(|s| s.expose().try_into().ok());
+    let chain_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let skip_dust = fund_balance_skip_dust_sync() || dust_seed_arr.is_none();
+
+    let (unshielded_utxos, shielded_report, dust_balance) = block_on(async {
+        let indexer_url = indexer_url.clone();
+        let address = address.clone();
+        let sync_scope = sync_scope.clone();
+
+        let unshielded_fut =
+            get_unshielded_utxos_for_display_scoped(&indexer_url, &address, &sync_scope);
+
+        let shielded_fut = async {
+            if let Some(seed) = shielded_seed.as_ref() {
+                get_shielded_balances_for_display_scoped(&indexer_url, seed.expose(), &sync_scope)
+                    .await
+            } else {
+                Ok(ShieldedDisplayBalances::default())
+            }
+        };
+
+        let dust_fut = async {
+            if skip_dust {
+                return None;
+            }
+            let seed_arr = dust_seed_arr.expect("checked above");
+            Some(
+                get_dust_balance_for_display_scoped(
+                    &indexer_url,
+                    &seed_arr,
+                    chain_time,
+                    &sync_scope,
+                )
+                .await,
+            )
+        };
+
+        let (unshielded_res, shielded_res, dust_res) =
+            tokio::join!(unshielded_fut, shielded_fut, dust_fut);
+        Ok::<_, OwsLibError>((
+            unshielded_res.map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+            shielded_res.map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+            dust_res,
         ))
-        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?
-    } else {
-        Default::default()
-    };
+    })?;
+
+    let mut unshielded: BTreeMap<String, u128> = BTreeMap::new();
+    for u in &unshielded_utxos {
+        *unshielded.entry(u.token_type.clone()).or_insert(0) += u.value;
+    }
     let shielded = shielded_report.spendable;
     let shielded_session_only = shielded_report.session_only;
 
@@ -235,12 +246,7 @@ pub fn print_fund_balance(
     }
 
     if chain_needs_dust_fee_registration(chain_id) {
-        print_dust_status(
-            &indexer_url,
-            &unshielded_utxos,
-            dust_seed.as_ref(),
-            &sync_scope,
-        )?;
+        print_dust_status(&unshielded_utxos, dust_seed.as_ref(), dust_balance)?;
     }
 
     Ok(())
