@@ -49,6 +49,16 @@ pub fn is_sealed_midnight_payload(tx_bytes: &[u8]) -> bool {
     tx_bytes.starts_with(TAG_SEALED)
 }
 
+/// Detect a proven (`proof,embedded-fr`) Midnight transaction blob (e.g. from `zswapoffer` wrap).
+pub fn is_proven_midnight_payload(tx_bytes: &[u8]) -> bool {
+    tx_bytes.starts_with(TAG_PROVEN)
+}
+
+/// Sealed or proven maker swap payload that [`balance_sealed_transaction`] can complete.
+pub fn is_balance_sealed_maker_payload(tx_bytes: &[u8]) -> bool {
+    is_sealed_midnight_payload(tx_bytes) || is_proven_midnight_payload(tx_bytes)
+}
+
 /// Parse maker input: hex sealed/proven tx, `zswapoffer…` bech32, MIP-0006 JSON, or connector JSON.
 pub fn parse_maker_swap_input(chain_id: &str, raw: &str) -> Result<Vec<u8>, PayError> {
     let trimmed = raw.trim();
@@ -893,5 +903,12 @@ mod tests {
     fn is_sealed_detects_tag() {
         assert!(is_sealed_midnight_payload(TAG_SEALED));
         assert!(!is_sealed_midnight_payload(TAG_PROVEN));
+    }
+
+    #[test]
+    fn is_balance_sealed_maker_detects_sealed_and_proven() {
+        assert!(is_balance_sealed_maker_payload(TAG_SEALED));
+        assert!(is_balance_sealed_maker_payload(TAG_PROVEN));
+        assert!(!is_balance_sealed_maker_payload(b"other"));
     }
 }

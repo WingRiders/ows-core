@@ -12,7 +12,7 @@ use ows_signer::{
 
 use super::{
     block_on, build_make_transfer_unsealed_tx, chain_needs_dust_fee_registration,
-    is_balance_unsealed_payload, is_sealed_midnight_payload, materialize_connector_request,
+    is_balance_sealed_maker_payload, is_balance_unsealed_payload, materialize_connector_request,
     parse_connector_tx_json, parse_maker_swap_input, post_submit_sync::refresh_after_submit,
     prepare_balanced_sealed_from_maker_offer, prepare_sealed_from_unsealed,
     seal_imbalanced_unsealed, submit_unshielded_tx, ConnectorTxRequest, PayError, SyncCacheScope,
@@ -370,11 +370,14 @@ pub fn policy_context_tx_bytes(chain: &Chain, tx_arg: &str) -> Result<Vec<u8>, O
             }
         }
     }
+    if trimmed.starts_with("zswapoffer") {
+        return parse_maker_swap_input(chain.chain_id, trimmed).map_err(pay_to_invalid);
+    }
     let hex_s = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     hex::decode(hex_s).map_err(|e| invalid_input(format!("invalid hex transaction: {e}")))
 }
 
-/// Decode `--tx` for Midnight: hex wire bytes or DApp Connector JSON.
+/// Decode `--tx` for Midnight: hex wire bytes, `zswapoffer…` bech32, or DApp Connector JSON.
 pub(crate) fn decode_midnight_transaction_input(
     chain: &Chain,
     tx_arg: &str,
@@ -419,6 +422,15 @@ pub(crate) fn decode_midnight_transaction_input(
             bytes,
             pay_fees,
             balance_before_sign: balance,
+        });
+    }
+    if trimmed.starts_with("zswapoffer") {
+        let bytes =
+            parse_maker_swap_input(chain.chain_id, trimmed).map_err(pay_to_invalid)?;
+        return Ok(DecodedTxInput {
+            bytes,
+            pay_fees: true,
+            balance_before_sign: true,
         });
     }
     let hex_s = trimmed.strip_prefix("0x").unwrap_or(trimmed);
@@ -767,7 +779,7 @@ pub fn sign_transaction(
         return Ok(SignResult::midnight_transaction(hex::encode(&signed_wire)));
     }
 
-    if is_sealed_midnight_payload(tx_bytes) && balance_before_sign {
+    if is_balance_sealed_maker_payload(tx_bytes) && balance_before_sign {
         let signed_wire = run_balance_sealed_transaction(
             chain.chain_id,
             private_key,
@@ -815,7 +827,7 @@ pub fn sign_and_send(
         } else {
             seal_imbalanced_unsealed_local(chain.chain_id, private_key, tx_bytes)?
         })
-    } else if is_sealed_midnight_payload(tx_bytes) && balance_before_sign {
+    } else if is_balance_sealed_maker_payload(tx_bytes) && balance_before_sign {
         std::borrow::Cow::Owned(run_balance_sealed_transaction(
             chain.chain_id,
             private_key,

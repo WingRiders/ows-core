@@ -348,7 +348,10 @@ pub fn prepare_balanced_sealed_from_maker_offer(
     )
 }
 
-pub use balance_sealed::{is_sealed_midnight_payload, parse_maker_swap_input};
+pub use balance_sealed::{
+    is_balance_sealed_maker_payload, is_proven_midnight_payload, is_sealed_midnight_payload,
+    parse_maker_swap_input,
+};
 
 #[cfg(test)]
 mod tests {
