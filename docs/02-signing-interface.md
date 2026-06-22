@@ -16,10 +16,17 @@ interface SignRequest {
 }
 
 interface SignResult {
-  signature: string;
+  signature: string;           // hex: detached sig (most chains); see Midnight below
   recoveryId?: number;
 }
 ```
+
+**Midnight (`midnight:*`) `signature` encoding** (chain-aware callers):
+
+- **Transactions:** full tagged `midnight:transaction[…]` wire bytes (hex). Signatures are embedded in the blob.
+- **Messages:** hex(`x_only_pubkey[32] || bip340_sig[64]`).
+
+Detect transaction vs message by decoding the hex prefix (`midnight:transaction` vs 96-byte message layout).
 
 **Flow:**
 1. Resolve `walletId` → wallet file
@@ -81,6 +88,7 @@ Message signing follows chain-specific conventions:
 - **Cosmos**: ADR-036 off-chain signing
 - **Filecoin**: Blake2b-256 hash then secp256k1 signing
 - **NEAR**: V1 Ed25519 signature over the raw message bytes (parity with Solana). [NEP-413](https://github.com/near/NEPs/blob/master/neps/nep-0413.md) prefixed message signing — `tag 2147484061 || borsh({message, nonce, recipient, callbackUrl?})` — is tracked as a follow-up so callers can opt in via a structured payload. Transaction signing is `Ed25519(SHA-256(borsh(Transaction)))`; `encode_signed_transaction` returns `borsh(Transaction) || 0x00 || sig64` (the canonical `borsh(SignedTransaction)`).
+- **Midnight (unshielded/Night)**: BIP-340 Schnorr over raw message bytes (`signData` / unshielded key only). **Transaction** signing returns the full tagged `midnight:transaction[…]` wire in `signature` (signatures embedded). **Message** signing returns hex(`pubkey[32] || sig[64]`) in `signature`. Unsealed dapp payloads require wallet-side balancing/proving on Preview/Preprod (mnemonic + DUST path `m/44'/2400'/0'/2/{index}` per [Midnight WalletEngine](https://github.com/midnightntwrk/midnight-wallet-engine)); coin type **2400** (BIP-44 registered for Midnight).
 
 ### `signTypedData(request: SignTypedDataRequest): Promise<SignMessageResult>`
 

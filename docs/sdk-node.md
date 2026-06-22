@@ -55,10 +55,19 @@ interface WalletInfo {
 }
 
 interface SignResult {
-  signature: string;      // Hex-encoded signature
+  signature: string;      // Hex-encoded; see Midnight conventions below
   recoveryId?: number;    // EVM/Tron recovery ID (v value)
 }
+```
 
+**Midnight `signature`:**
+
+| Operation | `signature` contents |
+|-----------|---------------------|
+| Transaction | Full tagged `midnight:transaction[…]` wire (hex) |
+| Message | hex(`x_only_pubkey[32] \|\| bip340_sig[64]`) |
+
+```typescript
 interface SendResult {
   txHash: string;         // Transaction hash
 }
@@ -345,6 +354,8 @@ Sign a raw transaction (hex-encoded bytes).
 const result = signTransaction("agent-treasury", "evm", "02f8...");
 console.log(result.signature);
 ```
+
+For **Midnight**, `signature` is the full sealed wire hex for transactions. Message signatures prefix the BIP-340 verifying key. Unsealed dapp payloads run the wallet pipeline (balance → prove → seal); Preview/Preprod require a **mnemonic** wallet (DUST seed at `m/44'/2400'/0'/2/<index>`). Agent/API-key mode supports the same when the wallet is mnemonic-based.
 
 **Returns:** `SignResult`
 

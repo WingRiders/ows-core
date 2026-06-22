@@ -58,10 +58,14 @@ All functions return Python dicts. Wallet functions return:
 
 # SignResult
 {
-    "signature": "bea6b4ee...",       # Hex-encoded
+    "signature": "bea6b4ee...",       # Hex: detached sig (most chains); see Midnight below
     "recovery_id": 0,                 # EVM/Tron only (None for others)
 }
+```
 
+**Midnight `signature`:** transactions → full `midnight:transaction[…]` wire hex; messages → hex(`pubkey[32] || sig[64]`).
+
+```python
 # SendResult
 {
     "tx_hash": "0xabc...",
@@ -287,6 +291,8 @@ Sign a raw transaction (hex-encoded bytes).
 result = sign_transaction("agent-treasury", "evm", "02f8...")
 print(result["signature"])
 ```
+
+For **Midnight**, use `result["signature"]` for broadcast (full wire hex) or verification (message: split pubkey + sig). Preview/Preprod unsealed flows need a **mnemonic** wallet (DUST at `m/44'/2400'/0'/2/<index>`). API-key mode supports this when the wallet is mnemonic-based.
 
 #### `sign_and_send(wallet, chain, tx_hex, passphrase=None, index=None, rpc_url=None, vault_path=None)`
 
