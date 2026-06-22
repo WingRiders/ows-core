@@ -168,7 +168,7 @@ enum SignCommands {
         /// Wallet name or ID (uses stored encrypted mnemonic)
         #[arg(long, env = "OWS_WALLET")]
         wallet: String,
-        /// Hex-encoded unsigned transaction bytes
+        /// Hex-encoded transaction bytes, or Midnight DApp Connector makeTransfer / makeIntent JSON
         #[arg(long)]
         tx: String,
         /// Account index
@@ -186,7 +186,7 @@ enum SignCommands {
         /// Wallet name or ID (uses stored encrypted mnemonic)
         #[arg(long, env = "OWS_WALLET")]
         wallet: String,
-        /// Hex-encoded unsigned transaction bytes
+        /// Hex-encoded transaction bytes, or Midnight DApp Connector makeTransfer / makeIntent JSON
         #[arg(long)]
         tx: String,
         /// Account index
@@ -361,6 +361,8 @@ enum CliError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Pay(#[from] ows_pay::PayError),
+    #[error("{0}")]
+    Midnight(#[from] ows_lib::chains::midnight::PayError),
     #[error("{0}")]
     InvalidArgs(String),
 }

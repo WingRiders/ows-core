@@ -83,14 +83,19 @@ pub fn sign_with_api_key(
     token: &str,
     wallet_name_or_id: &str,
     chain: &ows_core::Chain,
-    tx_bytes: &[u8],
+    tx_arg: &str,
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
 
-    let signer = signer_for_chain(chain.chain_type);
-    let transaction = signer.make_transaction_context(tx_bytes, None)?;
+    // Policy context: use decoded bytes when possible; makeIntent JSON is resolved after decrypt.
+    let policy_bytes = crate::ops::policy_tx_bytes_for_chain(chain, tx_arg)?;
+    let transaction = ows_core::policy::TransactionContext {
+        effects: vec![],
+        raw_hex: hex::encode(&policy_bytes),
+        data: None,
+    };
 
     let (key, _) = enforce_policies_and_decrypt_key(
         token,
@@ -103,14 +108,21 @@ pub fn sign_with_api_key(
         vault_path,
     )?;
 
-    // 7. Sign (extract signable portion first — e.g. strips Solana sig-slot headers)
-    let signable = signer.extract_signable_bytes(tx_bytes)?;
-    let output = signer.sign_transaction(key.expose(), signable)?;
+    if chain.chain_type == ows_core::ChainType::Midnight {
+        return crate::chains::midnight::wallet::sign_transaction_for_wallet(
+            wallet_name_or_id,
+            chain,
+            tx_arg,
+            token,
+            key.expose(),
+            index,
+            vault_path,
+            false,
+        );
+    }
 
-    Ok(crate::types::SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    let tx_bytes = crate::ops::decode_owner_tx_hex(chain, tx_arg)?;
+    crate::ops::sign_transaction_with_key(chain, key.expose(), &tx_bytes)
 }
 
 /// Sign a message using an API token (agent mode).
@@ -140,11 +152,7 @@ pub fn sign_message_with_api_key(
     )?;
     let signer = signer_for_chain(chain.chain_type);
     let output = signer.sign_message(key.expose(), msg_bytes)?;
-
-    Ok(crate::types::SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign a raw 32-byte hash using an API token (agent mode).
@@ -177,10 +185,10 @@ pub fn sign_hash_with_api_key(
     let signer = signer_for_chain(chain.chain_type);
     let output = signer.sign(key.expose(), hash_bytes)?;
 
-    Ok(crate::types::SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    Ok(crate::types::SignResult::detached_signature(
+        hex::encode(&output.signature),
+        output.recovery_id,
+    ))
 }
 
 /// Sign EIP-712 typed data using an API token (agent mode).
@@ -261,10 +269,10 @@ pub fn sign_typed_data_with_api_key(
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
-    Ok(crate::types::SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    Ok(crate::types::SignResult::detached_signature(
+        hex::encode(&output.signature),
+        output.recovery_id,
+    ))
 }
 
 /// Token → key file lookup, expiry check, wallet load + scope check.
@@ -511,8 +519,14 @@ mod tests {
 
         let chain = ows_core::parse_chain("base").unwrap();
         let tx_bytes = vec![0u8; 32];
-        let result =
-            sign_with_api_key(&token, "test-wallet", &chain, &tx_bytes, None, Some(&vault));
+        let result = sign_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            &hex::encode(&tx_bytes),
+            None,
+            Some(&vault),
+        );
         assert!(
             result.is_ok(),
             "sign_with_api_key failed: {:?}",
@@ -618,8 +632,14 @@ mod tests {
         let chain = ows_core::parse_chain("base").unwrap();
         let tx_bytes = vec![0u8; 32]; // dummy tx
 
-        let result =
-            sign_with_api_key(&token, "test-wallet", &chain, &tx_bytes, None, Some(&vault));
+        let result = sign_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            &hex::encode(&tx_bytes),
+            None,
+            Some(&vault),
+        );
 
         // The signing should succeed (policy allows eip155:8453)
         assert!(
@@ -665,7 +685,7 @@ mod tests {
             &token,
             "imported-wallet",
             &chain,
-            &tx_bytes,
+            &hex::encode(&tx_bytes),
             None,
             Some(&vault),
         );
@@ -715,8 +735,14 @@ mod tests {
         let chain = ows_core::parse_chain("ethereum").unwrap(); // eip155:1
         let tx_bytes = vec![0u8; 32];
 
-        let result =
-            sign_with_api_key(&token, "test-wallet", &chain, &tx_bytes, None, Some(&vault));
+        let result = sign_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            &hex::encode(&tx_bytes),
+            None,
+            Some(&vault),
+        );
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -749,8 +775,14 @@ mod tests {
         let chain = ows_core::parse_chain("base").unwrap();
         let tx_bytes = vec![0u8; 32];
 
-        let result =
-            sign_with_api_key(&token, "test-wallet", &chain, &tx_bytes, None, Some(&vault));
+        let result = sign_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            &hex::encode(&tx_bytes),
+            None,
+            Some(&vault),
+        );
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -785,7 +817,7 @@ mod tests {
             "ows_key_wrong_token",
             "test-wallet",
             &chain,
-            &tx_bytes,
+            &hex::encode(&tx_bytes),
             None,
             Some(&vault),
         );
@@ -835,7 +867,7 @@ mod tests {
             &token,
             "other-wallet",
             &chain,
-            &tx_bytes,
+            &hex::encode(&tx_bytes),
             None,
             Some(&vault),
         );

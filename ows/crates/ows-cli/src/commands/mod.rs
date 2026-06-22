@@ -20,6 +20,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
+/// Vault directory from `~/.ows/config.json` (or defaults).
 pub(crate) fn vault_dir() -> PathBuf {
     ows_core::Config::load_or_default().vault_path
 }
@@ -136,4 +137,88 @@ pub fn resolve_signing_key(
         Some(index),
         None,
     )?)
+}
+
+/// Owner-mode sign / send context (chain-specific).
+pub enum OwnerSignContext {
+    Midnight {
+        key: ows_signer::SecretBytes,
+        prepared: ows_lib::chains::midnight::MidnightOwnerTxContext,
+    },
+    Generic {
+        chain: ows_core::Chain,
+        key: ows_signer::SecretBytes,
+        tx_bytes: Vec<u8>,
+    },
+}
+
+/// Decrypt signing key and decode `--tx` for owner-mode sign / send (non–API-token).
+pub fn resolve_owner_sign_context(
+    wallet_name: &str,
+    chain_str: &str,
+    tx_hex: &str,
+    index: u32,
+    for_self_submit: bool,
+) -> Result<OwnerSignContext, CliError> {
+    let chain = crate::parse_chain(chain_str)?;
+    let key = resolve_signing_key(wallet_name, chain.chain_type, index)?;
+    if chain.chain_type == ows_core::ChainType::Midnight {
+        let prepared = ows_lib::chains::midnight::prepare_midnight_owner_tx_context(
+            wallet_name,
+            &chain,
+            tx_hex,
+            key.expose(),
+            Some(index),
+            Some(vault_dir().as_path()),
+            for_self_submit,
+            || read_passphrase().to_string(),
+        )
+        .map_err(|e| CliError::InvalidArgs(e.to_string()))?;
+        return Ok(OwnerSignContext::Midnight { key, prepared });
+    }
+    let tx_bytes = ows_lib::decode_owner_tx_hex(&chain, tx_hex)
+        .map_err(|e| CliError::InvalidArgs(e.to_string()))?;
+    Ok(OwnerSignContext::Generic {
+        chain,
+        key,
+        tx_bytes,
+    })
+}
+
+/// Sign an owner-resolved transaction.
+pub fn sign_owner_transaction(
+    ctx: &OwnerSignContext,
+) -> Result<ows_lib::SignResult, ows_lib::OwsLibError> {
+    match ctx {
+        OwnerSignContext::Midnight { key, prepared } => {
+            ows_lib::chains::midnight::sign_prepared_owner_transaction(key.expose(), prepared)
+        }
+        OwnerSignContext::Generic {
+            chain,
+            key,
+            tx_bytes,
+        } => ows_lib::sign_transaction_with_key(chain, key.expose(), tx_bytes),
+    }
+}
+
+/// Sign and broadcast an owner-resolved transaction.
+pub fn send_owner_transaction(
+    ctx: &OwnerSignContext,
+    chain_str: &str,
+    rpc_url: Option<&str>,
+) -> Result<ows_lib::SendResult, ows_lib::OwsLibError> {
+    match ctx {
+        OwnerSignContext::Midnight { key, prepared } => {
+            ows_lib::chains::midnight::sign_and_send_prepared_owner_transaction(
+                key.expose(),
+                prepared,
+                rpc_url,
+            )
+        }
+        OwnerSignContext::Generic {
+            chain: _,
+            key,
+            tx_bytes,
+        } => ows_lib::sign_encode_and_broadcast(key.expose(), chain_str, tx_bytes, rpc_url),
+    }
 }

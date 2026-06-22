@@ -1,6 +1,4 @@
-use ows_signer::signer_for_chain;
-
-use crate::{parse_chain, CliError};
+use crate::CliError;
 
 pub fn run(
     chain_str: &str,
@@ -23,41 +21,24 @@ pub fn run(
             Some(index),
             None,
         )?;
-        return print_result(&result.signature, result.recovery_id, json_output);
+        return print_result(&result, json_output);
     }
 
-    // Owner mode: resolve key directly (existing behavior)
-    let chain = parse_chain(chain_str)?;
-    let key = super::resolve_signing_key(wallet_name, chain.chain_type, index)?;
-
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| CliError::InvalidArgs(format!("invalid hex transaction: {e}")))?;
-
-    let signer = signer_for_chain(chain.chain_type);
-    let signable = signer.extract_signable_bytes(&tx_bytes)?;
-    let output = signer.sign_transaction(key.expose(), signable)?;
-
-    print_result(
-        &hex::encode(&output.signature),
-        output.recovery_id,
-        json_output,
-    )
+    let ctx = super::resolve_owner_sign_context(wallet_name, chain_str, tx_hex, index, false)?;
+    let result = super::sign_owner_transaction(&ctx)?;
+    print_result(&result, json_output)
 }
 
-fn print_result(
-    signature: &str,
-    recovery_id: Option<u8>,
-    json_output: bool,
-) -> Result<(), CliError> {
+fn print_result(result: &ows_lib::SignResult, json_output: bool) -> Result<(), CliError> {
     if json_output {
         let obj = serde_json::json!({
-            "signature": signature,
-            "recovery_id": recovery_id,
+            "signature": result.signature,
+            "recovery_id": result.recovery_id,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
-    } else {
-        println!("{signature}");
+        return Ok(());
     }
+
+    println!("{}", result.signature);
     Ok(())
 }

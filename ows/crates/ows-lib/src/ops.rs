@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use ows_core::{
-    default_chain_for_type, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
-    ALL_CHAIN_TYPES,
+    universal_wallet_chains, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
+    UNIVERSAL_WALLET_ACCOUNT_COUNT,
 };
 use ows_signer::{
     decrypt, encrypt, signer_for_chain, CryptoEnvelope, Curve, HdDeriver, Mnemonic,
@@ -36,16 +36,39 @@ fn parse_chain(s: &str) -> Result<ows_core::Chain, OwsLibError> {
     ows_core::parse_chain(s).map_err(OwsLibError::InvalidInput)
 }
 
+/// Transaction bytes for policy evaluation before decrypt (chain-aware).
+pub fn policy_tx_bytes_for_chain(
+    chain: &ows_core::Chain,
+    tx_arg: &str,
+) -> Result<Vec<u8>, OwsLibError> {
+    if chain.chain_type == ChainType::Midnight {
+        return crate::chains::midnight::policy_context_tx_bytes(chain, tx_arg);
+    }
+    decode_owner_tx_hex(chain, tx_arg)
+}
+
+/// Decode owner-mode `--tx` hex for non-Midnight chains.
+pub fn decode_owner_tx_hex(chain: &ows_core::Chain, tx_arg: &str) -> Result<Vec<u8>, OwsLibError> {
+    if chain.chain_type == ChainType::Midnight {
+        return Err(OwsLibError::InvalidInput(
+            "Midnight transactions must be resolved via chains::midnight::wallet".into(),
+        ));
+    }
+    let trimmed = tx_arg.trim();
+    let hex_s = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    hex::decode(hex_s)
+        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))
+}
+
 /// Derive accounts for all chain families from a mnemonic at the given index.
 fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAccount>, OwsLibError> {
-    let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
-    for ct in &ALL_CHAIN_TYPES {
-        let chain = default_chain_for_type(*ct);
-        let signer = signer_for_chain(*ct);
+    let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
+    for chain in universal_wallet_chains() {
+        let signer = signer_for_chain(chain.chain_type);
         let path = signer.default_derivation_path(index);
         let curve = signer.curve();
         let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve)?;
-        let address = signer.derive_address(key.expose())?;
+        let address = signer.derive_address_for_chain_id(chain.chain_id, key.expose())?;
         let account_id = format!("{}:{}", chain.chain_id, address);
         accounts.push(WalletAccount {
             account_id,
@@ -112,12 +135,11 @@ impl KeyPair {
 
 /// Derive accounts for all chain families using a key pair (one key per curve).
 fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, OwsLibError> {
-    let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
-    for ct in &ALL_CHAIN_TYPES {
-        let signer = signer_for_chain(*ct);
+    let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
+    for chain in universal_wallet_chains() {
+        let signer = signer_for_chain(chain.chain_type);
         let key = keys.key_for_curve(signer.curve());
-        let address = signer.derive_address(key)?;
-        let chain = default_chain_for_type(*ct);
+        let address = signer.derive_address_for_chain_id(chain.chain_id, key)?;
         accounts.push(WalletAccount {
             account_id: format!("{}:{}", chain.chain_id, address),
             address,
@@ -184,7 +206,7 @@ pub fn derive_address(
     let curve = signer.curve();
 
     let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, curve)?;
-    let address = signer.derive_address(key.expose())?;
+    let address = signer.derive_address_for_chain_id(chain.chain_id, key.expose())?;
     Ok(address)
 }
 
@@ -476,10 +498,36 @@ fn sign_hash_with_credential(
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
     let output = signer.sign(key.expose(), hash_bytes)?;
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    Ok(SignResult::detached_signature(
+        hex::encode(&output.signature),
+        output.recovery_id,
+    ))
+}
+
+/// Sign raw transaction bytes with a decrypted private key (non-Midnight chains).
+///
+/// For Midnight, use [`crate::chains::midnight::wallet::sign_transaction_for_wallet`] or
+/// [`crate::chains::midnight::wallet::sign_prepared_owner_transaction`].
+pub fn sign_transaction_with_key(
+    chain: &ows_core::Chain,
+    private_key: &[u8],
+    tx_bytes: &[u8],
+) -> Result<SignResult, OwsLibError> {
+    if chain.chain_type == ChainType::Midnight {
+        return Err(OwsLibError::InvalidInput(
+            "Midnight signing requires dust seed and connector options; use \
+             chains::midnight::wallet::sign_transaction"
+                .into(),
+        ));
+    }
+
+    let signer = signer_for_chain(chain.chain_type);
+    let signable = signer.extract_signable_bytes(tx_bytes)?;
+    let output = signer.sign_transaction(private_key, signable)?;
+    Ok(SignResult::detached_signature(
+        hex::encode(&output.signature),
+        output.recovery_id,
+    ))
 }
 
 /// Sign a transaction. Returns hex-encoded signature.
@@ -487,6 +535,9 @@ fn sign_hash_with_credential(
 /// The `passphrase` parameter accepts either the owner's passphrase or an
 /// API token (`ows_key_...`). When a token is provided, policy enforcement
 /// kicks in and the mnemonic is decrypted via HKDF instead of scrypt.
+///
+/// For Midnight, the return value includes a full signed transaction hex in
+/// [`SignResult::signature`] (see [`crate::types::is_midnight_transaction_signature_hex`]).
 pub fn sign_transaction(
     wallet: &str,
     chain: &str,
@@ -496,30 +547,32 @@ pub fn sign_transaction(
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
-
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))?;
+    let chain = parse_chain(chain)?;
 
     // Agent mode: token-based signing with policy enforcement
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
-        let chain = parse_chain(chain)?;
         return crate::key_ops::sign_with_api_key(
-            credential, wallet, &chain, &tx_bytes, index, vault_path,
+            credential, wallet, &chain, tx_hex, index, vault_path,
         );
     }
 
-    // Owner mode: existing passphrase-based signing (unchanged)
-    let chain = parse_chain(chain)?;
+    // Owner mode
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(chain.chain_type);
-    let signable = signer.extract_signable_bytes(&tx_bytes)?;
-    let output = signer.sign_transaction(key.expose(), signable)?;
+    if chain.chain_type == ChainType::Midnight {
+        return crate::chains::midnight::wallet::sign_transaction_for_wallet(
+            wallet,
+            &chain,
+            tx_hex,
+            credential,
+            key.expose(),
+            index,
+            vault_path,
+            false,
+        );
+    }
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    let tx_bytes = decode_owner_tx_hex(&chain, tx_hex)?;
+    sign_transaction_with_key(&chain, key.expose(), &tx_bytes)
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.
@@ -581,6 +634,9 @@ pub fn sign_authorization(
 
 /// Sign a message. Returns hex-encoded signature.
 ///
+/// For Midnight, [`SignResult::signature`] is hex(`x_only_pubkey[32] || bip340_sig[64]`);
+/// see [`crate::types::encode_midnight_message_signature`].
+///
 /// The `passphrase` parameter accepts either the owner's passphrase or an
 /// API token (`ows_key_...`).
 pub fn sign_message(
@@ -619,11 +675,7 @@ pub fn sign_message(
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
     let signer = signer_for_chain(chain.chain_type);
     let output = signer.sign_message(key.expose(), &msg_bytes)?;
-
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign EIP-712 typed structured data. Returns hex-encoded signature.
@@ -663,10 +715,10 @@ pub fn sign_typed_data(
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    Ok(SignResult::detached_signature(
+        hex::encode(&output.signature),
+        output.recovery_id,
+    ))
 }
 
 /// Sign and broadcast a transaction. Returns the transaction hash.
@@ -684,18 +736,17 @@ pub fn sign_and_send(
     vault_path: Option<&Path>,
 ) -> Result<SendResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
+    let chain_info = parse_chain(chain)?;
 
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))?;
-
-    // Agent mode: enforce policies, decrypt key, then sign + broadcast
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
-        let chain_info = parse_chain(chain)?;
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
-        let signer = signer_for_chain(chain_info.chain_type);
-        let transaction = signer.make_transaction_context(&tx_bytes, rpc_url)?;
+        let policy_bytes = policy_tx_bytes_for_chain(&chain_info, tx_hex)?;
+        let transaction = ows_core::policy::TransactionContext {
+            effects: vec![],
+            raw_hex: hex::encode(&policy_bytes),
+            data: None,
+        };
         let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
             key_file,
@@ -706,13 +757,38 @@ pub fn sign_and_send(
             index,
             vault_path,
         )?;
+        if chain_info.chain_type == ChainType::Midnight {
+            return crate::chains::midnight::wallet::sign_and_send_for_wallet(
+                wallet,
+                &chain_info,
+                tx_hex,
+                credential,
+                key.expose(),
+                index,
+                vault_path,
+                rpc_url,
+            );
+        }
+        let tx_bytes = decode_owner_tx_hex(&chain_info, tx_hex)?;
         return sign_encode_and_broadcast(key.expose(), chain, &tx_bytes, rpc_url);
     }
 
     // Owner mode
-    let chain_info = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain_info.chain_type, credential, index, vault_path)?;
+    if chain_info.chain_type == ChainType::Midnight {
+        return crate::chains::midnight::wallet::sign_and_send_for_wallet(
+            wallet,
+            &chain_info,
+            tx_hex,
+            credential,
+            key.expose(),
+            index,
+            vault_path,
+            rpc_url,
+        );
+    }
 
+    let tx_bytes = decode_owner_tx_hex(&chain_info, tx_hex)?;
     sign_encode_and_broadcast(key.expose(), chain, &tx_bytes, rpc_url)
 }
 
@@ -729,6 +805,12 @@ pub fn sign_encode_and_broadcast(
     rpc_url: Option<&str>,
 ) -> Result<SendResult, OwsLibError> {
     let chain = parse_chain(chain)?;
+    if chain.chain_type == ChainType::Midnight {
+        return Err(OwsLibError::InvalidInput(
+            "Midnight send-tx requires chains::midnight::wallet::sign_and_send".into(),
+        ));
+    }
+
     let signer = signer_for_chain(chain.chain_type);
 
     // 1. Extract signable portion (strips signature-slot headers for Solana; no-op for others)
@@ -826,9 +908,7 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
         ChainType::Xrpl => broadcast_xrpl(rpc_url, signed_bytes),
         ChainType::Nano => broadcast_nano(rpc_url, signed_bytes),
         ChainType::Near => crate::near_rpc::broadcast_tx_commit(rpc_url, signed_bytes),
-        ChainType::Midnight => Err(OwsLibError::InvalidInput(
-            "Midnight send is not wired until transaction signing is integrated".into(),
-        )),
+        ChainType::Midnight => crate::chains::midnight::broadcast_sealed(rpc_url, signed_bytes),
     }
 }
 
@@ -1192,6 +1272,7 @@ mod tests {
         let phrase = generate_mnemonic(12).unwrap();
         let chains = [
             "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "sui", "xrpl", "nano", "near",
+            "midnight",
         ];
         for chain in &chains {
             let addr = derive_address(&phrase, chain, None).unwrap();
@@ -1321,7 +1402,9 @@ mod tests {
         let near_tx_hex = "42".repeat(80);
 
         let chains = [
-            "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "spark", "sui", "xrpl", "near",
+            // Note: XRPL signing expects a properly binary-encoded XRPL transaction body.
+            // This test uses a generic dummy hex blob for non-Solana chains, so we exclude XRPL here.
+            "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "spark", "sui", "near",
         ];
         for chain in &chains {
             let tx = if *chain == "solana" {
@@ -1490,7 +1573,7 @@ mod tests {
 
         assert_eq!(
             info.accounts.len(),
-            ALL_CHAIN_TYPES.len(),
+            UNIVERSAL_WALLET_ACCOUNT_COUNT,
             "should have one account per chain type"
         );
 
