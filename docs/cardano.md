@@ -2,17 +2,22 @@
 
 > Status: work in progress. This document specifies the Cardano integration parts
 > that are **implemented** in this fork, and flags the parts that are still
-> **planned**. It is scoped to three deliverables that are complete:
+> **planned**. It is scoped to four deliverables that are complete:
 >
 > 1. **Analysis, architecture, and setup** — codebase familiarization, build/test
 >    pipeline, and a map of where Cardano fits into the existing abstractions (see
 >    [Analysis, Architecture, and Setup](#analysis-architecture-and-setup)).
 > 2. **CAIP-2 / CAIP-10 addressing abstraction**
 > 3. **Key derivation and cryptography — Ed25519-BIP32**
+> 4. **Implementing the chain plugin interface** — Shelley address encoding
+>    (base/enterprise/reward), CIP-8 (COSE) message signing, and transaction
+>    signing/witness encoding, all via `cardano-serialization-lib` and its
+>    `cardano-message-signing` companion (see
+>    [Transaction and Message Signing](#3-transaction-and-message-signing-chain-plugin-interface)).
 >
-> Transaction building, message/transaction signing, and Shelley address
-> encoding are explicitly out of scope for these deliverables and are
-> tracked separately.
+> Transaction *building* (input selection, fee/change calculation) and balance/UTxO
+> fetching remain out of scope for these deliverables and are tracked separately;
+> the signer operates on an already-assembled unsigned transaction (CBOR).
 
 ## Abstract
 
@@ -27,7 +32,14 @@ CIP-1852 hierarchical derivation. Cardano accounts are derived from two credenti
 — a payment credential (`role = 0`) and a stake credential (`role = 2`) — which
 diverges from OWS's prior assumption that one account maps to a single derivation
 path; the key-storage and derivation layers were extended to carry the two
-96-byte extended private keys required to later assemble a Shelley base address.
+96-byte extended private keys required to assemble a Shelley base address. On top
+of this foundation, the chain plugin interface (`ChainSigner`) is fully
+implemented: Shelley **base**, **enterprise**, and **reward** address encoding;
+raw Ed25519 signing; CIP-8 message signing (COSE `COSE_Sign1` structures); and
+transaction signing that produces and CBOR-encodes the `Vkeywitness`es required to
+make a transaction submittable. Address encoding, transaction (de)serialization,
+and witness construction use `cardano-serialization-lib` (CSL), while the COSE
+message structures use Emurgo's `cardano-message-signing` companion library.
 
 ## Motivation
 
@@ -80,11 +92,18 @@ Cardano introduces two additional, Cardano-specific dependencies:
   keys. Chosen so derivation stays in the generic `HdDeriver`, rather than pulling
   a full chain SDK into the key path.
 - **`cardano-serialization-lib` (CSL, 14.1.1)** — the canonical Cardano library
-  for network parameters (`NetworkInfo`), address construction, and CBOR
-  transaction encoding. In the completed deliverables it is used only for
-  `NetworkInfo`; later deliverables will use it for Shelley address encoding and
-  transaction (de)serialization. Note CSL also pulls in `pbkdf2`, which we use
-  directly for the Icarus master-key step.
+  for network parameters (`NetworkInfo`), address construction
+  (`BaseAddress`/`EnterpriseAddress`/`RewardAddress`, `Credential`), extended-key
+  helpers (`Bip32PrivateKey`), and CBOR transaction (de)serialization
+  (`FixedTransaction`, `make_vkey_witness`, `Vkeywitness`). It is used for network
+  parameters, Shelley address encoding, and transaction signing/witness encoding.
+  Note CSL also pulls in `pbkdf2`, which we use directly for the Icarus master-key
+  step.
+- **`emurgo-cardano-message-signing` (1.1.0)** — Emurgo's COSE companion to CSL,
+  used exclusively for CIP-8 message signing. It provides the `COSESign1Builder`,
+  `HeaderMap`/`Headers`/`ProtectedHeaderMap`/`Label`, `AlgorithmId::EdDSA`, and
+  `SignedMessage`/CBOR helpers needed to build and serialize the COSE `Sig_structure`
+  and `COSE_Sign1` payload that Cardano wallets expect.
 
 ### Peculiarities of Cardano vs. other OWS chains
 
@@ -110,9 +129,14 @@ drove a specific design decision later in this document:
 5. **CAIP-2 via CIP-34.** The chain identifier encodes both a network id and a
    network magic (`cip34:<networkId>-<networkMagic>`), rather than a single
    numeric/string reference.
-6. **CBOR transactions + keyless RPC.** Transactions are CBOR (handled by CSL
-   later); the default RPC provider is keyless Koios, with submission via a binary
-   `POST /submittx`.
+6. **CBOR transactions + keyless RPC.** Transactions are CBOR (parsed and
+   witness-encoded by CSL's `FixedTransaction`); the default RPC provider is
+   keyless Koios, with submission via a binary `POST /submittx`.
+7. **COSE message signing (CIP-8).** Unlike most OWS chains, which sign a hashed
+   or prefixed byte string, Cardano message signing follows CIP-8: the message is
+   wrapped in a COSE `COSE_Sign1` structure whose protected headers carry the
+   signing address, and the signature is over the COSE `Sig_structure`, not the
+   raw message.
 
 General specifications worth reading alongside this section:
 [CIP-1852](https://cips.cardano.org/cip/CIP-1852),
@@ -248,8 +272,12 @@ with secp256k1/ed25519 keys for the same path).
 
 Per the agreed scope, only **one base address per account at address index 0** is
 supported initially. `default_derivation_path(index)` returns the payment leaf for
-account 0 (`m/1852'/1815'/0'/0/{index}`), which is what the generic single-path
-key-resolution code (`decrypt_signing_key`, `secret_to_signing_key`) uses today.
+account 0 (`m/1852'/1815'/0'/0/{index}`). Generic single-path key resolution no
+longer derives this leaf directly; instead generic call sites use
+`default_derivation_paths` and `encode_keys` (see
+[§3.5](#35-key-material-abstraction-default_derivation_paths-and-encode_keys)),
+which for Cardano materialize both the payment leaf and the stake key
+(`m/1852'/1815'/0'/2/0`) as a single 192-byte buffer.
 
 #### 2.5 `ChainSigner` integration
 
@@ -260,12 +288,13 @@ key-resolution code (`decrypt_signing_key`, `secret_to_signing_key`) uses today.
 - `coin_type()` → `1815`
 - `default_derivation_path(index)` → payment leaf (see above)
 
-> **Planned (stubbed today):** `derive_address`, `sign`, `sign_message`, and
-> `sign_transaction` currently return errors. `derive_address` documents the
-> intended input layout: a 192-byte private key = payment `XPrv` (96) ‖ stake
-> `XPrv` (96) at matching CIP-1852 indices, from which a Shelley **base** address
-> (`addr1…` on mainnet) will be assembled. The Shelley address encoding and the
-> signing operations are separate, not-yet-completed deliverables.
+`derive_address`, `sign`, `sign_message`, `sign_transaction`, and
+`encode_signed_transaction` are now fully implemented; mnemonic key resolution uses
+`default_derivation_paths` and `encode_keys` (see [§3.5](#35-key-material-abstraction-default_derivation_paths-and-encode_keys));
+they are specified in [§3](#3-transaction-and-message-signing-chain-plugin-interface).
+The key material these methods consume is a 192-byte buffer = payment `XPrv` (96) ‖
+stake `XPrv` (96) at matching CIP-1852 indices (or a bare 96-byte payment `XPrv`,
+which yields an enterprise address with no staking component).
 
 #### 2.6 Multi-credential key storage
 
@@ -279,17 +308,160 @@ extended (`ows-lib/src/ops.rs`):
   version (`ows_version`) is unchanged at `2`; the new field is additive.
 - For imported private-key wallets, `random_ed25519_bip32()` generates **two**
   normalized 96-byte `XPrv`s (payment ‖ stake = 192 bytes) so the layout matches
-  the planned base-address encoding.
+  the base-address encoding.
 - `KeyPair::key_for_curve(Curve::Ed25519Bip32)` returns this material; empty
   material yields a clear "private key for chain is empty" error for wallets
   imported before Cardano support existed.
+- Mnemonic wallets reach the same 192-byte layout through `default_derivation_paths`
+  and `encode_keys` (see
+  [§3.5](#35-key-material-abstraction-default_derivation_paths-and-encode_keys)) rather than through
+  `KeyPair`, so both wallet kinds present an identical payment ‖ stake buffer to the
+  signer.
 
 #### 2.7 Broadcast plumbing
 
 `broadcast` dispatches `ChainType::Cardano` to `broadcast_cardano`, which POSTs the
 raw CBOR transaction to Koios `{rpc}/submittx` (`Content-Type: application/cbor`),
-expects HTTP `202`, and returns the 64-hex-character transaction hash. This path is
-present but only exercisable once transaction signing/encoding lands.
+expects HTTP `202`, and returns the 64-hex-character transaction hash. The fully
+signed CBOR produced by `encode_signed_transaction` (see [§3.4](#34-transaction-signing)) is
+what feeds this path.
+
+### 3. Transaction and message signing (Chain Plugin Interface)
+
+This deliverable implements the `ChainSigner` plugin surface for Cardano:
+address encoding, raw signing, CIP-8 message signing, and transaction
+signing/witness encoding. Address construction, transaction (de)serialization, and
+witness encoding use `cardano-serialization-lib` (CSL); COSE message structures use
+Emurgo's `cardano-message-signing` companion crate.
+
+All signer methods accept the **key material** layout described in
+[§2.5](#25-chainsigner-integration): either a 192-byte payment `XPrv` ‖ stake
+`XPrv`, or a bare 96-byte payment `XPrv`. Two small private helpers slice this
+buffer:
+
+- `payment_bip32(key_material)` → payment `Bip32PrivateKey` (accepts 96 or 192
+  bytes; anything else is a clear `InvalidPrivateKey` error).
+- `stake_bip32(key_material)` → `Some(stake)` when 192 bytes are supplied, `None`
+  for the 96-byte payment-only case.
+
+#### 3.1 Shelley address encoding
+
+`derive_address` chooses the address kind from whether a stake key is present:
+
+| Key material            | Address kind | Helper                          | Example prefix |
+| ----------------------- | ------------ | ------------------------------- | -------------- |
+| payment ‖ stake (192 B) | base         | `base_address_bech32`           | `addr1q…`      |
+| payment only (96 B)     | enterprise   | `enterprise_address_bech32`     | `addr1v…`      |
+| stake only (signing)    | reward       | `reward_address_bech32`         | `stake1…`      |
+
+Each helper hashes the relevant public key (`to_public().to_raw_key().hash()`),
+wraps it in a `Credential::from_keyhash`, builds the matching CSL address type
+(`BaseAddress` / `EnterpriseAddress` / `RewardAddress`) bound to the signer's
+`network_id`, and bech32-encodes it. The reward address is not produced by
+`derive_address` directly; it is used during message signing when a stake/reward
+address is the requested signer.
+
+#### 3.2 Raw signing (`sign`)
+
+`sign` produces a bare 64-byte Ed25519 signature over the supplied bytes using the
+**payment** key, returning the signature plus the payment public key. It performs
+no hashing or prefixing (the caller decides what to sign) and is the low-level
+primitive used by transaction witnessing.
+
+#### 3.3 CIP-8 message signing (`sign_message`)
+
+`sign_message` follows [CIP-8](https://cips.cardano.org/cip/CIP-8): the message is
+embedded in a COSE `COSE_Sign1` structure and the signature is computed over the
+COSE `Sig_structure`, not the raw message. The flow:
+
+1. **Select the signing credential from the optional `address`.** The address (a
+   bech32 string) determines which key signs and is embedded in the protected
+   headers:
+   - `Reward` (`stake1…`) → sign with the **stake** key; requires 192-byte
+     material, else `InvalidPrivateKey`.
+   - `Base` (`addr1q…`) → sign with the **payment** key; also requires the stake
+     key so the base address can be reconstructed and verified.
+   - `Enterprise` (`addr1v…`) → sign with the **payment** key.
+   - Any other address kind → `AddressMismatch`.
+   In each case the signer **re-derives** the address from the key material and
+   compares it to the requested one, returning `AddressMismatch` on any
+   discrepancy. This guarantees the embedded `address` header is one the key
+   actually controls.
+2. **No `address` supplied** → sign with the payment key and embed the address
+   derived from the key material (base if a stake key is present, else
+   enterprise).
+3. **Build the COSE structure.** A `HeaderMap` of protected headers is populated
+   with `AlgorithmId::EdDSA` and an `"address"` label whose value is the **raw
+   address bytes** (CBOR byte string). A `COSESign1Builder` is constructed over
+   these headers and the message payload; `make_data_to_sign()` yields the
+   `Sig_structure`, which is signed with the selected raw Ed25519 key.
+4. **Serialize.** The signature is folded back into the builder, wrapped as a
+   `SignedMessage::new_cose_sign1`, and serialized to CBOR. `SignOutput.signature`
+   is the serialized `COSE_Sign1`; `public_key` is the signing key's public key.
+
+#### 3.4 Transaction signing
+
+`sign_transaction` consumes the unsigned transaction CBOR (it does **not** build
+transactions — input selection, fees, and change are the caller's responsibility):
+
+1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure).
+2. Always create a payment witness with `make_vkey_witness(tx_hash, payment_raw_key)`.
+3. If stake key material is present **and** the transaction body's
+   `required_signers` set contains the stake key hash, also create a stake witness.
+   (Stake witnesses are only added when the transaction explicitly requires them —
+   e.g. certificate or withdrawal transactions — to avoid attaching superfluous
+   signatures.)
+4. `SignOutput.signature` is the **concatenation** of the CBOR-encoded witness(es)
+   (payment, optionally followed by stake); `public_key` is the payment witness's
+   public key.
+
+`encode_signed_transaction` assembles the submittable transaction: it re-parses the
+unsigned CBOR into a `FixedTransaction`, splits the signature buffer into
+fixed-size 101-byte chunks (`VKEY_WITNESS_CBOR_BYTES` = 32-byte pubkey + 64-byte
+signature + 5 bytes of CBOR framing), decodes each chunk into a `Vkeywitness`, adds
+it with `add_vkey_witness`, and returns the CBOR of the now-witnessed transaction.
+This is the byte string handed to `broadcast_cardano` ([§2.7](#27-broadcast-plumbing)).
+
+#### 3.5 Key-material abstraction (`default_derivation_paths` and `encode_keys`)
+
+To let a chain decide how mnemonic-derived key material is shaped, `ChainSigner`
+exposes two overridable hooks:
+
+- `default_derivation_paths(index)` — all BIP paths bound to one account. The
+  default returns a single-element vector containing `default_derivation_path(index)`,
+  so every other chain is unaffected.
+- `encode_keys(keys)` — packs the resolved key bundle into the single opaque blob
+  that signing methods consume. The default returns the primary (first) key
+  unchanged.
+
+`CardanoSigner` overrides both: `default_derivation_paths` returns the payment leaf
+`m/1852'/1815'/0'/0/{index}` and the stake key `m/1852'/1815'/0'/2/0`;
+`encode_keys` concatenates the two 96-byte `XPrv`s into the 192-byte payment ‖
+stake buffer the address and signing methods expect. Generic call sites were
+migrated to this pattern — `derive_all_accounts`, `secret_to_signing_key`,
+`derive_address` (the public lib function), the CLI `derive` command, and the
+signer integration test now call `signer.default_derivation_paths(index)`, derive
+keys via `HdDeriver`, then `signer.encode_keys(&keys)` instead of deriving a single
+path inline. This is what lets Cardano transparently carry two credentials through
+code that still assumes "one account → one key blob".
+
+#### 3.6 Address-aware `sign_message` across all chains
+
+CIP-8 needs to know *which* of a wallet's Cardano addresses a signature is for, so
+the `sign_message` signature gained an `address: Option<&str>` parameter across the
+whole `ChainSigner` trait, every chain implementation, the `ows-lib` entry points
+(`sign_message`, `sign_typed_data`, and their API-key variants), the CLI (a new
+`--address` flag on `sign message`), and the Node/Python bindings.
+
+For non-Cardano chains the parameter is an optional safety check: a new default
+trait method `verify_sign_message_address` re-derives the address from the private
+key and compares it (case-insensitively, ignoring a `0x` prefix) to the requested
+one, returning the new `SignerError::AddressMismatch` on a mismatch. Each chain
+calls it at the top of `sign_message` (and EVM's typed-data path calls it too), so
+passing an `address` that the key does not control is rejected everywhere, while
+passing `None` keeps the prior behavior. Cardano does not use the default check —
+it performs richer, address-kind-aware selection and verification inline (see
+[§3.3](#33-cip-8-message-signing-sign_message)).
 
 ## Rationale
 
@@ -303,8 +475,17 @@ present but only exercisable once transaction signing/encoding lands.
   `cardano-serialization-lib` (CSL). OWS deliberately keeps derivation
   chain-agnostic and generic (a single `HdDeriver` across all families), so we
   implement BIP32-Ed25519 with the lightweight `ed25519-bip32` crate and only use
-  CSL for Cardano-specific concerns (network parameters now; address/tx encoding
-  later). This avoids leaking a chain-specific library into the generic key path.
+  CSL for Cardano-specific concerns (network parameters, address encoding, and
+  transaction/witness encoding). This avoids leaking a chain-specific library into
+  the generic key path while still using the canonical library for the parts that
+  must match the ecosystem byte-for-byte.
+- **CSL + `cardano-message-signing` for the chain plugin, per IOHK.** As recorded
+  in the deliverable description (IOHK agreed on 8.4.2026 to use
+  `cardano-serialization-lib`), address encoding and transaction signing go through
+  CSL, and CIP-8 message signing uses Emurgo's `cardano-message-signing` COSE
+  helpers rather than a hand-rolled COSE encoder. This keeps the produced
+  addresses, witnesses, and signed messages compatible with mainstream Cardano
+  wallets and tooling.
 - **Base address with payment + stake.** Per agreement with IOHK, the initial
   implementation targets exactly one base address per account at address index 0,
   combining a payment credential (role 0) and a stake credential (role 2). This
@@ -313,10 +494,28 @@ present but only exercisable once transaction signing/encoding lands.
 - **Two 96-byte keys in `KeyPair`.** Storing payment ‖ stake (192 bytes) up front
   makes the imported-key representation forward-compatible with base-address
   assembly without another schema change.
+- **`default_derivation_paths` + `encode_keys` instead of widening the signer
+  surface.** Rather than special-casing Cardano in every generic call site,
+  overridable `ChainSigner::default_derivation_paths` and `encode_keys` let a chain
+  declare how many keys per account it needs and how to pack them into one blob.
+  The defaults keep single-path behavior for all other chains; only Cardano returns
+  the 192-byte payment ‖ stake buffer. This localizes the "two credentials per
+  account" peculiarity to the Cardano signer.
+- **`address`-driven message signing.** CIP-8 embeds the signing address in the
+  COSE protected headers, so `sign_message` must know which address the caller
+  intends. Threading an optional `address` through the trait (rather than a
+  Cardano-only API) also gave every other chain a cheap opt-in guard against
+  signing with the wrong key (`verify_sign_message_address` →
+  `AddressMismatch`).
+- **Concatenated witnesses + fixed-size chunking.** `sign_transaction` returns the
+  CBOR witnesses concatenated, and `encode_signed_transaction` splits them back on
+  the fixed 101-byte `Vkeywitness` size. This keeps `SignOutput.signature` a flat
+  byte string (consistent with other chains) while still supporting the
+  multi-witness (payment + stake) case.
 
 ### Acceptance Criteria
 
-These two deliverables are considered complete when:
+These deliverables are considered complete when:
 
 1. `ChainType::Cardano` exists and round-trips through serde, `namespace()`,
    `from_namespace()`, `default_coin_type()`, and `Display`/`FromStr`.
@@ -332,18 +531,31 @@ These two deliverables are considered complete when:
    CIP-1852 payment leaf as its default path.
 7. Multi-curve key storage carries an `ed25519_bip32` entry (192 bytes for
    imported keys) without changing the wallet schema version.
-
-> Shelley address encoding, message signing, and transaction signing are **not**
-> part of these acceptance criteria.
+8. `derive_address` produces the correct mainnet Shelley **base** address from
+   192-byte key material and the correct **enterprise** address from 96-byte
+   payment-only material (verified against fixed vectors for 12- and 24-word
+   mnemonics).
+9. `sign_message` produces a CIP-8 `COSE_Sign1` matching reference vectors for the
+   no-address, base, enterprise, and reward-address cases, and rejects an address
+   the key does not control with `AddressMismatch`.
+10. `sign_transaction` produces correct `Vkeywitness`(es) — payment only, and
+    payment + stake when the transaction's `required_signers` demand it — and
+    `encode_signed_transaction` round-trips them into a submittable transaction
+    matching reference CBOR vectors.
+11. `default_derivation_paths` returns both CIP-1852 paths for Cardano, and
+    `encode_keys` returns the 192-byte payment ‖ stake buffer; all other chains
+    remain on their single-path defaults.
 
 ### Implementation Plan
 
-The two deliverables are landed and covered by unit/integration tests (see
-[Testing](#testing)). Remaining Cardano work (separate deliverables) proceeds as:
-Shelley base-address encoding (consuming the 192-byte payment ‖ stake layout),
-transaction context resolution via Koios, transaction signing
-(`sign`/`sign_transaction`), CIP-8/CIP-30-style message signing, and optional
-alternative RPC providers (e.g. Blockfrost).
+All four deliverables are landed and covered by unit/integration tests (see
+[Testing](#testing)): the chain-registry/addressing layer, Ed25519-BIP32 key
+derivation, and the chain plugin interface (Shelley base/enterprise/reward address
+encoding, raw signing, CIP-8 message signing, and transaction
+signing/witness encoding). Remaining Cardano work (separate deliverables) proceeds
+as: transaction *building* and context resolution via Koios (input selection,
+fee/change), balance/UTxO fetching, persisting both payment and stake paths per
+`WalletAccount`, and optional alternative RPC providers (e.g. Blockfrost).
 
 ## Backwards Compatibility Assessment
 
@@ -355,11 +567,19 @@ alternative RPC providers (e.g. Blockfrost).
 - **Existing families untouched.** secp256k1 and SLIP-10 ed25519 derivation paths
   are unchanged; the `Ed25519Bip32` branch is additive in `Curve`, `HdDeriver`,
   and `KeyPair`. Characterization tests on EVM/Solana derivation continue to pass.
+- **`sign_message` signature changed (binding-level).** Adding `address:
+  Option<&str>` to `ChainSigner::sign_message` and to the `ows-lib`/binding entry
+  points is a source-breaking change for direct callers, mitigated by making the
+  parameter optional: passing `None` reproduces the prior behavior exactly, and
+  every chain's non-Cardano message signing is unchanged when no address is given.
+  `default_derivation_paths` and `encode_keys` are purely additive (defaults mirror
+  the old inline single-path derivation).
 - **Known abstraction gap.** `WalletAccount` still stores a single
   `derivation_path`, so the stored Cardano account currently records only the
-  payment leaf. Carrying both payment and stake paths per account is a noted
-  follow-up (`TODO` in `derive_all_accounts`) required before base-address
-  derivation is finalized.
+  payment leaf even though the signer now derives both payment and stake keys at
+  runtime via `default_derivation_paths` and `encode_keys`. Persisting both paths
+  per account is a noted
+  follow-up (`TODO` in `derive_all_accounts`).
 
 ## Security Considerations
 
@@ -381,6 +601,18 @@ alternative RPC providers (e.g. Blockfrost).
 - **Keyless RPC.** Koios needs no API key, avoiding credential storage. Broadcast
   is performed over HTTPS; transaction submission and input resolution will rely on
   this provider, so provider availability/trust is a deployment consideration.
+- **Address-bound message signing.** `sign_message` always re-derives the address
+  from the supplied key material and refuses to sign for an `address` the key does
+  not control (`AddressMismatch`). The signing address is embedded in the CIP-8
+  COSE protected headers, so a verifier can confirm which credential signed. Across
+  other chains the same `verify_sign_message_address` guard prevents signing a
+  message under an address the wallet did not derive.
+- **Selective stake witnessing.** `sign_transaction` only attaches a stake
+  witness when the transaction body's `required_signers` explicitly lists the
+  stake key hash, so a routine payment transaction is never signed with the stake
+  key. Transaction *content* is not otherwise inspected or policy-checked here —
+  the signer trusts the caller-provided unsigned CBOR — so transaction building and
+  vetting remain the responsibility of upstream layers.
 
 ## Implementation
 
@@ -396,19 +628,37 @@ Components modified or added:
 - `ows-signer/src/mnemonic.rs` — `Mnemonic::entropy()` (raw BIP-39 entropy).
 - `ows-signer/src/hd.rs` — Icarus master-key generation and V2 child derivation.
 - `ows-signer/src/chains/cardano.rs` — `CardanoSigner`, CIP-1852 path helpers,
-  network selection, `ChainSigner` impl (address/sign methods stubbed).
+  network selection, and the full `ChainSigner` impl: base/enterprise/reward
+  address encoding, `sign`, CIP-8 `sign_message`, `sign_transaction`,
+  `encode_signed_transaction`, and the `default_derivation_paths` / `encode_keys`
+  overrides.
+- `ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
+  default methods `verify_sign_message_address`, `default_derivation_paths`, and
+  `encode_keys`; new
+  `SignerError::AddressMismatch`.
+- `ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
+  signature and calls `verify_sign_message_address`.
 - `ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
-  `signer_for_chain`.
+  `signer_for_chain`; integration test uses `default_derivation_paths` and
+  `encode_keys`.
 - `ows-lib/src/ops.rs` — `KeyPair.ed25519_bip32`, random 192-byte generation,
-  curve dispatch, and `broadcast_cardano`.
-- `ows-cli` — `derive`/`info` commands surface the new family.
+  curve dispatch, `broadcast_cardano`; `sign_message`/`sign_typed_data` thread the
+  `address` argument; mnemonic derivation routes through `default_derivation_paths`
+  and `encode_keys`.
+- `ows-lib/src/key_ops.rs` — API-key `sign_message`/`sign_typed_data` thread
+  `address` and call `verify_sign_message_address`.
+- `ows-cli` — `sign message --address` flag; `derive` uses `default_derivation_paths`
+  and `encode_keys`.
+- `bindings/node` & `bindings/python` — `sign_message`/`sign_typed_data` expose
+  the optional `address` argument.
 
 Dependencies added (`ows-signer/Cargo.toml`):
 
 - `ed25519-bip32 = "0.4.1"` — generic BIP32-Ed25519 derivation.
 - `pbkdf2 = "0.12"` — Icarus master-key derivation.
 - `cardano-serialization-lib = "14.1.1"` — Cardano network parameters
-  (`NetworkInfo`) now, address/transaction encoding later.
+  (`NetworkInfo`), Shelley address encoding, and transaction/witness encoding.
+- `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers.
 
 ## Testing
 
@@ -429,20 +679,37 @@ Implemented and passing for these deliverables:
 - **Config** (`config.rs`): default RPC lookups for all three Koios endpoints.
 - **Signer** (`cardano.rs`): CIP-1852 path construction; chain type/curve/coin
   type; default path equals payment leaf.
-
-Not yet covered (pending the signing/address deliverables): the
-`signer_for_chain` integration test asserts a mainnet `addr1…` base address of
-length 103; this depends on the not-yet-implemented Shelley address encoder and
-will pass once that lands.
+- **Address encoding** (`cardano.rs`): mainnet **base** address from 12- and
+  24-word mnemonics (via `default_derivation_paths` and `encode_keys`) against fixed
+  `addr1q…` vectors;
+  **enterprise** address from a payment-only key against fixed `addr1v…` vectors.
+- **Message signing** (`cardano.rs`): CIP-8 `COSE_Sign1` output against reference
+  vectors for the no-address, base, enterprise, and reward-address cases
+  (including the expected public key per signing credential).
+- **Transaction signing** (`cardano.rs`): a CBOR test-transaction builder
+  exercises the payment-only witness path and the payment + required-stake-key
+  path; both `sign_transaction` signatures and the `encode_signed_transaction`
+  output are asserted against reference CBOR.
+- **Cross-chain `sign_message`** (`evm.rs`, etc.): `AddressMismatch` is returned
+  for a wrong `address`, and signing succeeds when the derived address is passed;
+  `None` reproduces prior signatures (`solana.rs`, `bitcoin.rs`).
+- **Integration** (`lib.rs`): `signer_for_chain` derives a mainnet `addr1…` base
+  address via `default_derivation_paths`, `encode_keys`, and `derive_address`, now
+  passing end-to-end.
 
 ## References
 
 - [CIP-34: Cardano Blockchain identification](https://cips.cardano.org/cip/CIP-34) (status: Proposed)
 - [CIP-1852: HD Wallets for Cardano](https://cips.cardano.org/cip/CIP-1852)
 - [CIP-3: Wallet key generation (Icarus master key)](https://cips.cardano.org/cip/CIP-3)
+- [CIP-8: Message signing](https://cips.cardano.org/cip/CIP-8)
+- [CIP-30: Cardano dApp-Wallet Web Bridge (`signData`)](https://cips.cardano.org/cip/CIP-30)
 - [CIP-19: Cardano addresses](https://cips.cardano.org/cip/CIP-19)
 - [BIP32-Ed25519 (Khovratovich & Law)](https://input-output-hk.github.io/adrestia/static/Ed25519_BIP.pdf)
 - [`ed25519-bip32` crate](https://docs.rs/ed25519-bip32/0.4.1/)
+- [`cardano-serialization-lib`](https://github.com/Emurgo/cardano-serialization-lib)
+- [`cardano-message-signing`](https://github.com/Emurgo/message-signing)
+- [RFC 8152: CBOR Object Signing and Encryption (COSE)](https://www.rfc-editor.org/rfc/rfc8152)
 - [Koios API](https://api.koios.rest/)
 - [CAIP-2](https://chainagnostic.org/CAIPs/caip-2) and [CAIP-10](https://chainagnostic.org/CAIPs/caip-10)
 - [SLIP-44: Registered coin types](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (ADA = 1815)
