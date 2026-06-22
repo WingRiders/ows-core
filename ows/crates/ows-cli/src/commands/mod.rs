@@ -17,7 +17,12 @@ use crate::CliError;
 use ows_signer::process_hardening::clear_env_var;
 use ows_signer::SecretBytes;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use zeroize::Zeroizing;
+
+pub(crate) fn vault_dir() -> PathBuf {
+    ows_core::Config::load_or_default().vault_path
+}
 
 /// Read mnemonic from OWS_MNEMONIC env var (or LWS_MNEMONIC fallback) or stdin.
 pub fn read_mnemonic() -> Result<Zeroizing<String>, CliError> {
