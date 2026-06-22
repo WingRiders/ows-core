@@ -67,7 +67,8 @@ pub enum SyncStream {
     Dust,
 }
 
-/// Signing fast path vs fund-balance display (always resume from disk then catch up).
+/// Why the wallet is syncing (balance display vs tx building). Both paths must reach
+/// the indexer chain tip before returning — no stale snapshot or session-cache shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncPurpose {
     Signing,
@@ -77,6 +78,12 @@ pub(crate) enum SyncPurpose {
 impl SyncPurpose {
     pub fn is_display(self) -> bool {
         matches!(self, Self::Display)
+    }
+
+    /// Balance display and tx balancing/signing always reconnect to the indexer.
+    pub fn must_catch_up_to_indexer_tip(self) -> bool {
+        let _ = self;
+        true
     }
 }
 
@@ -157,6 +164,7 @@ pub fn midnight_sync_log_enabled() -> bool {
     [
         "OWS_MIDNIGHT_SYNC_LOG",
         "OWS_MIDNIGHT_DUST_SYNC_LOG",
+        "OWS_PAY_MIDNIGHT_DUST_SYNC_LOG",
         "OWS_MIDNIGHT_UNSHIELDED_SYNC_LOG",
         "OWS_MIDNIGHT_SHIELDED_SYNC_LOG",
     ]

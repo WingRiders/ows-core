@@ -1,7 +1,7 @@
 //! Shielded indexer session: `connect(viewingKey)` + `shieldedTransactions` replay.
 
 use super::error::{PayError, PayErrorCode};
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::SinkExt as _;
 use midnight_coin_structure::coin::{self, QualifiedInfo as QualifiedCoinInfo};
 use midnight_coin_structure::transfer;
 use midnight_ledger::events::{Event, EventDetails};
@@ -585,10 +585,42 @@ async fn replay_shielded_ws_loop(
     applied_event_ids: &mut BTreeSet<i64>,
     log: bool,
 ) -> Result<(), PayError> {
-    while let Some(msg) = ws.next().await {
-        let msg = msg.map_err(|e| PayError::new(PayErrorCode::HttpTransport, e.to_string()))?;
-        let tokio_tungstenite::tungstenite::Message::Text(t) = msg else {
-            continue;
+    use std::time::Instant;
+
+    let ws_idle = midnight_env::ws_idle_timeout(SyncStream::Shielded);
+    let stall_timeout = midnight_env::stall_timeout(SyncStream::Shielded);
+    let sync_started = Instant::now();
+    let mut last_event_at: Option<Instant> = None;
+
+    loop {
+        let stall_elapsed = last_event_at.unwrap_or(sync_started).elapsed();
+        if stall_elapsed > stall_timeout {
+            return Err(PayError::new(
+                PayErrorCode::HttpTransport,
+                format!(
+                    "no shielded indexer events for {}s (highest_end={highest_end:?} highest_checked={highest_checked}); \
+indexer may be stalled",
+                    stall_timeout.as_secs()
+                ),
+            ));
+        }
+
+        let t = match indexer_ws::read_subscription_text(ws, ws_idle).await? {
+            indexer_ws::SubscriptionTextRead::Text(t) => {
+                last_event_at = Some(Instant::now());
+                t
+            }
+            indexer_ws::SubscriptionTextRead::Closed => break,
+            indexer_ws::SubscriptionTextRead::IdleTimeout => {
+                return Err(PayError::new(
+                    PayErrorCode::HttpTransport,
+                    format!(
+                        "Midnight indexer shielded sync: no WebSocket data for {}s \
+(highest_end={highest_end:?} highest_checked={highest_checked})",
+                        ws_idle.as_secs()
+                    ),
+                ));
+            }
         };
 
         let frame: indexer_ws::WsFrame<ShieldedWsData> = serde_json::from_str(&t)

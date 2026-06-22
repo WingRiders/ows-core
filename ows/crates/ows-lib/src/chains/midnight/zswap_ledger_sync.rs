@@ -1,7 +1,6 @@
 //! Full `zswapLedgerEvents` replay fallback for shielded balance sync.
 
 use super::error::{PayError, PayErrorCode};
-use futures_util::{SinkExt as _, StreamExt as _};
 use midnight_coin_structure::coin;
 use midnight_coin_structure::transfer;
 use midnight_ledger::events::{Event, EventDetails};
@@ -97,13 +96,18 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
         eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
     }
 
-    if saved_max_id > 0 && last_seen_id >= saved_max_id {
+    if saved_max_id > 0 && last_seen_id >= saved_max_id && !purpose.must_catch_up_to_indexer_tip() {
         if log {
             eprintln!(
                 "[ows-midnight] zswapLedgerEvents: already at saved chain tip (last_seen_id={last_seen_id} max_id={saved_max_id})"
             );
         }
         return Ok(balances_from_owned_coins(&owned));
+    }
+    if saved_max_id > 0 && last_seen_id >= saved_max_id && log {
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents: snapshot at saved tip (last_seen_id={last_seen_id} max_id={saved_max_id}), catching up on indexer…"
+        );
     }
 
     let mut max_id: Option<i64> = if saved_max_id > 0 {
@@ -118,8 +122,14 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
     let stall_timeout = midnight_env::stall_timeout(SyncStream::Shielded);
     let sync_started = Instant::now();
     let mut last_event_at: Option<Instant> = None;
+    let verifying_at_tip = saved_max_id > 0 && last_seen_id >= saved_max_id;
+    let max_attempts = if verifying_at_tip {
+        midnight_env::dust_verify_max_attempts()
+    } else {
+        4
+    };
 
-    for attempt in 0..=3u32 {
+    for attempt in 0..max_attempts {
         if log && attempt > 0 {
             eprintln!(
                 "[ows-midnight] zswapLedgerEvents: reconnecting (attempt {}) from event id {}",
@@ -136,18 +146,24 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
             indexer_ws::connect_and_init(indexer_url, ws_idle, Some("zswapLedgerEvents")).await?;
 
         let resume_id = last_seen_id.saturating_add(1);
+        let sub_vars = if verifying_at_tip {
+            // At tip the indexer often has no events after `last_seen+1`; omit `id` so the
+            // stream starts from the live head instead of RST on an empty resume cursor.
+            serde_json::json!({ "id": serde_json::Value::Null })
+        } else {
+            serde_json::json!({ "id": resume_id })
+        };
         if log {
             eprintln!(
-                "[ows-midnight] zswapLedgerEvents: subscribed from event id {resume_id} (last_seen_id={last_seen_id} saved_max_id={saved_max_id})"
+                "[ows-midnight] zswapLedgerEvents: subscribed from event id {} (last_seen_id={last_seen_id} saved_max_id={saved_max_id})",
+                if verifying_at_tip {
+                    "null (tip verify)".to_string()
+                } else {
+                    resume_id.to_string()
+                }
             );
         }
-        indexer_ws::subscribe(
-            &mut ws,
-            "1",
-            ZSWAP_LEDGER_SUB,
-            serde_json::json!({ "id": resume_id }),
-        )
-        .await?;
+        indexer_ws::subscribe(&mut ws, "1", ZSWAP_LEDGER_SUB, sub_vars).await?;
 
         let (dropped, attempt_events) = replay_zswap_ws_loop(
             &mut ws,
@@ -163,6 +179,7 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
             &mut last_event_at,
             progress_interval,
             log,
+            verifying_at_tip,
         )
         .await?;
 
@@ -177,7 +194,7 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
             }
             break;
         }
-        if attempt < 3 {
+        if attempt + 1 < max_attempts {
             tokio::time::sleep(Duration::from_millis(
                 250u64.saturating_mul((attempt + 1) as u64),
             ))
@@ -185,6 +202,13 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
             continue;
         }
         if attempt_events == 0 && max_id.is_some_and(|m| last_seen_id >= m) {
+            if log && verifying_at_tip {
+                eprintln!(
+                    "[ows-midnight] zswapLedgerEvents: accepting saved tip after verify \
+(last_seen_id={last_seen_id} max_id={})",
+                    max_id.unwrap_or(-1)
+                );
+            }
             break;
         }
         return Err(PayError::new(
@@ -249,69 +273,78 @@ async fn replay_zswap_ws_loop(
     last_event_at: &mut Option<Instant>,
     progress_interval: u64,
     log: bool,
+    verifying_at_tip: bool,
 ) -> Result<(bool, u64), PayError> {
-    use tokio_tungstenite::tungstenite::Message;
-
-    let mut dropped = false;
     let mut attempt_events: u64 = 0;
 
     loop {
+        let effective_stall = if verifying_at_tip && attempt_events == 0 {
+            midnight_env::dust_verify_idle_timeout()
+        } else {
+            stall_timeout
+        };
         let stall_elapsed = last_event_at.unwrap_or(sync_started).elapsed();
-        if stall_elapsed > stall_timeout {
+        if stall_elapsed > effective_stall {
+            if verifying_at_tip && attempt_events == 0 && max_id.is_some_and(|m| *last_seen_id >= m)
+            {
+                if log {
+                    eprintln!(
+                        "[ows-midnight] zswapLedgerEvents: verify stall {}s, accepting saved tip \
+(last_seen_id={last_seen_id} max_id={max_id:?})",
+                        effective_stall.as_secs()
+                    );
+                }
+                return Ok((false, attempt_events));
+            }
             return Err(PayError::new(
                 PayErrorCode::HttpTransport,
                 format!(
                     "no zswap ledger events for {}s (last_seen_id={last_seen_id} max_id={max_id:?}); \
 indexer may be stalled",
-                    stall_timeout.as_secs()
+                    effective_stall.as_secs()
                 ),
             ));
         }
 
-        let msg = match tokio::time::timeout(ws_idle, ws.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(_))) | Ok(None) => {
-                dropped = true;
-                break;
+        let read_timeout = if verifying_at_tip && attempt_events == 0 {
+            midnight_env::dust_verify_idle_timeout()
+        } else {
+            ws_idle
+        };
+
+        let t = match indexer_ws::read_subscription_text(ws, read_timeout).await? {
+            indexer_ws::SubscriptionTextRead::Text(t) => {
+                *last_event_at = Some(Instant::now());
+                t
             }
-            Err(_) => {
-                if attempt_events == 0 && max_id.is_some_and(|m| *last_seen_id >= m) {
-                    if log {
+            indexer_ws::SubscriptionTextRead::Closed => {
+                let at_tip = attempt_events == 0 && max_id.is_some_and(|m| *last_seen_id >= m);
+                if log {
+                    eprintln!(
+                        "[ows-midnight] zswapLedgerEvents: connection closed{} \
+(last_seen_id={last_seen_id} max_id={max_id:?})",
+                        if at_tip { " at tip" } else { "" }
+                    );
+                }
+                return Ok((!at_tip, attempt_events));
+            }
+            indexer_ws::SubscriptionTextRead::IdleTimeout => {
+                let at_tip = attempt_events == 0 && max_id.is_some_and(|m| *last_seen_id >= m);
+                if log {
+                    if at_tip {
                         eprintln!(
                             "[ows-midnight] zswapLedgerEvents: no new events (already at tip last_seen_id={last_seen_id} max_id={max_id:?})"
                         );
-                    }
-                    dropped = false;
-                } else {
-                    if log {
+                    } else {
                         eprintln!(
                             "[ows-midnight] zswapLedgerEvents: no indexer message for {}s (last_seen_id={last_seen_id} max_id={max_id:?})",
-                            ws_idle.as_secs()
+                            read_timeout.as_secs()
                         );
                     }
-                    dropped = true;
                 }
-                break;
+                return Ok((!at_tip, attempt_events));
             }
         };
-
-        let Message::Text(t) = msg else {
-            match msg {
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
-                Message::Close(_) => {
-                    dropped = true;
-                }
-                Message::Text(_) => unreachable!(),
-            }
-            if dropped {
-                break;
-            }
-            continue;
-        };
-        *last_event_at = Some(Instant::now());
 
         let frame: indexer_ws::WsFrame<ZswapWsData> = serde_json::from_str(&t)
             .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
@@ -386,19 +419,19 @@ indexer may be stalled",
                 }
 
                 if max_id.is_some_and(|m| *last_seen_id >= m) {
-                    dropped = false;
-                    break;
+                    return Ok((false, attempt_events));
                 }
             }
-            "complete" => {
-                dropped = false;
-                break;
+            "complete" => return Ok((false, attempt_events)),
+            "error" => {
+                return Err(PayError::new(
+                    PayErrorCode::ProtocolMalformed,
+                    format!("indexer zswap subscription error: {t}"),
+                ));
             }
             _ => {}
         }
     }
-
-    Ok((dropped, attempt_events))
 }
 
 fn encode_zswap_owned_coins(

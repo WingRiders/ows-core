@@ -55,12 +55,14 @@ async fn get_shielded_balances_impl(
     let network = MidnightNetwork::from_indexer_url(indexer_url);
     let zswap_fallback = midnight_env::shielded_zswap_fallback_enabled(network);
 
-    if zswap_fallback {
-        if let Some(bal) = session_cache::get_shielded(scope, &fp, &zswap_cache_key) {
+    if session_cache::session_cache_shortcut_allowed(purpose) {
+        if zswap_fallback {
+            if let Some(bal) = session_cache::get_shielded(scope, &fp, &zswap_cache_key) {
+                return Ok(bal);
+            }
+        } else if let Some(bal) = session_cache::get_shielded(scope, &fp, &vk_fp) {
             return Ok(bal);
         }
-    } else if let Some(bal) = session_cache::get_shielded(scope, &fp, &vk_fp) {
-        return Ok(bal);
     }
 
     let zswap_fut = zswap_ledger_sync::get_shielded_balances_from_zswap_ledger_events_scoped(

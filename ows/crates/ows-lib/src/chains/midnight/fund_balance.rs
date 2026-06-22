@@ -153,6 +153,7 @@ pub fn print_fund_balance(
 
     let indexer_url = resolve_indexer_url(chain_id)?;
     let sync_scope = sync_scope_for_wallet(wallet_name, Some(chain_id), vault_path);
+    super::session_cache::invalidate_wallet_indexer_session_cache(&indexer_url, &sync_scope);
 
     if midnight_sync_log_enabled() {
         eprintln!("[ows-midnight] syncing unshielded balance from indexer…");

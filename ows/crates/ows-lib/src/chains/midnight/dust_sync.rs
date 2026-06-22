@@ -6,7 +6,6 @@
 //! [`format_dust_specks`] (render `SPECKS_PER_DUST`-denominated values).
 
 use super::error::{PayError, PayErrorCode};
-use futures_util::{SinkExt as _, StreamExt as _};
 use midnight_ledger::dust::{
     DustLocalState, DustPublicKey, DustSecretKey, INITIAL_DUST_PARAMETERS,
 };
@@ -30,6 +29,7 @@ pub struct DustSyncOptions {
     pub log_progress: bool,
     /// Reconnect when the indexer WebSocket sends no frames for this long.
     pub ws_idle_timeout: Duration,
+    pub purpose: SyncPurpose,
 }
 
 impl Default for DustSyncOptions {
@@ -38,6 +38,7 @@ impl Default for DustSyncOptions {
             stall_timeout: midnight_env::stall_timeout(SyncStream::Dust),
             log_progress: midnight_env::midnight_sync_log_enabled(),
             ws_idle_timeout: midnight_env::ws_idle_timeout(SyncStream::Dust),
+            purpose: SyncPurpose::Signing,
         }
     }
 }
@@ -100,7 +101,10 @@ impl DustSyncOptions {
 
     /// `ows fund balance` — runs until caught up unless the indexer stalls.
     pub fn for_fund_balance_display() -> Self {
-        Self::default()
+        Self {
+            purpose: SyncPurpose::Display,
+            ..Self::default()
+        }
     }
 }
 
@@ -213,12 +217,15 @@ async fn sync_dust_local_state_inner(
     let dust_pk_hex = dust_public_key_hex(dust_sk)?;
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
 
-    if let Some(state_hex) = session_cache::get_dust_ledger_state_hex(scope, &fp, &dust_pk_hex) {
-        if let Ok(state) = super::dust_sync_cache::decode_state(&state_hex) {
-            if options.log_progress {
-                eprintln!("[ows-midnight] dust sync: using in-process session cache");
+    if session_cache::session_cache_shortcut_allowed(options.purpose) {
+        if let Some(state_hex) = session_cache::get_dust_ledger_state_hex(scope, &fp, &dust_pk_hex)
+        {
+            if let Ok(state) = super::dust_sync_cache::decode_state(&state_hex) {
+                if options.log_progress {
+                    eprintln!("[ows-midnight] dust sync: using in-process session cache");
+                }
+                return Ok(state);
             }
-            return Ok(state);
         }
     }
 
@@ -350,15 +357,14 @@ async fn sync_dust_local_state_inner(
                 break;
             }
 
-            use tokio_tungstenite::tungstenite::Message;
             let read_timeout = dust_ws_read_timeout(verifying_at_tip, attempt_events, ws_idle);
-            let msg = match tokio::time::timeout(read_timeout, ws.next()).await {
-                Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(_))) | Ok(None) => {
+            let t = match indexer_ws::read_subscription_text(&mut ws, read_timeout).await? {
+                indexer_ws::SubscriptionTextRead::Text(t) => t,
+                indexer_ws::SubscriptionTextRead::Closed => {
                     dropped = true;
                     break;
                 }
-                Err(_) => {
+                indexer_ws::SubscriptionTextRead::IdleTimeout => {
                     if attempt_events == 0 && dust_at_chain_tip(last_seen_id, max_id) {
                         if log_progress {
                             eprintln!(
@@ -385,22 +391,6 @@ async fn sync_dust_local_state_inner(
                     }
                     break;
                 }
-            };
-            let Message::Text(t) = msg else {
-                match msg {
-                    Message::Ping(p) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
-                    Message::Close(_) => {
-                        dropped = true;
-                    }
-                    Message::Text(_) => unreachable!(),
-                }
-                if !dropped {
-                    break;
-                }
-                continue;
             };
             let frame: indexer_ws::WsFrame<DustWsData> = serde_json::from_str(&t)
                 .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
@@ -572,8 +562,10 @@ async fn get_dust_balance_scoped_with_options(
     let dust_pk_hex = dust_public_key_hex(&dust_sk)?;
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
 
-    if let Some(cached) = session_cache::get_dust(scope, &fp, &dust_pk_hex) {
-        return Ok(cached);
+    if session_cache::session_cache_shortcut_allowed(purpose) {
+        if let Some(cached) = session_cache::get_dust(scope, &fp, &dust_pk_hex) {
+            return Ok(cached);
+        }
     }
 
     // Always load snapshot inside sync (if present) and catch up incrementally.

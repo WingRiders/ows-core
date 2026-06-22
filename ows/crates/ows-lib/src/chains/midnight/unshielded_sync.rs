@@ -3,18 +3,18 @@
 //!
 //! Mirrors [`super::shielded_sync`] for the unshielded (transparent) ledger:
 //! we replay `created` / `spent` events until we reach `highestTransactionId`,
-//! optionally short-circuiting from a recent disk snapshot.
+//! resuming from on-disk snapshots, then verifying catch-up at the indexer chain tip.
 
 use super::error::{PayError, PayErrorCode};
-use futures_util::StreamExt as _;
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::cache_io::{self, SyncCacheScope, SyncPurpose};
 use super::indexer_ws;
-use super::midnight_env::{midnight_sync_log_enabled, stall_timeout, ws_idle_timeout, SyncStream};
+use super::midnight_env::{
+    dust_verify_idle_timeout, midnight_sync_log_enabled, stall_timeout, ws_idle_timeout, SyncStream,
+};
 use super::session_cache;
 
 const SNAPSHOT_VERSION: u32 = 5;
@@ -89,9 +89,7 @@ subscription UnshieldedTransactions($address: UnshieldedAddress!, $transactionId
 
 /// Retrieve the current *unshielded* UTXO set for a Midnight address (signing / tx-building).
 ///
-/// Uses the in-process session cache (90s) when warm; otherwise resumes from disk snapshots
-/// and catches up on the indexer. Session cache is cleared after each successful submit once
-/// the indexer reflects the transaction.
+/// Resumes from on-disk snapshots then always catches up on the indexer before returning.
 pub(crate) async fn get_unshielded_utxos_scoped(
     indexer_url: &str,
     address: &str,
@@ -322,18 +320,21 @@ async fn get_unshielded_utxos_inner(
     indexer_url: &str,
     address: &str,
     scope: &SyncCacheScope,
-    _purpose: SyncPurpose,
+    purpose: SyncPurpose,
     wait_for_tx_hash: Option<&str>,
     tx_seen: &mut bool,
 ) -> Result<Vec<UnshieldedUtxo>, PayError> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
-    if let Some(cached) = session_cache::get_unshielded(scope, &fp, address) {
-        return Ok(cached);
+    if session_cache::session_cache_shortcut_allowed(purpose) {
+        if let Some(cached) = session_cache::get_unshielded(scope, &fp, address) {
+            return Ok(cached);
+        }
     }
 
     let cache_path = cache_io::snapshot_path(CACHE_SUBDIR, indexer_url, address, scope);
 
     let mut resume_last_seen: i64 = 0;
+    let mut saved_highest_tx_id: i64 = 0;
     let mut snapshot_at_saved_tip = false;
     let mut utxos: BTreeMap<(String, i64, String), UnshieldedUtxo> = BTreeMap::new();
 
@@ -349,26 +350,14 @@ async fn get_unshielded_utxos_inner(
             ) && snap.address == address
             {
                 resume_last_seen = snap.last_seen_tx_id;
-                snapshot_at_saved_tip = snap.is_complete() && snap.highest_tx_id_when_saved > 0;
+                saved_highest_tx_id = snap.highest_tx_id_when_saved;
+                snapshot_at_saved_tip = snap.is_complete() && saved_highest_tx_id > 0;
                 utxos = seed_utxos_from_snapshot(&snap);
             }
         }
     }
 
     let mut last_seen: i64 = resume_last_seen;
-
-    if wait_for_tx_hash.is_none() && snapshot_at_saved_tip {
-        let log_progress = midnight_sync_log_enabled();
-        if log_progress {
-            eprintln!(
-                "[ows-midnight] unshielded sync: already at saved chain tip \
-(last_seen_tx_id={resume_last_seen})"
-            );
-        }
-        let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
-        session_cache::put_unshielded(scope, &fp, address, list.clone());
-        return Ok(list);
-    }
 
     let start_tx_id = if resume_last_seen > 0 {
         Some(resume_last_seen.saturating_add(1))
@@ -392,6 +381,16 @@ async fn get_unshielded_utxos_inner(
     let ws_idle = ws_idle_timeout(SyncStream::Unshielded);
     let sync_started = Instant::now();
     let mut last_event_at: Option<Instant> = None;
+    let verifying_at_tip = wait_for_tx_hash.is_none()
+        && snapshot_at_saved_tip
+        && resume_last_seen > 0
+        && resume_last_seen >= saved_highest_tx_id;
+    if verifying_at_tip && log_progress {
+        eprintln!(
+            "[ows-midnight] unshielded sync: snapshot at saved tip \
+(last_seen_tx_id={resume_last_seen} highest={saved_highest_tx_id}), verifying with indexer…"
+        );
+    }
 
     let mut ws = indexer_ws::connect_and_init(indexer_url, ws_idle, None).await?;
 
@@ -407,29 +406,63 @@ async fn get_unshielded_utxos_inner(
     let mut sync_done = false;
 
     while !sync_done {
+        let effective_stall = if verifying_at_tip && !progress_received {
+            dust_verify_idle_timeout()
+        } else {
+            stall_timeout
+        };
         let stall_elapsed = last_event_at.unwrap_or(sync_started).elapsed();
-        if stall_elapsed > stall_timeout {
+        if stall_elapsed > effective_stall {
+            let tip_id = highest.unwrap_or(saved_highest_tx_id);
+            if verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id) {
+                if log_progress {
+                    eprintln!(
+                        "[ows-midnight] unshielded sync: verify stall {}s, accepting saved tip \
+(last_seen_tx_id={last_seen} highest={tip_id})",
+                        effective_stall.as_secs()
+                    );
+                }
+                sync_done = true;
+                break;
+            }
             return Err(PayError::new(
                 PayErrorCode::HttpTransport,
                 format!(
                     "no unshielded indexer events for {}s (last_seen_tx_id={last_seen} highest={highest:?}); \
 indexer may be stalled",
-                    stall_timeout.as_secs()
+                    effective_stall.as_secs()
                 ),
             ));
         }
 
-        let msg = match tokio::time::timeout(ws_idle, ws.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(e))) => {
-                return Err(PayError::new(PayErrorCode::HttpTransport, e.to_string()));
+        let read_timeout = if verifying_at_tip && !progress_received {
+            dust_verify_idle_timeout()
+        } else {
+            ws_idle
+        };
+        let t = match indexer_ws::read_subscription_text(&mut ws, read_timeout).await? {
+            indexer_ws::SubscriptionTextRead::Text(t) => {
+                last_event_at = Some(Instant::now());
+                t
             }
-            Ok(None) => break,
-            Err(_) => {
+            indexer_ws::SubscriptionTextRead::Closed => break,
+            indexer_ws::SubscriptionTextRead::IdleTimeout => {
+                let tip_id = highest.unwrap_or(saved_highest_tx_id);
+                if verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id) {
+                    if log_progress {
+                        eprintln!(
+                            "[ows-midnight] unshielded sync: verify idle {}s, accepting saved tip \
+(last_seen_tx_id={last_seen} highest={tip_id})",
+                            read_timeout.as_secs()
+                        );
+                    }
+                    sync_done = true;
+                    break;
+                }
                 if log_progress {
                     eprintln!(
                         "[ows-midnight] unshielded sync: no indexer message for {}s (last_seen={last_seen} highest={highest:?})",
-                        ws_idle.as_secs()
+                        read_timeout.as_secs()
                     );
                 }
                 return Err(PayError::new(
@@ -437,15 +470,11 @@ indexer may be stalled",
                     format!(
                         "Midnight indexer unshielded sync: no WebSocket data for {}s \
 (last_seen_tx_id={last_seen} highest={highest:?})",
-                        ws_idle.as_secs()
+                        read_timeout.as_secs()
                     ),
                 ));
             }
         };
-        let tokio_tungstenite::tungstenite::Message::Text(t) = msg else {
-            continue;
-        };
-        last_event_at = Some(Instant::now());
 
         let frame: indexer_ws::WsFrame<UnshieldedWsData> = serde_json::from_str(&t)
             .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
@@ -475,15 +504,15 @@ indexer may be stalled",
                         progress_received = true;
                         if log_progress {
                             eprintln!(
-                                "[ows-midnight] unshielded sync progress: last_seen={last_seen} highest={highest_transaction_id}"
-                            );
+                                        "[ows-midnight] unshielded sync progress: last_seen={last_seen} highest={highest_transaction_id}"
+                                    );
                         }
                         if unshielded_sync_done(progress_received, highest, last_seen) {
                             sync_done = true;
                             if log_progress {
                                 eprintln!(
-                                    "[ows-midnight] unshielded sync: caught up (last_seen={last_seen} highest={highest_transaction_id})"
-                                );
+                                            "[ows-midnight] unshielded sync: caught up (last_seen={last_seen} highest={highest_transaction_id})"
+                                        );
                             }
                         }
                     }
@@ -523,13 +552,16 @@ indexer may be stalled",
     // Drop the socket instead of awaiting `complete` — some indexers never ack it and block for minutes.
     drop(ws);
 
-    if !unshielded_sync_done(progress_received, highest, last_seen) {
-        return Err(PayError::new(
-            PayErrorCode::HttpTransport,
-            "Midnight indexer closed the unshielded subscription before sync completed; \
+    if !sync_done && !unshielded_sync_done(progress_received, highest, last_seen) {
+        let tip_id = highest.unwrap_or(saved_highest_tx_id);
+        if !(verifying_at_tip && last_seen >= tip_id.max(saved_highest_tx_id)) {
+            return Err(PayError::new(
+                PayErrorCode::HttpTransport,
+                "Midnight indexer closed the unshielded subscription before sync completed; \
 try again or check indexer health."
-                .to_string(),
-        ));
+                    .to_string(),
+            ));
+        }
     }
 
     let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
@@ -629,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_at_saved_tip_skips_ws_when_complete() {
+    fn snapshot_complete_when_last_seen_reaches_saved_highest() {
         let snap = UnshieldedSyncSnapshot {
             version: SNAPSHOT_VERSION,
             indexer_fingerprint: String::new(),

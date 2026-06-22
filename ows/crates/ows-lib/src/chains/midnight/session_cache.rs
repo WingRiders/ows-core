@@ -1,14 +1,16 @@
 //! In-process cache for Midnight sync results within a single CLI / library session.
 //!
-//! Avoids repeated indexer WebSocket replays when balance and sign run back-to-back.
-//! Cleared after each successful Midnight submit once the indexer reflects the transaction.
+//! Optional in-process cache (90s TTL) for internal fast paths only.
+//! User-facing balance and sign flows invalidate the site cache first, then always
+//! catch up on the indexer. Cleared after each successful Midnight submit.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::cache_io::SyncCacheScope;
+use super::cache_io::{self, SyncCacheScope};
+use super::midnight_env::SyncPurpose;
 use super::unshielded_sync::UnshieldedUtxo;
 use super::ShieldedBalances;
 
@@ -159,6 +161,11 @@ fn site_prefix(scope: &SyncCacheScope, indexer_fp: &str) -> String {
     )
 }
 
+/// Whether a sync may return a warm in-process entry without talking to the indexer.
+pub(super) fn session_cache_shortcut_allowed(purpose: SyncPurpose) -> bool {
+    !purpose.must_catch_up_to_indexer_tip()
+}
+
 /// Drop all in-process sync caches for a wallet/indexer/chain site (e.g. after submit).
 pub(super) fn invalidate_site(scope: &SyncCacheScope, indexer_fp: &str) {
     let prefix = site_prefix(scope, indexer_fp);
@@ -169,4 +176,11 @@ pub(super) fn invalidate_site(scope: &SyncCacheScope, indexer_fp: &str) {
     for map in by_kind.values_mut() {
         map.retain(|k, _| !k.starts_with(prefix.as_str()));
     }
+}
+
+/// Clear in-process sync caches before balance display or tx balancing so UTXO/coin state
+/// is refreshed from the indexer (disk snapshots are still used as a resume cursor).
+pub(super) fn invalidate_wallet_indexer_session_cache(indexer_url: &str, scope: &SyncCacheScope) {
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    invalidate_site(scope, &fp);
 }

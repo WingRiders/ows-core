@@ -25,6 +25,8 @@
 //! | `OWS_MIDNIGHT_DUST_STALL_TIMEOUT_SECS` | Fail only if no dust events applied for this long (default **120**; aliases: `OWS_MIDNIGHT_DUST_*_SYNC_TIMEOUT_SECS`) |
 //! | `OWS_MIDNIGHT_DUST_SNAPSHOT_MAX_AGE_SECS` | TTL for signing fast-path snapshot reuse; fund balance always resumes from disk then syncs |
 //! | `OWS_MIDNIGHT_DUST_WS_IDLE_TIMEOUT_SECS` | Reconnect if the WebSocket sends no frames (default **90**) |
+//! | `OWS_MIDNIGHT_DUST_VERIFY_IDLE_TIMEOUT_SECS` | Tip-verify idle before reconnect/accept (default **15**) |
+//! | `OWS_MIDNIGHT_WS_CONNECT_TIMEOUT_SECS` | WebSocket connect handshake timeout (default **30**) |
 //! | `OWS_MIDNIGHT_SKIP_DUST_BALANCE=1` | Skip DUST ledger sync in `fund balance` |
 //! | `OWS_MIDNIGHT_SYNC_LOG=1` | Progress lines during Midnight indexer sync (stderr) |
 //! | `OWS_MIDNIGHT_SHIELDED_VK_FREE` | `1`/`true`: shielded **balance** sync uses only `zswapLedgerEvents` (never `connect(viewingKey)`); shielded **spends** fail until a VK-free spend path exists |
@@ -182,7 +184,7 @@ pub fn snapshot_path(
 
 /// Max age for returning a complete cached snapshot without hitting the indexer.
 ///
-/// Reserved for optional display fast-paths; signing always catches up on the indexer.
+/// Reserved for legacy env tuning; balance and signing always catch up on the indexer.
 ///
 /// Priority: `OWS_MIDNIGHT_SNAPSHOT_MAX_AGE_SECS` env → 120s when wallet-scoped → 0.
 #[allow(dead_code)]

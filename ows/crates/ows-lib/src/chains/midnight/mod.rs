@@ -203,6 +203,8 @@ pub fn prepare_sealed_from_unsealed(
     sync_scope: &SyncCacheScope,
     pay_fees: bool,
 ) -> Result<Vec<u8>, PayError> {
+    session_cache::invalidate_wallet_indexer_session_cache(indexer_url, sync_scope);
+
     let key32: [u8; 32] = sender_private_key.try_into().map_err(|_| {
         PayError::new(
             PayErrorCode::InvalidInput,
