@@ -1087,18 +1087,27 @@ fn attach_shielded_proven_inputs_if_needed(
     let mut binding_delta = PedersenRandomness::from(0);
 
     for (segment, seg_deficits) in inputs_by_segment {
-        let zswap_inputs = super::dapp_connector::collect_shielded_preimage_inputs(
+        let selection = super::dapp_connector::collect_shielded_preimage_inputs(
             &mut wallet,
             segment,
             &seg_deficits,
         )?;
-        if zswap_inputs.is_empty() {
+        if selection.inputs.is_empty() {
             continue;
         }
-        for inp in &zswap_inputs {
+        for inp in &selection.inputs {
             binding_delta = binding_delta + inp.binding_randomness();
         }
-        let preimage_offer = ZswapOffer::new(zswap_inputs, vec![], vec![])
+        let change_outputs = super::dapp_connector::build_shielded_change_outputs(
+            &wallet,
+            segment,
+            &selection.spent_by_token,
+            &seg_deficits,
+        )?;
+        for out in &change_outputs {
+            binding_delta = binding_delta + out.binding_randomness();
+        }
+        let preimage_offer = ZswapOffer::new(selection.inputs, change_outputs, vec![])
             .ok_or_else(|| err("failed to build shielded input offer for contract balancing"))?;
         let (_seg, proven_partial) = rt
             .block_on(preimage_offer.prove(prover.clone(), segment))

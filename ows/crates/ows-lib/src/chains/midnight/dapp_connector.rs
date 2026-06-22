@@ -512,22 +512,31 @@ fn build_make_intent_standard_tx(
     Ok(out)
 }
 
+/// Shielded coin spends selected from the wallet (whole coins; may exceed the requested amount).
+pub(super) struct ShieldedZswapSelection {
+    pub inputs: Vec<ZswapInput<ProofPreimage, InMemoryDB>>,
+    /// Total value consumed per token (sum of spent coin values).
+    pub spent_by_token: Vec<(ShieldedTokenType, u128)>,
+}
+
 /// Build shielded Zswap spend preimages covering per-token deficits (for contract-call balancing).
 pub(super) fn collect_shielded_preimage_inputs(
     wallet: &mut ShieldedWalletState,
     segment: u16,
     deficits: &[(ShieldedTokenType, u128)],
-) -> Result<Vec<ZswapInput<ProofPreimage, InMemoryDB>>, PayError> {
+) -> Result<ShieldedZswapSelection, PayError> {
     super::shielded_session::ensure_shielded_merkle_ready(wallet)?;
     let mut rng = OsRng;
     let seg = Some(segment);
     let mut zswap_inputs = Vec::new();
+    let mut spent_by_token = Vec::new();
     for (token_type, need_total) in deficits {
         if *need_total == 0 {
             continue;
         }
         let wire = hex::encode(token_type.into_inner().0);
         let mut need = *need_total;
+        let mut spent = 0u128;
         let mut coins: Vec<QualifiedCoinInfo> = wallet
             .zswap
             .coins
@@ -553,6 +562,7 @@ spend wallet should come from zswapLedgerEvents replay only)"
                     err(format!("shielded spend failed: {e:?}{hint}"))
                 })?;
             wallet.zswap = st2;
+            spent = spent.saturating_add(coin.value);
             need = need.saturating_sub(coin.value);
             zswap_inputs.push(inp);
         }
@@ -569,8 +579,48 @@ spend wallet should come from zswapLedgerEvents replay only)"
 state (have {have}). Run `ows fund balance` to confirm zswapLedgerEvents sync, then sign again"
             )));
         }
+        if spent > 0 {
+            spent_by_token.push((*token_type, spent));
+        }
     }
-    Ok(zswap_inputs)
+    Ok(ShieldedZswapSelection {
+        inputs: zswap_inputs,
+        spent_by_token,
+    })
+}
+
+/// Return shielded change outputs to the wallet owner when whole-coin spends exceed what is owed.
+pub(super) fn build_shielded_change_outputs(
+    wallet: &ShieldedWalletState,
+    segment: u16,
+    spent_by_token: &[(ShieldedTokenType, u128)],
+    output_due_by_token: &[(ShieldedTokenType, u128)],
+) -> Result<Vec<ZswapOutput<ProofPreimage, InMemoryDB>>, PayError> {
+    let mut rng = OsRng;
+    let cpk = wallet.keys.coin_public_key();
+    let epk = wallet.keys.enc_public_key();
+    let seg = Some(segment);
+    let mut outputs = Vec::new();
+    for (token, spent) in spent_by_token {
+        let due = output_due_by_token
+            .iter()
+            .find(|(t, _)| t == token)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        let change = spent.saturating_sub(due);
+        if change == 0 {
+            continue;
+        }
+        let coin = CoinInfo {
+            nonce: rng.r#gen(),
+            type_: *token,
+            value: change,
+        };
+        let out = ZswapOutput::new(&mut rng, &coin, seg, &cpk, Some(epk))
+            .map_err(|e| err(format!("shielded change output failed: {e:?}")))?;
+        outputs.push(out);
+    }
+    Ok(outputs)
 }
 
 fn build_zswap_offer(
@@ -582,6 +632,7 @@ fn build_zswap_offer(
 ) -> Result<ZswapOffer<ProofPreimage, InMemoryDB>, PayError> {
     let mut rng = OsRng;
     let mut zswap_inputs: Vec<ZswapInput<ProofPreimage, InMemoryDB>> = Vec::new();
+    let mut zswap_outputs: Vec<ZswapOutput<ProofPreimage, InMemoryDB>> = Vec::new();
 
     if !desired_inputs.is_empty() {
         let wallet =
@@ -595,11 +646,28 @@ fn build_zswap_offer(
                 Ok((wire_type_to_shielded(&d.token_type)?, d.value))
             })
             .collect::<Result<Vec<_>, PayError>>()?;
-        zswap_inputs = collect_shielded_preimage_inputs(wallet, segment, &deficits)?;
+        let selection = collect_shielded_preimage_inputs(wallet, segment, &deficits)?;
+        zswap_inputs = selection.inputs;
+        let mut output_due: std::collections::BTreeMap<ShieldedTokenType, u128> =
+            std::collections::BTreeMap::new();
+        for d in desired_outputs {
+            if d.kind != TransferKind::Shielded {
+                continue;
+            }
+            let tt = wire_type_to_shielded(&d.token_type)?;
+            *output_due.entry(tt).or_insert(0) = output_due
+                .get(&tt)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(d.value);
+        }
+        let output_due: Vec<_> = output_due.into_iter().collect();
+        let change_outputs =
+            build_shielded_change_outputs(wallet, segment, &selection.spent_by_token, &output_due)?;
+        zswap_outputs.extend(change_outputs);
     }
 
     let seg = Some(segment);
-    let mut zswap_outputs: Vec<ZswapOutput<ProofPreimage, InMemoryDB>> = Vec::new();
     for d in desired_outputs {
         if d.value == 0 {
             return Err(err("desired output value must be greater than zero"));
