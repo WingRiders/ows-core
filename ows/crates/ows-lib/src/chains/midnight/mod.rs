@@ -5,7 +5,7 @@
 //!
 //! - [`unshielded_sync`] — replay `unshieldedTransactions` to materialize a
 //!   wallet's spendable UTXO set; counterpart to [`shielded_sync`].
-//! - [`shielded_sync`] — Zswap balance sync via `shieldedTransactions`.
+//! - [`shielded_sync`] — Zswap balance/spend sync via `zswapLedgerEvents` (midnight-wallet-sdk path).
 //! - [`dust_sync`] — DUST local-state replay + decay-aware balance helper.
 //! - [`ledger_params`] — indexer `block { ledgerParameters }` fetch + decode.
 //! - [`prover`] — proof generation client (`OwsProver`).

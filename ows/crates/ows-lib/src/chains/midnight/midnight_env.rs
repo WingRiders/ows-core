@@ -172,11 +172,16 @@ pub fn midnight_sync_log_enabled() -> bool {
     .any(env_flag_truthy)
 }
 
-/// When true, shielded **balance** sync uses only `zswapLedgerEvents` replay and never calls
-/// `connect(viewingKey)` on the indexer. Shielded **spends** (`sync_shielded_wallet_state_scoped`)
-/// still require a viewing-key session and will fail until a VK-free spend path exists.
+/// When true, shielded sync uses only `zswapLedgerEvents` replay (the midnight-wallet-sdk path).
+/// This is the default for balance and spend; no `connect(viewingKey)` session is started.
 pub fn shielded_vk_free_sync_enabled() -> bool {
     env_flag_truthy("OWS_MIDNIGHT_SHIELDED_VK_FREE")
+}
+
+/// Primary shielded sync uses `zswapLedgerEvents` + `ZswapLocalState::replay_events`, matching
+/// `@midnight-ntwrk/wallet-sdk-shielded` (Lace). Enabled by default on preview/preprod.
+pub fn shielded_zswap_ledger_sync_enabled(network: MidnightNetwork) -> bool {
+    shielded_vk_free_sync_enabled() || shielded_zswap_fallback_enabled(network)
 }
 
 pub fn shielded_zswap_fallback_enabled(network: MidnightNetwork) -> bool {
@@ -190,9 +195,14 @@ pub fn shielded_zswap_fallback_enabled(network: MidnightNetwork) -> bool {
     }
 }
 
-/// Whether shielded balance sync may call `connect(viewingKey)` as a fallback.
-pub fn shielded_indexer_session_enabled() -> bool {
-    !shielded_vk_free_sync_enabled()
+/// Optional `connect(viewingKey)` + `shieldedTransactions` replay (wallet-indexer session).
+/// Off by default — midnight-wallet-sdk does not use this for shielded balance/spend; it uses
+/// `zswapLedgerEvents` locally. Opt in with `OWS_MIDNIGHT_SHIELDED_SESSION_SYNC=1` to compare.
+pub fn shielded_indexer_session_sync_enabled() -> bool {
+    if shielded_vk_free_sync_enabled() {
+        return false;
+    }
+    env_flag_truthy("OWS_MIDNIGHT_SHIELDED_SESSION_SYNC")
 }
 
 /// After viewing-key session sync, merge qualified coins from the on-disk zswap-ledger snapshot
@@ -205,17 +215,9 @@ pub fn shielded_zswap_spend_hydrate_enabled(_network: MidnightNetwork) -> bool {
     env_flag_truthy("OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE")
 }
 
-/// Build spendable shielded state from full `zswapLedgerEvents` replay (`ZswapLocalState::replay_events`).
-/// Used when the viewing-key session has no coins but zswap-ledger balance does. Default on preview/preprod.
+/// Build spend wallet state from `zswapLedgerEvents` + `ZswapLocalState::replay_events` (Lace model).
 pub fn shielded_zswap_spend_wallet_enabled(network: MidnightNetwork) -> bool {
-    if shielded_vk_free_sync_enabled() {
-        return false;
-    }
-    match std::env::var("OWS_MIDNIGHT_SHIELDED_ZSWAP_SPEND") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => shielded_zswap_fallback_enabled(network),
-    }
+    shielded_zswap_ledger_sync_enabled(network)
 }
 
 pub fn fund_balance_skip_dust_sync() -> bool {

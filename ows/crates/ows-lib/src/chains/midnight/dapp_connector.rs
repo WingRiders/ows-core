@@ -545,8 +545,8 @@ pub(super) fn collect_shielded_preimage_inputs(
                 .spend(&mut rng, &wallet.keys, &coin, seg)
                 .map_err(|e| {
                     let hint = if format!("{e:?}").contains("InvalidIndex") {
-                        " (often caused by OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE merging zswap-ledger \
-coins into session state — unset that env var and use only viewing-key session coins)"
+                        " (often caused by OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE — unset that env var; \
+spend wallet should come from zswapLedgerEvents replay only)"
                     } else {
                         ""
                     };
@@ -565,10 +565,8 @@ coins into session state — unset that env var and use only viewing-key session
                 .map(|(_, qci)| qci.value)
                 .sum();
             return Err(err(format!(
-                "insufficient shielded balance for token 0x{wire}: short by {need} in viewing-key \
-wallet state (session has {have}). If `ows fund balance` lists this token under \"zswap-ledger only\", \
-those coins are not spendable yet — run `ows fund balance` again, then sign; ensure \
-OWS_MIDNIGHT_SHIELDED_VK_FREE is unset"
+                "insufficient shielded balance for token 0x{wire}: short by {need} in zswap wallet \
+state (have {have}). Run `ows fund balance` to confirm zswapLedgerEvents sync, then sign again"
             )));
         }
     }

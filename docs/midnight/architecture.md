@@ -131,6 +131,25 @@ Disk snapshots live under `{vault}/sync/midnight/{unshielded|shielded|dust}/` (s
 Environment toggles (stall timeouts, VK-free shielded sync, logging) are centralized in
 `midnight_env.rs`.
 
+### Indexer WebSocket stalls (why it happens, what OWS does)
+
+Midnight sync uses **graphql-transport-ws** subscriptions (`unshieldedTransactions`,
+`zswapLedgerEvents`, `dustLedgerEvents`, `shieldedTransactions`). Perceived “stalls” usually come
+from one of these:
+
+| Cause | What you see | Mitigation in OWS |
+|-------|----------------|-------------------|
+| **Already at chain tip** | Subscription resumes after the last event id; the indexer may RST or send no `next` frames | Tip **verify**: shorter idle (`OWS_MIDNIGHT_DUST_VERIFY_IDLE_TIMEOUT_SECS`, default 15s), accept on-disk tip on idle/close; **zswap** uses `id: null` at tip (resume cursor `last_seen+1` can RST); WS resets map to reconnect, not fatal |
+| **Protocol keepalive** | Indexer sends `{"type":"ping"}` (or WebSocket Ping frames); client must answer or the server may drop the socket | `indexer_ws::read_subscription_text` replies with `pong` / WS Pong and does **not** treat pings as “no data” |
+| **Large catch-up** | Long replay from genesis (especially `zswapLedgerEvents`) with sparse progress lines | On-disk snapshots + resume cursor; `OWS_MIDNIGHT_SYNC_LOG=1` for progress; tune `OWS_MIDNIGHT_*_STALL_TIMEOUT_SECS` |
+| **Dead / slow indexer** | No frames at all until idle timeout | Per-stream `OWS_MIDNIGHT_*_WS_IDLE_TIMEOUT_SECS` (default 90s) and stall timeouts (default 120s); dust/zswap reconnect |
+
+**Operator knobs:** `OWS_MIDNIGHT_SYNC_LOG=1`, increase stall timeouts if the public indexer is
+slow, `OWS_MIDNIGHT_SHIELDED_VK_FREE=1` for zswap-only sync. Optional viewing-key session sync
+(`OWS_MIDNIGHT_SHIELDED_SESSION_SYNC=1`) requires the canonical viewing key encoding from
+`wallet-sdk-address-format` (ScaleBigInt serialization of the encryption secret key — not raw
+`repr()` bytes). See `shielded_session.rs`, `cache_io.rs`, and `midnight_env.rs`.
+
 ## Transaction and signing pipelines
 
 ### 1. Sealed wire (`midnight:transaction[v9](...)`)

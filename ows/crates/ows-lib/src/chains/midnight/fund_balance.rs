@@ -192,7 +192,7 @@ pub fn print_fund_balance(
         Default::default()
     };
     let shielded = shielded_report.spendable;
-    let shielded_zswap_only = shielded_report.zswap_only;
+    let shielded_session_only = shielded_report.session_only;
 
     print_addresses(
         chain_id,
@@ -201,7 +201,7 @@ pub fn print_fund_balance(
         dust_seed.as_ref(),
     )?;
 
-    if unshielded.is_empty() && shielded.is_empty() && shielded_zswap_only.is_empty() {
+    if unshielded.is_empty() && shielded.is_empty() && shielded_session_only.is_empty() {
         eprintln!("No Midnight tokens found for {address} on {chain_id}");
         return Ok(());
     }
@@ -214,27 +214,21 @@ pub fn print_fund_balance(
         eprintln!();
     }
     if shielded_seed.is_some() {
-        eprintln!("Shielded spendable balances (viewing-key session):");
+        eprintln!("Shielded balances (zswapLedgerEvents):");
         if shielded.is_empty() {
-            eprintln!("  (none — no unspent shielded coins in session after full sync)");
+            eprintln!("  (none — no unspent shielded coins after zswap ledger sync)");
         } else {
             for (token_type, amount) in &shielded {
                 println!("{:>24} {}", amount, token_type);
             }
         }
-        if !shielded_zswap_only.is_empty() {
+        if !shielded_session_only.is_empty() {
             eprintln!();
             eprintln!(
-                "Shielded zswap-ledger only (visible on-chain but not in viewing-key session — OWS cannot sign shielded spends for these until the indexer delivers them as RelevantTransaction):"
+                "Shielded viewing-key session only (OWS_MIDNIGHT_SHIELDED_SESSION_SYNC=1 diagnostic — not in zswap replay):"
             );
-            for (token_type, amount) in &shielded_zswap_only {
+            for (token_type, amount) in &shielded_session_only {
                 println!("{:>24} {}", amount, token_type);
-            }
-            if shielded.is_empty() {
-                eprintln!();
-                eprintln!(
-                    "Hint: receive or transfer shielded funds again (to your shielded address above) using a wallet that updates the indexer session, then re-run fund balance."
-                );
             }
         }
         eprintln!();
