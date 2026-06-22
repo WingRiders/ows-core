@@ -140,6 +140,17 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_full_pipeline_midnight_unshielded() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let address = derive_address_for_chain(&mnemonic, ChainType::Midnight);
+        assert!(
+            address.starts_with("mn_addr1"),
+            "Midnight mainnet unshielded address should start with mn_addr1, got: {}",
+            address
+        );
+    }
+
+    #[test]
     fn test_spark_uses_bitcoin_derivation_path() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
         let btc_signer = signer_for_chain(ChainType::Bitcoin);
@@ -264,6 +275,7 @@ mod integration_tests {
             ChainType::Spark,
             ChainType::Filecoin,
             ChainType::Xrpl,
+            ChainType::Midnight,
         ] {
             let signer = signer_for_chain(chain);
             assert_eq!(signer.chain_type(), chain);

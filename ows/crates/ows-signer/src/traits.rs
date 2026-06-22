@@ -30,6 +30,19 @@ pub trait ChainSigner: Send + Sync {
     /// Derive an on-chain address from a private key.
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError>;
 
+    /// Derive an on-chain address for a specific CAIP-2 chain ID.
+    ///
+    /// Default implementation ignores `chain_id` and calls `derive_address`.
+    /// Chains with network-specific address formats (e.g. HRP differences) should override.
+    fn derive_address_for_chain_id(
+        &self,
+        chain_id: &str,
+        private_key: &[u8],
+    ) -> Result<String, SignerError> {
+        let _ = chain_id;
+        self.derive_address(private_key)
+    }
+
     /// Sign a pre-hashed message (32 bytes for secp256k1, raw message for ed25519).
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
 
