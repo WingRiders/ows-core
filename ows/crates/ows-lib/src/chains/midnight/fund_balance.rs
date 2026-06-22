@@ -18,34 +18,56 @@ use super::{
 };
 use crate::error::OwsLibError;
 
-fn print_addresses(
+struct MidnightWalletAddresses {
+    unshielded: String,
+    shielded: Option<String>,
+    dust: Option<String>,
+}
+
+fn derive_midnight_wallet_addresses(
     chain_id: &str,
     unshielded_address: &str,
     shielded_seed: Option<&SecretBytes>,
     dust_seed: Option<&SecretBytes>,
-) -> Result<(), OwsLibError> {
-    eprintln!("Addresses:");
-    eprintln!("  Unshielded: {unshielded_address}");
+) -> Result<MidnightWalletAddresses, OwsLibError> {
+    let mut out = MidnightWalletAddresses {
+        unshielded: unshielded_address.to_string(),
+        shielded: None,
+        dust: None,
+    };
 
     if let Some(seed) = shielded_seed {
-        let shielded_addr = MidnightSigner
-            .derive_shielded_address_from_seed_for_chain_id(chain_id, seed.expose())
-            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-        eprintln!("  Shielded:   {shielded_addr}");
-    } else {
-        eprintln!("  Shielded:   (unavailable: missing shielded seed)");
+        out.shielded = Some(
+            MidnightSigner
+                .derive_shielded_address_from_seed_for_chain_id(chain_id, seed.expose())
+                .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+        );
     }
 
     if let Some(seed) = dust_seed {
         let seed_arr: [u8; 32] = seed.expose().try_into().map_err(|_| {
             OwsLibError::InvalidInput("dust seed must be 32 bytes (wallet corruption?)".into())
         })?;
-        let dust_addr = MidnightSigner
-            .derive_dust_address_from_seed(&seed_arr)
-            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-        eprintln!("  Dust:       {dust_addr}");
-    } else {
-        eprintln!("  Dust:       (unavailable: missing dust seed)");
+        out.dust = Some(
+            MidnightSigner
+                .derive_dust_address_from_seed_for_chain_id(chain_id, &seed_arr)
+                .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+        );
+    }
+
+    Ok(out)
+}
+
+fn print_addresses(addrs: &MidnightWalletAddresses) -> Result<(), OwsLibError> {
+    eprintln!("Addresses:");
+    eprintln!("  Unshielded: {}", addrs.unshielded);
+    match &addrs.shielded {
+        Some(a) => eprintln!("  Shielded:   {a}"),
+        None => eprintln!("  Shielded:   (unavailable: missing shielded seed)"),
+    }
+    match &addrs.dust {
+        Some(a) => eprintln!("  Dust:       {a}"),
+        None => eprintln!("  Dust:       (unavailable: missing dust seed)"),
     }
     eprintln!();
     Ok(())
@@ -145,6 +167,13 @@ pub fn print_fund_balance(
         &mut prompt_passphrase,
     )?;
 
+    print_addresses(&derive_midnight_wallet_addresses(
+        chain_id,
+        &address,
+        shielded_seed.as_ref(),
+        dust_seed.as_ref(),
+    )?)?;
+
     if midnight_sync_log_enabled() {
         eprintln!("[ows-midnight] syncing unshielded, shielded, and dust balances in parallel…");
     }
@@ -205,13 +234,6 @@ pub fn print_fund_balance(
     }
     let shielded = shielded_report.spendable;
     let shielded_session_only = shielded_report.session_only;
-
-    print_addresses(
-        chain_id,
-        &address,
-        shielded_seed.as_ref(),
-        dust_seed.as_ref(),
-    )?;
 
     if unshielded.is_empty() && shielded.is_empty() && shielded_session_only.is_empty() {
         eprintln!("No Midnight tokens found for {address} on {chain_id}");

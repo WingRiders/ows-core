@@ -92,9 +92,16 @@ account address in the wallet file.
 
 #### 3.3 DUST address (not used as CAIP-10 `address`)
 
-Midnight DUST addresses are derived from a **32-byte dust seed**, encoded as Bech32m under the `mn_dust`
-HRP (without a network-specific suffix). DUST credentials are used for Preview / Preprod
-fee registration and related ledger flows.
+Midnight DUST addresses are derived from a **32-byte dust seed**, encoded as Bech32m under
+network-specific HRPs:
+
+| Network | HRP prefix |
+|---|---|
+| Mainnet | `mn_dust` |
+| Preview | `mn_dust_preview` |
+| Preprod | `mn_dust_preprod` |
+
+DUST credentials are used for Preview / Preprod fee registration and related ledger flows.
 
 ### 4. HD derivation paths and “roles” (WalletEngine)
 

@@ -59,6 +59,21 @@ impl MidnightSigner {
         }
     }
 
+    /// Bech32m HRP for a Midnight DUST address on the given chain id.
+    ///
+    /// - `midnight:preview` → `mn_dust_preview`
+    /// - `midnight:preprod` → `mn_dust_preprod`
+    /// - any other (incl. `midnight:mainnet`) → `mn_dust`
+    pub fn dust_hrp_for_chain_id(chain_id: &str) -> &'static str {
+        if chain_id.eq_ignore_ascii_case("midnight:preview") {
+            "mn_dust_preview"
+        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
+            "mn_dust_preprod"
+        } else {
+            "mn_dust"
+        }
+    }
+
     /// Re-encode a stored unshielded address for another Midnight network.
     ///
     /// Universal wallets store the mainnet-HRP address only; preview / preprod (and future
@@ -199,8 +214,31 @@ impl MidnightSigner {
     /// Derive the dust address (type `mn_dust1...`) from a 32-byte dust seed.
     ///
     /// Wallet SDK encodes the dust *public key* (a field element) as SCALE compact,
-    /// then Bech32m-encodes it under the `mn_dust` HRP.
+    /// then Bech32m-encodes it under the `mn_dust` HRP (mainnet).
+    ///
+    /// For preview / preprod networks, use [`Self::derive_dust_address_from_seed_for_chain_id`].
     pub fn derive_dust_address_from_seed(&self, seed: &[u8]) -> Result<String, SignerError> {
+        self.derive_dust_address_from_seed_with_hrp(seed, "mn_dust")
+    }
+
+    /// Derive the dust address for the given Midnight `chain_id` from a 32-byte dust seed.
+    ///
+    /// HRP is selected via [`Self::dust_hrp_for_chain_id`], mirroring
+    /// [`Self::derive_shielded_address_from_seed_for_chain_id`] on the shielded side.
+    pub fn derive_dust_address_from_seed_for_chain_id(
+        &self,
+        chain_id: &str,
+        seed: &[u8],
+    ) -> Result<String, SignerError> {
+        let hrp = Self::dust_hrp_for_chain_id(chain_id);
+        self.derive_dust_address_from_seed_with_hrp(seed, hrp)
+    }
+
+    fn derive_dust_address_from_seed_with_hrp(
+        &self,
+        seed: &[u8],
+        hrp: &str,
+    ) -> Result<String, SignerError> {
         if seed.len() != 32 {
             return Err(SignerError::InvalidPrivateKey(format!(
                 "expected 32-byte dust seed, got {} bytes",
@@ -221,7 +259,7 @@ impl MidnightSigner {
         let dust_pk = BigUint::from_bytes_be(&be);
 
         let payload = scale_bigint_encode_biguint(&dust_pk)?;
-        Self::bech32m_encode("mn_dust", &payload)
+        Self::bech32m_encode(hrp, &payload)
     }
 
     /// Convenience: derive all Midnight address types from a BIP-39 mnemonic.
@@ -831,6 +869,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reencoded, preview_addr);
+    }
+
+    #[test]
+    fn test_midnight_preview_dust_address_uses_network_hrp() {
+        let mnemonic = Mnemonic::from_phrase(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+
+        let signer = MidnightSigner;
+        let dust_path = "m/44'/2400'/0'/2/0";
+        let dust_seed =
+            HdDeriver::derive_from_mnemonic(&mnemonic, "", dust_path, signer.curve()).unwrap();
+
+        let mainnet_dust = signer
+            .derive_dust_address_from_seed(dust_seed.expose())
+            .unwrap();
+        assert!(mainnet_dust.starts_with("mn_dust1"));
+
+        let preview_dust = signer
+            .derive_dust_address_from_seed_for_chain_id("midnight:preview", dust_seed.expose())
+            .unwrap();
+        assert!(preview_dust.starts_with("mn_dust_preview1"));
+
+        // Same underlying key; only the Bech32m HRP differs.
+        use bech32::primitives::decode::CheckedHrpstring;
+        let mainnet_payload = CheckedHrpstring::new::<Bech32m>(&mainnet_dust)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        let preview_payload = CheckedHrpstring::new::<Bech32m>(&preview_dust)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        assert_eq!(mainnet_payload, preview_payload);
     }
 
     #[test]

@@ -447,9 +447,9 @@ where
 
 fn unshielded_token_wire(token: UnshieldedTokenType) -> String {
     if token == NIGHT {
-        "night".to_string()
+        super::TokenType::Native.to_wire_token_type()
     } else {
-        format!("0x{}", hex::encode(token.0 .0))
+        hex::encode(token.0 .0)
     }
 }
 
@@ -929,6 +929,14 @@ mod tests {
             err.message.contains("sealed/proven") || err.message.contains("zswapoffer"),
             "unexpected error: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn unshielded_token_wire_matches_indexer_night_format() {
+        assert_eq!(
+            unshielded_token_wire(NIGHT),
+            "0000000000000000000000000000000000000000000000000000000000000000"
         );
     }
 
