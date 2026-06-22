@@ -16,6 +16,7 @@ const CHAIN_MAP = {
   xrpl: "xrpl:mainnet",
   filecoin: "fil:mainnet",
   spark: "spark:mainnet",
+  midnight: "midnight:mainnet",
 };
 
 function resolveChain(chain) {

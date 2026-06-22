@@ -10,6 +10,16 @@ fn map_err(e: ows_lib::OwsLibError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+fn sign_result_to_dict<'py>(
+    py: Python<'py>,
+    result: &ows_lib::types::SignResult,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("signature", &result.signature)?;
+    dict.set_item("recovery_id", result.recovery_id)?;
+    Ok(dict)
+}
+
 /// Generate a new BIP-39 mnemonic phrase.
 #[pyfunction]
 #[pyo3(signature = (words=12))]
@@ -166,12 +176,7 @@ fn sign_transaction(
     )
     .map_err(map_err)?;
 
-    Python::with_gil(|py| {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("signature", &result.signature)?;
-        dict.set_item("recovery_id", result.recovery_id)?;
-        Ok(dict.unbind().into())
-    })
+    Python::with_gil(|py| sign_result_to_dict(py, &result).map(|d| d.unbind().into()))
 }
 
 /// Sign a message.
@@ -197,12 +202,7 @@ fn sign_message(
     )
     .map_err(map_err)?;
 
-    Python::with_gil(|py| {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("signature", &result.signature)?;
-        dict.set_item("recovery_id", result.recovery_id)?;
-        Ok(dict.unbind().into())
-    })
+    Python::with_gil(|py| sign_result_to_dict(py, &result).map(|d| d.unbind().into()))
 }
 
 /// Sign EIP-712 typed structured data (EVM only).
@@ -226,12 +226,7 @@ fn sign_typed_data(
     )
     .map_err(map_err)?;
 
-    Python::with_gil(|py| {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("signature", &result.signature)?;
-        dict.set_item("recovery_id", result.recovery_id)?;
-        Ok(dict.unbind().into())
-    })
+    Python::with_gil(|py| sign_result_to_dict(py, &result).map(|d| d.unbind().into()))
 }
 
 /// Sign a raw 32-byte hash on a secp256k1-backed chain.
@@ -255,12 +250,7 @@ fn sign_hash(
     )
     .map_err(map_err)?;
 
-    Python::with_gil(|py| {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("signature", &result.signature)?;
-        dict.set_item("recovery_id", result.recovery_id)?;
-        Ok(dict.unbind().into())
-    })
+    Python::with_gil(|py| sign_result_to_dict(py, &result).map(|d| d.unbind().into()))
 }
 
 /// Sign an EIP-7702 authorization tuple.
@@ -286,12 +276,7 @@ fn sign_authorization(
     )
     .map_err(map_err)?;
 
-    Python::with_gil(|py| {
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("signature", &result.signature)?;
-        dict.set_item("recovery_id", result.recovery_id)?;
-        Ok(dict.unbind().into())
-    })
+    Python::with_gil(|py| sign_result_to_dict(py, &result).map(|d| d.unbind().into()))
 }
 
 /// Sign and broadcast a transaction.

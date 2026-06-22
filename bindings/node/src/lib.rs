@@ -49,8 +49,17 @@ impl From<ows_lib::WalletInfo> for WalletInfo {
 /// Result from a signing operation.
 #[napi(object)]
 pub struct SignResult {
+    /// Hex-encoded signature. For Midnight transactions this is the full tagged wire blob;
+    /// for Midnight messages it is hex(pubkey32 || sig64). See OWS signing docs.
     pub signature: String,
     pub recovery_id: Option<u32>,
+}
+
+fn sign_result_from_lib(r: ows_lib::types::SignResult) -> SignResult {
+    SignResult {
+        signature: r.signature,
+        recovery_id: r.recovery_id.map(|v| v as u32),
+    }
 }
 
 /// Result from a sign-and-send operation.
@@ -210,10 +219,7 @@ pub fn sign_transaction(
         index,
         vault_path(vault_path_opt).as_deref(),
     )
-    .map(|r| SignResult {
-        signature: r.signature,
-        recovery_id: r.recovery_id.map(|v| v as u32),
-    })
+    .map(sign_result_from_lib)
     .map_err(map_err)
 }
 
@@ -237,10 +243,7 @@ pub fn sign_message(
         index,
         vault_path(vault_path_opt).as_deref(),
     )
-    .map(|r| SignResult {
-        signature: r.signature,
-        recovery_id: r.recovery_id.map(|v| v as u32),
-    })
+    .map(sign_result_from_lib)
     .map_err(map_err)
 }
 
@@ -262,10 +265,7 @@ pub fn sign_typed_data(
         index,
         vault_path(vault_path_opt).as_deref(),
     )
-    .map(|r| SignResult {
-        signature: r.signature,
-        recovery_id: r.recovery_id.map(|v| v as u32),
-    })
+    .map(sign_result_from_lib)
     .map_err(map_err)
 }
 
@@ -287,10 +287,7 @@ pub fn sign_hash(
         index,
         vault_path(vault_path_opt).as_deref(),
     )
-    .map(|r| SignResult {
-        signature: r.signature,
-        recovery_id: r.recovery_id.map(|v| v as u32),
-    })
+    .map(sign_result_from_lib)
     .map_err(map_err)
 }
 
@@ -314,10 +311,7 @@ pub fn sign_authorization(
         index,
         vault_path(vault_path_opt).as_deref(),
     )
-    .map(|r| SignResult {
-        signature: r.signature,
-        recovery_id: r.recovery_id.map(|v| v as u32),
-    })
+    .map(sign_result_from_lib)
     .map_err(map_err)
 }
 

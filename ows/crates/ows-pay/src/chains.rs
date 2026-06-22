@@ -44,6 +44,10 @@ mod tests {
             resolve_chain_type("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
             Some(ChainType::Solana)
         );
+        assert_eq!(
+            resolve_chain_type("midnight:preview"),
+            Some(ChainType::Midnight)
+        );
     }
 
     #[test]

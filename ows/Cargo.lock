@@ -3301,6 +3301,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "ows-cli"
 version = "1.3.2"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -3383,6 +3384,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "ows-core",
+ "ows-signer",
  "reqwest",
  "serde",
  "serde_json",

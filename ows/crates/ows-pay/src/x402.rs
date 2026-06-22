@@ -229,9 +229,6 @@ fn parse_requirements(
     ))
 }
 
-/// Payment schemes we know how to handle.
-const SUPPORTED_SCHEMES: &[&str] = &["exact"];
-
 fn is_gateway_batched(req: &PaymentRequirements) -> bool {
     req.extra
         .get("name")
@@ -255,7 +252,7 @@ fn pick_payment_option<'a>(
     let mut candidates = Vec::new();
 
     for req in requirements {
-        if !SUPPORTED_SCHEMES.contains(&req.scheme.as_str()) {
+        if !wallet.supports_scheme(&req.scheme) {
             continue;
         }
 
@@ -669,8 +666,8 @@ mod tests {
         assert_eq!(reqs[0].pay_to, "0xv2");
     }
 
-    #[test]
-    fn v2_header_without_version_builds_v2_payment_payload() {
+    #[tokio::test]
+    async fn v2_header_without_version_builds_v2_payment_payload() {
         let x402 = serde_json::json!({
             "accepts": [{
                 "scheme": "exact",

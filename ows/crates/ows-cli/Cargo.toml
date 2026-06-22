@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 zeroize = "1"
 ows-pay = { path = "../ows-pay", version = "=1.3.2" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
 
 [dev-dependencies]
 ows-signer = { path = "../ows-signer", version = "=1.3.2", features = ["fast-kdf"] }

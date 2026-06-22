@@ -29,4 +29,11 @@ pub trait WalletAccess: Send + Sync {
     ///
     /// Returns the signature as a hex string with `0x` prefix.
     fn sign_payload(&self, scheme: &str, network: &str, payload: &str) -> Result<String, PayError>;
+
+    /// Whether this wallet can satisfy the x402 `scheme` value.
+    ///
+    /// Default: only the EVM EIP-3009 `"exact"` scheme.
+    fn supports_scheme(&self, scheme: &str) -> bool {
+        scheme == "exact"
+    }
 }
