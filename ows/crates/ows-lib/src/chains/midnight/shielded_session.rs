@@ -148,25 +148,6 @@ pub(super) async fn connect_session(
         .ok_or_else(|| PayError::new(PayErrorCode::ProtocolMalformed, "missing connect response"))
 }
 
-pub(super) async fn connect_session_try_candidates(
-    indexer_url: &str,
-    candidates: &[String],
-) -> Result<String, PayError> {
-    let mut last_err: Option<PayError> = None;
-    for vk in candidates {
-        match connect_session(indexer_url, vk).await {
-            Ok(sid) => return Ok(sid),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        PayError::new(
-            PayErrorCode::InvalidInput,
-            "no viewing key candidates provided".to_string(),
-        )
-    }))
-}
-
 pub(super) async fn disconnect_session(indexer_url: &str, session_id: &str) {
     let client = indexer_http_client();
     let _ = client
@@ -196,7 +177,7 @@ pub(super) enum ShieldedEvent {
         #[serde(rename = "highestCheckedEndIndex")]
         highest_checked_end_index: i64,
         #[serde(rename = "highestRelevantEndIndex")]
-        _highest_relevant_end_index: i64,
+        highest_relevant_end_index: i64,
     },
     #[serde(rename = "RelevantTransaction")]
     RelevantTransaction {
@@ -254,6 +235,7 @@ pub(super) fn shielded_sync_done(
     progress_received: bool,
     highest_end: Option<i64>,
     highest_checked: i64,
+    highest_relevant: i64,
 ) -> bool {
     if !progress_received {
         return false;
@@ -261,7 +243,15 @@ pub(super) fn shielded_sync_done(
     let Some(h) = highest_end else {
         return false;
     };
-    h == 0 || highest_checked >= h
+    if highest_checked < h {
+        return false;
+    }
+    // Indexer can report tip 0 on an empty relevant set while the chain has blocks; wait until
+    // relevant catch-up is also reported at the tip when the chain has relevant history.
+    if h == 0 && highest_relevant > 0 {
+        return false;
+    }
+    true
 }
 
 pub(super) fn token_type_hex(ci: &coin::Info) -> String {
@@ -275,6 +265,24 @@ pub struct ShieldedWalletState {
     pub zswap: ZswapLocalState<InMemoryDB>,
 }
 
+/// Rehash the shielded Merkle tree after session replay (collapsed updates already applied).
+///
+/// Do not patch individual leaves here: `try_update_hash` on a collapsed tree produces a root
+/// the chain does not recognize (`Invalid Transaction` / Zswap error 103).
+pub(super) fn ensure_shielded_merkle_ready(
+    wallet: &mut ShieldedWalletState,
+) -> Result<(), PayError> {
+    wallet.zswap.merkle_tree = wallet.zswap.merkle_tree.rehash();
+    if wallet.zswap.merkle_tree.root().is_none() {
+        return Err(PayError::new(
+            PayErrorCode::InvalidInput,
+            "shielded Merkle tree has no root after sync; indexer shielded session may be incomplete",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum ShieldedReplayMode {
     BalanceOnly,
     WalletState,
@@ -299,6 +307,8 @@ enum ShieldedReplayAccum {
     Wallet {
         zswap: ZswapLocalState<InMemoryDB>,
         owned: BTreeMap<coin::Nullifier, QualifiedCoinInfo>,
+        relevant_txs: u64,
+        zswap_outputs_decrypted: u64,
     },
 }
 
@@ -349,6 +359,8 @@ impl ShieldedReplayAccum {
             ShieldedReplayMode::WalletState => Self::Wallet {
                 zswap: ZswapLocalState::new(),
                 owned: BTreeMap::new(),
+                relevant_txs: 0,
+                zswap_outputs_decrypted: 0,
             },
         }
     }
@@ -393,13 +405,19 @@ impl ShieldedReplayAccum {
                     _ => {}
                 }
             }
-            Self::Wallet { zswap, owned } => match ev.content {
+            Self::Wallet {
+                zswap,
+                owned,
+                relevant_txs: _,
+                zswap_outputs_decrypted,
+            } => match ev.content {
                 EventDetails::ZswapOutput {
                     preimage_evidence,
                     mt_index,
                     ..
                 } => {
                     if let Some(ci) = preimage_evidence.try_with_keys(keys) {
+                        *zswap_outputs_decrypted = zswap_outputs_decrypted.saturating_add(1);
                         let qci = ci.qualify(mt_index);
                         let nul =
                             coin::Info::from(&qci).nullifier(&transfer::SenderEvidence::User(
@@ -428,24 +446,52 @@ impl ShieldedReplayAccum {
                 }
                 ShieldedReplayOutcome::Balances(balances)
             }
-            Self::Wallet { mut zswap, .. } => {
-                if zswap.merkle_tree.root().is_none() {
-                    zswap.merkle_tree = zswap.merkle_tree.rehash();
-                }
-                ShieldedReplayOutcome::Wallet(ShieldedWalletState {
+            Self::Wallet { zswap, .. } => {
+                let mut wallet = ShieldedWalletState {
                     keys: keys.clone(),
                     zswap,
-                })
+                };
+                let _ = ensure_shielded_merkle_ready(&mut wallet);
+                ShieldedReplayOutcome::Wallet(wallet)
             }
         }
     }
+}
+
+/// Insert qualified coins from zswap-ledger snapshot into session wallet state (no Merkle patching).
+pub(super) fn hydrate_wallet_from_zswap_snapshot(
+    indexer_url: &str,
+    shielded_seed_32: &[u8],
+    scope: &SyncCacheScope,
+    wallet: &mut ShieldedWalletState,
+) -> usize {
+    let seed_fp = shielded_sync_cache::shielded_seed_fingerprint(shielded_seed_32);
+    let qualified = super::zswap_ledger_sync::load_zswap_qualified_coins_from_snapshot(
+        indexer_url,
+        scope,
+        &seed_fp,
+    );
+    let log = midnight_env::midnight_sync_log_enabled();
+    let mut added = 0usize;
+    for (nul, qci) in qualified {
+        if wallet.zswap.coins.get(&nul).is_none() {
+            wallet.zswap.coins = wallet.zswap.coins.insert(nul, qci);
+            added = added.saturating_add(1);
+        }
+    }
+    if log && added > 0 {
+        eprintln!(
+            "[ows-midnight] shielded spend: hydrated {added} qualified coin(s) from zswap-ledger snapshot"
+        );
+    }
+    added
 }
 
 /// Full shielded wallet sync (Merkle tree + spendable qualified coins) for Zswap spends.
 pub async fn sync_shielded_wallet_state_scoped(
     indexer_url: &str,
     shielded_seed_32: &[u8],
-    _scope: &SyncCacheScope,
+    scope: &SyncCacheScope,
 ) -> Result<ShieldedWalletState, PayError> {
     if midnight_env::shielded_vk_free_sync_enabled() {
         return Err(PayError::new(
@@ -455,22 +501,66 @@ pub async fn sync_shielded_wallet_state_scoped(
         ));
     }
     let keys = zswap_secret_keys_from_seed(shielded_seed_32)?;
+    let network = MidnightNetwork::from_indexer_url(indexer_url);
     let viewing_key_candidates = viewing_key_candidates_from_secret_keys(indexer_url, &keys)?;
 
     tokio::time::timeout(SHIELDED_SYNC_TIMEOUT, async {
-        let session_id =
-            connect_session_try_candidates(indexer_url, &viewing_key_candidates).await?;
-        let res = replay_shielded_transactions_via_session(
-            indexer_url,
-            &keys,
-            &session_id,
-            ShieldedReplayMode::WalletState,
-            None,
-            None,
-        )
-        .await;
-        disconnect_session(indexer_url, &session_id).await;
-        res
+        let mut wallet = if midnight_env::shielded_zswap_spend_wallet_enabled(network) {
+            if midnight_env::midnight_sync_log_enabled() {
+                eprintln!(
+                    "[ows-midnight] shielded spend: building wallet from zswapLedgerEvents replay"
+                );
+            }
+            super::zswap_ledger_sync::sync_shielded_wallet_from_zswap_ledger_scoped(
+                indexer_url,
+                &keys,
+                scope,
+                super::midnight_env::SyncPurpose::Signing,
+            )
+            .await?
+        } else {
+            ShieldedWalletState {
+                keys: keys.clone(),
+                zswap: ZswapLocalState::new(),
+            }
+        };
+
+        let zswap_coins = wallet.zswap.coins.iter().count();
+        if zswap_coins == 0 {
+            let (res, _vk_fp) = replay_shielded_session_best_vk(
+                indexer_url,
+                &keys,
+                &viewing_key_candidates,
+                ShieldedReplayMode::WalletState,
+                None,
+            )
+            .await?;
+            wallet = match res {
+                ShieldedReplayOutcome::Wallet(w) => w,
+                ShieldedReplayOutcome::Balances(_) => {
+                    return Err(PayError::new(
+                        PayErrorCode::InvalidInput,
+                        "shielded wallet replay returned balances".to_string(),
+                    ));
+                }
+            };
+            if midnight_env::midnight_sync_log_enabled() {
+                eprintln!(
+                    "[ows-midnight] shielded spend: zswap replay empty, fell back to viewing-key session ({} coins)",
+                    wallet.zswap.coins.iter().count()
+                );
+            }
+        } else if midnight_env::midnight_sync_log_enabled() {
+            eprintln!(
+                "[ows-midnight] shielded spend: zswapLedgerEvents wallet ready ({zswap_coins} coins)"
+            );
+        }
+
+        if midnight_env::shielded_zswap_spend_hydrate_enabled(network) {
+            hydrate_wallet_from_zswap_snapshot(indexer_url, shielded_seed_32, scope, &mut wallet);
+        }
+        ensure_shielded_merkle_ready(&mut wallet)?;
+        Ok(wallet)
     })
     .await
     .map_err(|_| {
@@ -482,13 +572,6 @@ pub async fn sync_shielded_wallet_state_scoped(
             ),
         )
     })?
-    .and_then(|out| match out {
-        ShieldedReplayOutcome::Wallet(w) => Ok(w),
-        ShieldedReplayOutcome::Balances(_) => Err(PayError::new(
-            PayErrorCode::InvalidInput,
-            "shielded wallet replay returned balances".to_string(),
-        )),
-    })
 }
 
 pub(super) async fn replay_shielded_transactions_via_session(
@@ -515,6 +598,7 @@ pub(super) async fn replay_shielded_transactions_via_session(
     let mut accum = ShieldedReplayAccum::new(mode);
     let mut highest_end: Option<i64> = None;
     let mut highest_checked: i64 = 0;
+    let mut highest_relevant: i64 = 0;
     let mut progress_received = false;
     let mut applied_event_ids = BTreeSet::new();
 
@@ -524,6 +608,7 @@ pub(super) async fn replay_shielded_transactions_via_session(
         &mut accum,
         &mut highest_end,
         &mut highest_checked,
+        &mut highest_relevant,
         &mut progress_received,
         &mut applied_event_ids,
         log,
@@ -536,7 +621,12 @@ pub(super) async fn replay_shielded_transactions_via_session(
         ))
         .await;
 
-    if !shielded_sync_done(progress_received, highest_end, highest_checked) {
+    if !shielded_sync_done(
+        progress_received,
+        highest_end,
+        highest_checked,
+        highest_relevant,
+    ) {
         return Err(PayError::new(
             PayErrorCode::HttpTransport,
             "Midnight indexer closed the shielded subscription before sync completed; try again."
@@ -545,20 +635,32 @@ pub(super) async fn replay_shielded_transactions_via_session(
     }
 
     if log {
-        if let ShieldedReplayAccum::Balance {
-            relevant_txs,
-            zswap_events_seen,
-            zswap_outputs_seen,
-            zswap_outputs_decrypted,
-            zswap_inputs_seen,
-            owned,
-            ..
-        } = &accum
-        {
-            let coins_unspent: u128 = owned.values().map(|ci| ci.value).sum();
-            eprintln!(
-                "[ows-midnight] shielded sync done: relevant_txs={relevant_txs} zswap_events_seen={zswap_events_seen} zswap_outputs_seen={zswap_outputs_seen} zswap_outputs_decrypted={zswap_outputs_decrypted} zswap_inputs_seen={zswap_inputs_seen} coins_unspent={coins_unspent}"
-            );
+        match &accum {
+            ShieldedReplayAccum::Balance {
+                relevant_txs,
+                zswap_events_seen,
+                zswap_outputs_seen,
+                zswap_outputs_decrypted,
+                zswap_inputs_seen,
+                owned,
+            } => {
+                let coins_unspent: u128 = owned.values().map(|ci| ci.value).sum();
+                eprintln!(
+                    "[ows-midnight] shielded sync done: relevant_txs={relevant_txs} zswap_events_seen={zswap_events_seen} zswap_outputs_seen={zswap_outputs_seen} zswap_outputs_decrypted={zswap_outputs_decrypted} zswap_inputs_seen={zswap_inputs_seen} coins_unspent={coins_unspent} highest_relevant_end_index={highest_relevant}"
+                );
+            }
+            ShieldedReplayAccum::Wallet {
+                relevant_txs,
+                zswap_outputs_decrypted,
+                zswap,
+                ..
+            } => {
+                let coins_unspent: u128 = zswap.coins.iter().map(|(_, q)| q.value).sum();
+                eprintln!(
+                    "[ows-midnight] shielded wallet sync done: relevant_txs={relevant_txs} zswap_outputs_decrypted={zswap_outputs_decrypted} spendable_coins={} coins_unspent={coins_unspent} highest_relevant_end_index={highest_relevant}",
+                    zswap.coins.iter().count()
+                );
+            }
         }
     }
 
@@ -581,6 +683,7 @@ async fn replay_shielded_ws_loop(
     accum: &mut ShieldedReplayAccum,
     highest_end: &mut Option<i64>,
     highest_checked: &mut i64,
+    highest_relevant: &mut i64,
     progress_received: &mut bool,
     applied_event_ids: &mut BTreeSet<i64>,
     log: bool,
@@ -647,17 +750,23 @@ indexer may be stalled",
                     ShieldedEvent::Progress {
                         highest_end_index,
                         highest_checked_end_index,
-                        _highest_relevant_end_index: _,
+                        highest_relevant_end_index,
                     } => {
                         *highest_end = Some(highest_end_index);
                         *highest_checked = highest_checked_end_index;
+                        *highest_relevant = (*highest_relevant).max(highest_relevant_end_index);
                         *progress_received = true;
                         if log {
                             eprintln!(
-                                "[ows-midnight] shielded sync progress: highest_end_index={highest_end_index} highest_checked_end_index={highest_checked_end_index}"
+                                "[ows-midnight] shielded sync progress: highest_end_index={highest_end_index} highest_checked_end_index={highest_checked_end_index} highest_relevant_end_index={highest_relevant_end_index}"
                             );
                         }
-                        if shielded_sync_done(*progress_received, *highest_end, *highest_checked) {
+                        if shielded_sync_done(
+                            *progress_received,
+                            *highest_end,
+                            *highest_checked,
+                            *highest_relevant,
+                        ) {
                             break;
                         }
                     }
@@ -689,12 +798,13 @@ indexer may be stalled",
                                 })?;
                             accum.on_zswap_event(keys, ev);
                         }
-                        if let ShieldedReplayAccum::Balance { relevant_txs, .. } = accum {
-                            *relevant_txs = relevant_txs.saturating_add(1);
-                        }
-
-                        if shielded_sync_done(*progress_received, *highest_end, *highest_checked) {
-                            break;
+                        match accum {
+                            ShieldedReplayAccum::Balance { relevant_txs, .. } => {
+                                *relevant_txs = relevant_txs.saturating_add(1);
+                            }
+                            ShieldedReplayAccum::Wallet { relevant_txs, .. } => {
+                                *relevant_txs = relevant_txs.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -753,29 +863,68 @@ fn maybe_save_session_snapshot(
     }
 }
 
-pub(super) async fn get_shielded_balances_via_session(
+fn shielded_replay_outcome_score(outcome: &ShieldedReplayOutcome) -> u128 {
+    match outcome {
+        ShieldedReplayOutcome::Balances(b) => b.values().copied().sum(),
+        ShieldedReplayOutcome::Wallet(w) => w.zswap.coins.iter().map(|(_, q)| q.value).sum(),
+    }
+}
+
+/// Try each viewing-key encoding; keep the session replay with the largest decrypted balance.
+pub(super) async fn replay_shielded_session_best_vk(
     indexer_url: &str,
     keys: &ZswapSecretKeys,
-    session_id: &str,
-    scope: &SyncCacheScope,
-    vk_fp: &str,
-) -> Result<ShieldedBalances, PayError> {
-    match replay_shielded_transactions_via_session(
-        indexer_url,
-        keys,
-        session_id,
-        ShieldedReplayMode::BalanceOnly,
-        Some(scope),
-        Some(vk_fp),
-    )
-    .await?
-    {
-        ShieldedReplayOutcome::Balances(balances) => Ok(balances),
-        ShieldedReplayOutcome::Wallet(_) => Err(PayError::new(
-            PayErrorCode::InvalidInput,
-            "shielded balance replay returned wallet state".to_string(),
-        )),
+    viewing_key_candidates: &[String],
+    mode: ShieldedReplayMode,
+    scope: Option<&SyncCacheScope>,
+) -> Result<(ShieldedReplayOutcome, String), PayError> {
+    let log = midnight_env::midnight_sync_log_enabled();
+    let mut best: Option<(ShieldedReplayOutcome, String, u128)> = None;
+    let mut last_connect_err: Option<PayError> = None;
+
+    for vk in viewing_key_candidates {
+        let vk_fp = shielded_sync_cache::viewing_key_fingerprint(vk);
+        let session_id = match connect_session(indexer_url, vk).await {
+            Ok(sid) => sid,
+            Err(e) => {
+                last_connect_err = Some(e);
+                continue;
+            }
+        };
+        let res = replay_shielded_transactions_via_session(
+            indexer_url,
+            keys,
+            &session_id,
+            mode,
+            scope,
+            Some(&vk_fp),
+        )
+        .await;
+        disconnect_session(indexer_url, &session_id).await;
+        let Ok(outcome) = res else {
+            continue;
+        };
+        let score = shielded_replay_outcome_score(&outcome);
+        if log {
+            eprintln!(
+                "[ows-midnight] shielded session vk_fp={vk_fp}: score={score} (picking best of {})",
+                viewing_key_candidates.len()
+            );
+        }
+        if best.as_ref().is_none_or(|(_, _, s)| score > *s) {
+            best = Some((outcome, vk_fp, score));
+        }
     }
+
+    let Some((outcome, vk_fp, _)) = best else {
+        return Err(last_connect_err.unwrap_or_else(|| {
+            PayError::new(
+                PayErrorCode::InvalidInput,
+                "no viewing key candidates connected to the indexer".to_string(),
+            )
+        }));
+    };
+    Ok((outcome, vk_fp))
 }
 
 pub(super) async fn get_shielded_balances_inner(
@@ -783,10 +932,21 @@ pub(super) async fn get_shielded_balances_inner(
     keys: &ZswapSecretKeys,
     viewing_key_candidates: &[String],
     scope: &SyncCacheScope,
-    vk_fp: &str,
+    _vk_fp: &str,
 ) -> Result<ShieldedBalances, PayError> {
-    let session_id = connect_session_try_candidates(indexer_url, viewing_key_candidates).await?;
-    let res = get_shielded_balances_via_session(indexer_url, keys, &session_id, scope, vk_fp).await;
-    disconnect_session(indexer_url, &session_id).await;
-    res
+    let (outcome, _) = replay_shielded_session_best_vk(
+        indexer_url,
+        keys,
+        viewing_key_candidates,
+        ShieldedReplayMode::BalanceOnly,
+        Some(scope),
+    )
+    .await?;
+    match outcome {
+        ShieldedReplayOutcome::Balances(balances) => Ok(balances),
+        ShieldedReplayOutcome::Wallet(_) => Err(PayError::new(
+            PayErrorCode::InvalidInput,
+            "shielded balance replay returned wallet state".to_string(),
+        )),
+    }
 }

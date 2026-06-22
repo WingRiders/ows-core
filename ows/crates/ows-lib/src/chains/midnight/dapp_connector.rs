@@ -512,6 +512,69 @@ fn build_make_intent_standard_tx(
     Ok(out)
 }
 
+/// Build shielded Zswap spend preimages covering per-token deficits (for contract-call balancing).
+pub(super) fn collect_shielded_preimage_inputs(
+    wallet: &mut ShieldedWalletState,
+    segment: u16,
+    deficits: &[(ShieldedTokenType, u128)],
+) -> Result<Vec<ZswapInput<ProofPreimage, InMemoryDB>>, PayError> {
+    super::shielded_session::ensure_shielded_merkle_ready(wallet)?;
+    let mut rng = OsRng;
+    let seg = Some(segment);
+    let mut zswap_inputs = Vec::new();
+    for (token_type, need_total) in deficits {
+        if *need_total == 0 {
+            continue;
+        }
+        let wire = hex::encode(token_type.into_inner().0);
+        let mut need = *need_total;
+        let mut coins: Vec<QualifiedCoinInfo> = wallet
+            .zswap
+            .coins
+            .iter()
+            .filter(|(_, qci)| shielded_token_matches(qci, &wire))
+            .map(|(_, qci)| *qci)
+            .collect();
+        coins.sort_by(|a, b| b.value.cmp(&a.value));
+        for coin in coins {
+            if need == 0 {
+                break;
+            }
+            let (st2, inp) = wallet
+                .zswap
+                .spend(&mut rng, &wallet.keys, &coin, seg)
+                .map_err(|e| {
+                    let hint = if format!("{e:?}").contains("InvalidIndex") {
+                        " (often caused by OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE merging zswap-ledger \
+coins into session state — unset that env var and use only viewing-key session coins)"
+                    } else {
+                        ""
+                    };
+                    err(format!("shielded spend failed: {e:?}{hint}"))
+                })?;
+            wallet.zswap = st2;
+            need = need.saturating_sub(coin.value);
+            zswap_inputs.push(inp);
+        }
+        if need > 0 {
+            let have: u128 = wallet
+                .zswap
+                .coins
+                .iter()
+                .filter(|(_, qci)| shielded_token_matches(qci, &wire))
+                .map(|(_, qci)| qci.value)
+                .sum();
+            return Err(err(format!(
+                "insufficient shielded balance for token 0x{wire}: short by {need} in viewing-key \
+wallet state (session has {have}). If `ows fund balance` lists this token under \"zswap-ledger only\", \
+those coins are not spendable yet — run `ows fund balance` again, then sign; ensure \
+OWS_MIDNIGHT_SHIELDED_VK_FREE is unset"
+            )));
+        }
+    }
+    Ok(zswap_inputs)
+}
+
 fn build_zswap_offer(
     chain_id: &str,
     segment: u16,
@@ -520,47 +583,24 @@ fn build_zswap_offer(
     desired_outputs: &[DesiredOutput],
 ) -> Result<ZswapOffer<ProofPreimage, InMemoryDB>, PayError> {
     let mut rng = OsRng;
-    let seg = Some(segment);
     let mut zswap_inputs: Vec<ZswapInput<ProofPreimage, InMemoryDB>> = Vec::new();
 
     if !desired_inputs.is_empty() {
         let wallet =
             wallet.ok_or_else(|| err("shielded inputs require synced shielded wallet state"))?;
-        for d in desired_inputs {
-            if d.value == 0 {
-                return Err(err("desired input value must be greater than zero"));
-            }
-            let wire = parse_token_type(Some(&d.token_type))?.to_wire_token_type();
-            let mut need = d.value;
-            let mut coins: Vec<QualifiedCoinInfo> = wallet
-                .zswap
-                .coins
-                .iter()
-                .filter(|(_, qci)| shielded_token_matches(qci, &wire))
-                .map(|(_, qci)| *qci)
-                .collect();
-            coins.sort_by(|a, b| b.value.cmp(&a.value));
-            for coin in coins {
-                if need == 0 {
-                    break;
+        let deficits: Vec<(ShieldedTokenType, u128)> = desired_inputs
+            .iter()
+            .map(|d| {
+                if d.value == 0 {
+                    return Err(err("desired input value must be greater than zero"));
                 }
-                let (st2, inp) = wallet
-                    .zswap
-                    .spend(&mut rng, &wallet.keys, &coin, seg)
-                    .map_err(|e| err(format!("shielded spend failed: {e:?}")))?;
-                wallet.zswap = st2;
-                need = need.saturating_sub(coin.value);
-                zswap_inputs.push(inp);
-            }
-            if need > 0 {
-                return Err(err(format!(
-                    "insufficient shielded balance for token {}: short by {need}",
-                    d.token_type
-                )));
-            }
-        }
+                Ok((wire_type_to_shielded(&d.token_type)?, d.value))
+            })
+            .collect::<Result<Vec<_>, PayError>>()?;
+        zswap_inputs = collect_shielded_preimage_inputs(wallet, segment, &deficits)?;
     }
 
+    let seg = Some(segment);
     let mut zswap_outputs: Vec<ZswapOutput<ProofPreimage, InMemoryDB>> = Vec::new();
     for d in desired_outputs {
         if d.value == 0 {

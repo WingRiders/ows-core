@@ -13,6 +13,10 @@ use super::urls::http_url_to_ws_url;
 const LEDGER_BALANCE_CHECK_OVERSPEND: u16 = 138;
 /// Node ledger code for DUST spend proof verification failed (`InvalidTransaction::Custom(170)`).
 const LEDGER_INVALID_DUST_SPEND_PROOF: u16 = 170;
+/// Pedersen binding commitment mismatch (`InvalidTransaction::Custom(185)`).
+const LEDGER_PEDERSEN_CHECK_FAILURE: u16 = 185;
+/// Zswap apply failure: unknown Merkle root, double-spend, etc. (`InvalidTransaction::Custom(103)`).
+const LEDGER_ZSWAP_INVALID: u16 = 103;
 /// Input references a UTXO absent from ledger state (`InvalidTransaction::Custom(195)`).
 const LEDGER_INPUT_NOT_IN_UTXOS: u16 = 195;
 
@@ -147,6 +151,37 @@ fn append_invalid_dust_spend_hint(msg: &mut String) {
              using dust spends when unregistered NIGHT inputs could fund a generationless \
              registration instead. Ensure the indexer returns block timestamps for UTXOs and pass \
              the wallet dust seed."
+        ));
+    }
+}
+
+fn append_zswap_invalid_hint(msg: &mut String) {
+    if msg.contains(&format!("Custom error: {LEDGER_ZSWAP_INVALID}"))
+        || msg.contains(&format!("Custom({LEDGER_ZSWAP_INVALID})"))
+        || msg.contains("UnknownMerkleRoot")
+        || msg.contains("NullifierAlreadyPresent")
+    {
+        msg.push_str(&format!(
+            "\n\nLedger error {LEDGER_ZSWAP_INVALID} (Zswap): shielded spend rejected on-chain — \
+often an unknown coin-tree Merkle root (stale or incorrect wallet sync) or a double-spend. \
+Rebuild with a current `ows`, run `ows fund balance` to force shielded catch-up, then retry. \
+Do not spend coins that only appear via zswapLedgerEvents fallback unless the shielded session \
+also lists them."
+        ));
+    }
+}
+
+fn append_pedersen_check_failure_hint(msg: &mut String) {
+    if msg.contains(&format!("Custom error: {LEDGER_PEDERSEN_CHECK_FAILURE}"))
+        || msg.contains(&format!("Custom({LEDGER_PEDERSEN_CHECK_FAILURE})"))
+        || msg.contains("PedersenCheckFailure")
+    {
+        msg.push_str(&format!(
+            "\n\nLedger error {LEDGER_PEDERSEN_CHECK_FAILURE} (PedersenCheckFailure): the \
+             transaction's Pedersen binding commitment does not match its shielded offers and \
+             intents. This often happens when shielded inputs were merged into a proven contract \
+             tx without refreshing binding randomness — rebuild with a current `ows` and retry \
+             `ows sign send-tx`."
         ));
     }
 }
@@ -436,6 +471,8 @@ pub async fn submit_unshielded_tx(
         }
         append_balance_overspend_hint(&mut msg);
         append_invalid_dust_spend_hint(&mut msg);
+        append_zswap_invalid_hint(&mut msg);
+        append_pedersen_check_failure_hint(&mut msg);
         append_input_not_in_utxos_hint(&mut msg);
         return Err(PayError::new(PayErrorCode::HttpTransport, msg));
     }

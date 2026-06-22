@@ -33,6 +33,7 @@ pub struct DecodedTxInput {
 /// Resolved Midnight tx bytes and signing options for owner-mode sign / send.
 pub struct MidnightOwnerTxContext {
     pub chain: Chain,
+    pub shielded_seed: Option<SecretBytes>,
     pub dust_seed: Option<SecretBytes>,
     pub sync_scope: SyncCacheScope,
     pub tx_bytes: Vec<u8>,
@@ -47,6 +48,7 @@ pub type OwnerTxContext = MidnightOwnerTxContext;
 pub(crate) struct ResolvedTxMaterial {
     pub sync_scope: SyncCacheScope,
     pub decoded: DecodedTxInput,
+    pub shielded_seed: Option<SecretBytes>,
     pub dust_seed: Option<SecretBytes>,
 }
 
@@ -459,6 +461,7 @@ pub(crate) fn resolve_transaction_material(
     Ok(ResolvedTxMaterial {
         sync_scope,
         decoded,
+        shielded_seed,
         dust_seed,
     })
 }
@@ -472,6 +475,7 @@ pub(crate) fn sign_transaction_from_material(
     sign_transaction(
         chain,
         private_key,
+        material.shielded_seed.as_ref().map(|s| s.expose()),
         material.dust_seed.as_ref().map(|s| s.expose()),
         &material.decoded.bytes,
         Some(&material.sync_scope),
@@ -490,6 +494,7 @@ pub(crate) fn sign_and_send_from_material(
     sign_and_send(
         chain,
         private_key,
+        material.shielded_seed.as_ref().map(|s| s.expose()),
         material.dust_seed.as_ref().map(|s| s.expose()),
         &material.decoded.bytes,
         rpc_url,
@@ -567,6 +572,7 @@ pub fn sign_prepared_owner_transaction(
     sign_transaction(
         &ctx.chain,
         private_key,
+        ctx.shielded_seed.as_ref().map(|s| s.expose()),
         ctx.dust_seed.as_ref().map(|s| s.expose()),
         &ctx.tx_bytes,
         Some(&ctx.sync_scope),
@@ -584,6 +590,7 @@ pub fn sign_and_send_prepared_owner_transaction(
     sign_and_send(
         &ctx.chain,
         private_key,
+        ctx.shielded_seed.as_ref().map(|s| s.expose()),
         ctx.dust_seed.as_ref().map(|s| s.expose()),
         &ctx.tx_bytes,
         rpc_url,
@@ -632,6 +639,7 @@ pub fn prepare_midnight_owner_tx_context(
     )?;
     Ok(MidnightOwnerTxContext {
         chain: *chain,
+        shielded_seed,
         dust_seed,
         sync_scope,
         tx_bytes: decoded.bytes,
@@ -667,6 +675,7 @@ pub fn prepare_owner_tx_context(
 fn run_prepare_sealed_from_unsealed(
     chain_id: &str,
     private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
     dust_seed: Option<&[u8]>,
     tx_bytes: &[u8],
     sync_scope: Option<&SyncCacheScope>,
@@ -679,6 +688,7 @@ fn run_prepare_sealed_from_unsealed(
         chain_id,
         &indexer_url,
         private_key,
+        shielded_seed,
         dust_seed,
         tx_bytes,
         scope,
@@ -701,6 +711,7 @@ fn seal_imbalanced_unsealed_local(
 pub fn sign_transaction(
     chain: &Chain,
     private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
     dust_seed: Option<&[u8]>,
     tx_bytes: &[u8],
     sync_scope: Option<&SyncCacheScope>,
@@ -712,6 +723,7 @@ pub fn sign_transaction(
             run_prepare_sealed_from_unsealed(
                 chain.chain_id,
                 private_key,
+                shielded_seed,
                 dust_seed,
                 tx_bytes,
                 sync_scope,
@@ -733,6 +745,7 @@ pub fn sign_transaction(
 pub fn sign_and_send(
     chain: &Chain,
     private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
     dust_seed: Option<&[u8]>,
     tx_bytes: &[u8],
     rpc_url: Option<&str>,
@@ -748,6 +761,7 @@ pub fn sign_and_send(
             run_prepare_sealed_from_unsealed(
                 chain.chain_id,
                 private_key,
+                shielded_seed,
                 dust_seed,
                 tx_bytes,
                 sync_scope,

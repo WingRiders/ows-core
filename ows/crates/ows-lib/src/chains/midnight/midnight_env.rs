@@ -195,6 +195,29 @@ pub fn shielded_indexer_session_enabled() -> bool {
     !shielded_vk_free_sync_enabled()
 }
 
+/// After viewing-key session sync, merge qualified coins from the on-disk zswap-ledger snapshot
+/// into spend state. **Off by default** — zswap `mt_index` values are not valid in the session
+/// Merkle tree and cause `InvalidIndex` on spend. Opt in with `OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE=1`.
+pub fn shielded_zswap_spend_hydrate_enabled(_network: MidnightNetwork) -> bool {
+    if shielded_vk_free_sync_enabled() {
+        return false;
+    }
+    env_flag_truthy("OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE")
+}
+
+/// Build spendable shielded state from full `zswapLedgerEvents` replay (`ZswapLocalState::replay_events`).
+/// Used when the viewing-key session has no coins but zswap-ledger balance does. Default on preview/preprod.
+pub fn shielded_zswap_spend_wallet_enabled(network: MidnightNetwork) -> bool {
+    if shielded_vk_free_sync_enabled() {
+        return false;
+    }
+    match std::env::var("OWS_MIDNIGHT_SHIELDED_ZSWAP_SPEND") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => shielded_zswap_fallback_enabled(network),
+    }
+}
+
 pub fn fund_balance_skip_dust_sync() -> bool {
     env_flag_truthy("OWS_MIDNIGHT_SKIP_DUST_BALANCE")
 }

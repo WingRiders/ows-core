@@ -194,10 +194,12 @@ pub fn is_balance_unsealed_payload(tx_bytes: &[u8]) -> bool {
 ///
 /// Returns fully-tagged sealed v9 transaction bytes ready to submit via
 /// [`submit_unshielded_tx`].
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_sealed_from_unsealed(
     chain_id: &str,
     indexer_url: &str,
     sender_private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
     dust_seed: Option<&[u8]>,
     tx_bytes: &[u8],
     sync_scope: &SyncCacheScope,
@@ -211,6 +213,16 @@ pub fn prepare_sealed_from_unsealed(
             "Midnight signing key must be 32 bytes",
         )
     })?;
+    let shielded_seed32 = shielded_seed
+        .map(|s| {
+            <[u8; 32]>::try_from(s).map_err(|_| {
+                PayError::new(
+                    PayErrorCode::InvalidInput,
+                    "Midnight shielded seed must be 32 bytes",
+                )
+            })
+        })
+        .transpose()?;
     let dust_seed32 = dust_seed
         .map(|s| {
             <[u8; 32]>::try_from(s).map_err(|_| {
@@ -248,6 +260,7 @@ pub fn prepare_sealed_from_unsealed(
                 chain_id,
                 indexer_url,
                 &key32,
+                shielded_seed32,
                 dust_seed32,
                 tx_bytes,
                 sync_scope,

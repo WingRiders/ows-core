@@ -22,7 +22,9 @@ use midnight_base_crypto::signatures::{
     Signature as MnSig, SigningKey as MidnightSigningKey, VerifyingKey,
 };
 use midnight_base_crypto::time::Timestamp;
-use midnight_coin_structure::coin::{UserAddress, NIGHT};
+use midnight_coin_structure::coin::{
+    ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
+};
 use midnight_ledger::dust::DustLocalState;
 use midnight_ledger::dust::{
     DustActions, DustPublicKey, DustRegistration, DustSecretKey, DustSpend, INITIAL_DUST_PARAMETERS,
@@ -37,12 +39,14 @@ use midnight_serialize::{
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
+use midnight_zswap::Offer as ZswapOffer;
 use ows_signer::chains::MidnightSigner;
 use ows_signer::ChainSigner as _;
 use rand::rngs::OsRng;
 use std::io::Cursor;
 use std::ops::Deref as _;
 use transient_crypto::commitment::PedersenRandomness;
+use transient_crypto::proofs::Proof as ZswapProof;
 
 use super::UnshieldedUtxo;
 
@@ -595,10 +599,12 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
 /// (`proof,embedded-fr`) payloads. Existing ZK proofs in `actions`, `guaranteed_coins`,
 /// and `fallible_coins` are preserved verbatim; we only inject unshielded inputs/outputs
 /// and (for Preview/Preprod) a fresh DUST registration.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn balance_unsealed_proven_standard_tx(
     chain_id: &str,
     indexer_url: &str,
     sender_private_key: &[u8; 32],
+    shielded_seed: Option<[u8; 32]>,
     dust_seed: Option<[u8; 32]>,
     tx_bytes: &[u8],
     scope: &SyncCacheScope,
@@ -607,6 +613,33 @@ pub(super) fn balance_unsealed_proven_standard_tx(
     let mut r: &[u8] = tx_bytes;
     let tx: TxProven = tagged_deserialize(&mut r)
         .map_err(|e| err(format!("failed to parse proven tx bytes: {e}")))?;
+    let Transaction::Standard(stx) = tx else {
+        return Err(err("expected Standard transaction"));
+    };
+
+    let tx = if let Some(offer) = stx.guaranteed_coins.as_ref() {
+        if zswap_offer_needs_shielded_inputs(offer.deref())
+            || !ledger_shielded_deficits(&Transaction::Standard(stx.clone()))?.is_empty()
+        {
+            let seed = shielded_seed.ok_or_else(|| {
+                err(
+                    "contract transaction needs shielded coin inputs; use a mnemonic wallet \
+                     (shielded seed at m/44'/2400'/0'/3/0) and ensure OWS_MIDNIGHT_SHIELDED_VK_FREE is unset",
+                )
+            })?;
+            attach_shielded_proven_inputs_if_needed(
+                indexer_url,
+                scope,
+                seed,
+                Transaction::Standard(stx),
+            )?
+        } else {
+            Transaction::Standard(stx)
+        }
+    } else {
+        Transaction::Standard(stx)
+    };
+
     let Transaction::Standard(stx) = tx else {
         return Err(err("expected Standard transaction"));
     };
@@ -980,9 +1013,109 @@ fn build_proven_dust_spends(
         .ok_or_else(|| err("proven dust spend intent did not contain dust actions"))
 }
 
+/// Per-segment shielded token deficits (ledger `balance` negative = overspend).
+fn ledger_shielded_deficits(
+    tx: &TxProven,
+) -> Result<Vec<(ShieldedTokenType, u128, u16)>, PayError> {
+    let mut out = Vec::new();
+    for ((token, segment), bal) in tx
+        .balance(None)
+        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?
+    {
+        if let LedgerTokenType::Shielded(tt) = token {
+            if bal < 0 {
+                out.push((tt, bal.unsigned_abs(), segment));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn zswap_offer_needs_shielded_inputs(offer: &ZswapOffer<ZswapProof, InMemoryDB>) -> bool {
+    offer.inputs.iter_deref().next().is_none() && offer.outputs.iter_deref().next().is_some()
+}
+
+/// Attach wallet shielded spends to an imbalanced proven `guaranteed_coins` offer (contract deposits).
+fn attach_shielded_proven_inputs_if_needed(
+    indexer_url: &str,
+    scope: &SyncCacheScope,
+    shielded_seed: [u8; 32],
+    tx: TxProven,
+) -> Result<TxProven, PayError> {
+    let Transaction::Standard(mut stx) = tx else {
+        return Err(err("expected Standard transaction"));
+    };
+    let Some(offer_sp) = stx.guaranteed_coins.as_ref() else {
+        return Ok(Transaction::Standard(stx));
+    };
+    let offer = offer_sp.deref();
+    if !zswap_offer_needs_shielded_inputs(offer) {
+        let check = Transaction::Standard(stx.clone());
+        if ledger_shielded_deficits(&check)?.is_empty() {
+            return Ok(Transaction::Standard(stx));
+        }
+    }
+
+    let deficits = ledger_shielded_deficits(&Transaction::Standard(stx.clone()))?;
+    if deficits.is_empty() {
+        return Ok(Transaction::Standard(stx));
+    }
+
+    let rt = super::async_runtime::runtime();
+    let mut wallet = rt
+        .block_on(super::shielded_sync::sync_shielded_wallet_state_scoped(
+            indexer_url,
+            &shielded_seed,
+            scope,
+        ))
+        .map_err(|e| err(format!("shielded wallet sync failed: {e}")))?;
+
+    super::shielded_session::ensure_shielded_merkle_ready(&mut wallet)
+        .map_err(|e| err(format!("shielded merkle tree not ready for spend: {e}")))?;
+
+    let mut inputs_by_segment: std::collections::BTreeMap<u16, Vec<(ShieldedTokenType, u128)>> =
+        std::collections::BTreeMap::new();
+    for (tt, need, segment) in deficits {
+        inputs_by_segment
+            .entry(segment)
+            .or_default()
+            .push((tt, need));
+    }
+
+    let mut merged_offer = offer.clone();
+    let prover = super::OwsProver::from_env().map_err(|e| err(format!("prover: {e}")))?;
+    let mut binding_delta = PedersenRandomness::from(0);
+
+    for (segment, seg_deficits) in inputs_by_segment {
+        let zswap_inputs = super::dapp_connector::collect_shielded_preimage_inputs(
+            &mut wallet,
+            segment,
+            &seg_deficits,
+        )?;
+        if zswap_inputs.is_empty() {
+            continue;
+        }
+        for inp in &zswap_inputs {
+            binding_delta = binding_delta + inp.binding_randomness();
+        }
+        let preimage_offer = ZswapOffer::new(zswap_inputs, vec![], vec![])
+            .ok_or_else(|| err("failed to build shielded input offer for contract balancing"))?;
+        let (_seg, proven_partial) = rt
+            .block_on(preimage_offer.prove(prover.clone(), segment))
+            .map_err(|e| err(format!("prove shielded inputs failed: {e:?}")))?;
+        merged_offer = merged_offer
+            .merge(&proven_partial)
+            .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
+    }
+
+    stx.guaranteed_coins = Some(Sp::new(merged_offer));
+    // Proven txs cannot call `recompute_binding_randomness`; add spend randomness from preimages.
+    stx.binding_randomness = stx.binding_randomness + binding_delta;
+    Ok(Transaction::Standard(stx))
+}
+
 /// Reassemble a proven `StandardTransaction`, preserving shielded Zswap offers
-/// and the existing binding randomness (the unshielded offer doesn't contribute
-/// to the Pedersen binding, so the existing sum is still correct).
+/// and binding randomness (must already match `guaranteed_coins` / intents).
 fn wrap_proven_standard(
     chain_id: &str,
     stx_in: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,

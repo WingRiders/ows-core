@@ -37,6 +37,9 @@ pub(super) struct ShieldedSyncSnapshot {
 pub(super) struct ZswapOwnedCoinRecord {
     pub nullifier_hex: String,
     pub coin_hex: String,
+    /// Merkle tree leaf index (required for shielded spends).
+    #[serde(default)]
+    pub mt_index: Option<u64>,
 }
 
 impl ShieldedSyncSnapshot {

@@ -176,7 +176,7 @@ pub fn print_fund_balance(
         &mut prompt_passphrase,
     )?;
 
-    let shielded = if let Some(seed) = shielded_seed.as_ref() {
+    let shielded_report = if let Some(seed) = shielded_seed.as_ref() {
         if midnight_sync_log_enabled() {
             eprintln!(
                 "[ows-midnight] syncing shielded balance from indexer (may take a while on first run)…"
@@ -191,6 +191,8 @@ pub fn print_fund_balance(
     } else {
         Default::default()
     };
+    let shielded = shielded_report.spendable;
+    let shielded_zswap_only = shielded_report.zswap_only;
 
     print_addresses(
         chain_id,
@@ -199,7 +201,7 @@ pub fn print_fund_balance(
         dust_seed.as_ref(),
     )?;
 
-    if unshielded.is_empty() && shielded.is_empty() {
+    if unshielded.is_empty() && shielded.is_empty() && shielded_zswap_only.is_empty() {
         eprintln!("No Midnight tokens found for {address} on {chain_id}");
         return Ok(());
     }
@@ -212,12 +214,27 @@ pub fn print_fund_balance(
         eprintln!();
     }
     if shielded_seed.is_some() {
-        eprintln!("Shielded balances:");
+        eprintln!("Shielded spendable balances (viewing-key session):");
         if shielded.is_empty() {
-            eprintln!("  (none — no unspent shielded coins found after full sync)");
+            eprintln!("  (none — no unspent shielded coins in session after full sync)");
         } else {
-            for (token_type, amount) in shielded {
+            for (token_type, amount) in &shielded {
                 println!("{:>24} {}", amount, token_type);
+            }
+        }
+        if !shielded_zswap_only.is_empty() {
+            eprintln!();
+            eprintln!(
+                "Shielded zswap-ledger only (visible on-chain but not in viewing-key session — OWS cannot sign shielded spends for these until the indexer delivers them as RelevantTransaction):"
+            );
+            for (token_type, amount) in &shielded_zswap_only {
+                println!("{:>24} {}", amount, token_type);
+            }
+            if shielded.is_empty() {
+                eprintln!();
+                eprintln!(
+                    "Hint: receive or transfer shielded funds again (to your shielded address above) using a wallet that updates the indexer session, then re-run fund balance."
+                );
             }
         }
         eprintln!();

@@ -1,12 +1,14 @@
 //! Full `zswapLedgerEvents` replay fallback for shielded balance sync.
 
 use super::error::{PayError, PayErrorCode};
-use midnight_coin_structure::coin;
+use midnight_coin_structure::coin::{self, QualifiedInfo as QualifiedCoinInfo};
 use midnight_coin_structure::transfer;
 use midnight_ledger::events::{Event, EventDetails};
+use midnight_ledger::semantics::ZswapLocalStateExt;
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
 use midnight_storage::db::InMemoryDB;
 use midnight_zswap::keys::SecretKeys as ZswapSecretKeys;
+use midnight_zswap::local::State as ZswapLocalState;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -35,6 +37,10 @@ pub(super) fn balances_from_owned_coins(
     balances
 }
 
+pub(super) struct ZswapLedgerReplayState {
+    pub owned: BTreeMap<coin::Nullifier, coin::Info>,
+}
+
 pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
     indexer_url: &str,
     keys: &ZswapSecretKeys,
@@ -42,12 +48,97 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
     seed_fp: &str,
     purpose: SyncPurpose,
 ) -> Result<ShieldedBalances, PayError> {
+    let state = zswap_ledger_replay_scoped(indexer_url, keys, scope, seed_fp, purpose).await?;
+    Ok(balances_from_owned_coins(&state.owned))
+}
+
+/// Spendable shielded wallet from full `zswapLedgerEvents` replay (correct Merkle tree + coins).
+pub(super) async fn sync_shielded_wallet_from_zswap_ledger_scoped(
+    indexer_url: &str,
+    keys: &ZswapSecretKeys,
+    scope: &SyncCacheScope,
+    purpose: SyncPurpose,
+) -> Result<super::shielded_session::ShieldedWalletState, PayError> {
+    let zswap = zswap_ledger_replay_wallet_scoped(indexer_url, keys, scope, purpose).await?;
+    Ok(super::shielded_session::ShieldedWalletState {
+        keys: keys.clone(),
+        zswap,
+    })
+}
+
+enum ZswapReplayTarget<'a> {
+    Balance {
+        owned: &'a mut BTreeMap<coin::Nullifier, coin::Info>,
+        qualified: &'a mut BTreeMap<coin::Nullifier, QualifiedCoinInfo>,
+    },
+}
+
+fn apply_zswap_ledger_event_balance(
+    owned: &mut BTreeMap<coin::Nullifier, coin::Info>,
+    qualified: &mut BTreeMap<coin::Nullifier, QualifiedCoinInfo>,
+    keys: &ZswapSecretKeys,
+    ev: &Event<InMemoryDB>,
+    n_outputs_decrypted: &mut u64,
+) {
+    match &ev.content {
+        EventDetails::ZswapOutput {
+            preimage_evidence,
+            mt_index,
+            ..
+        } => {
+            if let Some(ci) = preimage_evidence.try_with_keys(keys) {
+                *n_outputs_decrypted = n_outputs_decrypted.saturating_add(1);
+                let nul = ci.nullifier(&transfer::SenderEvidence::User(
+                    std::borrow::Cow::Borrowed(&keys.coin_secret_key),
+                ));
+                let qci = ci.qualify(*mt_index);
+                owned.insert(nul, ci);
+                qualified.insert(nul, qci);
+            }
+        }
+        EventDetails::ZswapInput { nullifier, .. } => {
+            owned.remove(nullifier);
+            qualified.remove(nullifier);
+        }
+        _ => {}
+    }
+}
+
+fn apply_zswap_ledger_event_wallet(
+    zswap: &mut ZswapLocalState<InMemoryDB>,
+    keys: &ZswapSecretKeys,
+    ev: &Event<InMemoryDB>,
+    n_outputs_decrypted: &mut u64,
+) -> Result<(), PayError> {
+    let coins_before = zswap.coins.iter().count();
+    let prev = std::mem::replace(zswap, ZswapLocalState::new());
+    *zswap = prev.replay_events(keys, std::iter::once(ev)).map_err(|e| {
+        PayError::new(
+            PayErrorCode::ProtocolMalformed,
+            format!("zswap ledger event replay failed: {e}"),
+        )
+    })?;
+    let coins_after = zswap.coins.iter().count();
+    if coins_after > coins_before {
+        *n_outputs_decrypted = n_outputs_decrypted.saturating_add(1);
+    }
+    Ok(())
+}
+
+async fn zswap_ledger_replay_scoped(
+    indexer_url: &str,
+    keys: &ZswapSecretKeys,
+    scope: &SyncCacheScope,
+    seed_fp: &str,
+    purpose: SyncPurpose,
+) -> Result<ZswapLedgerReplayState, PayError> {
     let log = midnight_env::midnight_sync_log_enabled();
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
     let zswap_cache_key = shielded_sync_cache::zswap_cache_key(seed_fp);
     let cache_path = shielded_sync_cache::snapshot_path(indexer_url, &zswap_cache_key, scope);
 
     let mut owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
+    let mut qualified: BTreeMap<coin::Nullifier, QualifiedCoinInfo> = BTreeMap::new();
     let mut last_seen_id: i64 = -1;
     let mut saved_max_id: i64 = 0;
 
@@ -60,8 +151,9 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
                 saved_max_id = snap.max_zswap_id_when_saved;
                 if !snap.zswap_owned_coins.is_empty() {
                     match decode_zswap_owned_coins(&snap.zswap_owned_coins) {
-                        Ok(map) => {
+                        Ok((map, qmap)) => {
                             owned = map;
+                            qualified = qmap;
                             last_seen_id = snap.last_seen_zswap_event_id;
                             if log {
                                 eprintln!(
@@ -102,7 +194,7 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
                 "[ows-midnight] zswapLedgerEvents: already at saved chain tip (last_seen_id={last_seen_id} max_id={saved_max_id})"
             );
         }
-        return Ok(balances_from_owned_coins(&owned));
+        return Ok(ZswapLedgerReplayState { owned });
     }
     if saved_max_id > 0 && last_seen_id >= saved_max_id && log {
         eprintln!(
@@ -147,8 +239,6 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
 
         let resume_id = last_seen_id.saturating_add(1);
         let sub_vars = if verifying_at_tip {
-            // At tip the indexer often has no events after `last_seen+1`; omit `id` so the
-            // stream starts from the live head instead of RST on an empty resume cursor.
             serde_json::json!({ "id": serde_json::Value::Null })
         } else {
             serde_json::json!({ "id": resume_id })
@@ -165,10 +255,15 @@ pub(super) async fn get_shielded_balances_from_zswap_ledger_events_scoped(
         }
         indexer_ws::subscribe(&mut ws, "1", ZSWAP_LEDGER_SUB, sub_vars).await?;
 
+        let mut target = ZswapReplayTarget::Balance {
+            owned: &mut owned,
+            qualified: &mut qualified,
+        };
         let (dropped, attempt_events) = replay_zswap_ws_loop(
             &mut ws,
             keys,
-            &mut owned,
+            Some(&mut target),
+            None,
             &mut last_seen_id,
             &mut max_id,
             &mut n_events,
@@ -236,7 +331,7 @@ try again or set OWS_MIDNIGHT_SYNC_LOG=1"
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let owned_records = encode_zswap_owned_coins(&owned)?;
+        let owned_records = encode_zswap_owned_coins(&owned, &qualified)?;
         shielded_sync_cache::try_save_snapshot(
             path,
             &shielded_sync_cache::ShieldedSyncSnapshot {
@@ -255,14 +350,111 @@ try again or set OWS_MIDNIGHT_SYNC_LOG=1"
         );
     }
 
-    Ok(balances)
+    Ok(ZswapLedgerReplayState { owned })
+}
+
+/// Full zswap replay from genesis building a spendable `ZswapLocalState` (no snapshot resume).
+async fn zswap_ledger_replay_wallet_scoped(
+    indexer_url: &str,
+    keys: &ZswapSecretKeys,
+    _scope: &SyncCacheScope,
+    purpose: SyncPurpose,
+) -> Result<ZswapLocalState<InMemoryDB>, PayError> {
+    let log = midnight_env::midnight_sync_log_enabled();
+    let mut zswap = ZswapLocalState::new();
+    let mut last_seen_id: i64 = -1;
+    let mut max_id: Option<i64> = None;
+    let mut n_events: u64 = 0;
+    let mut n_outputs_decrypted: u64 = 0;
+    let progress_interval = if purpose.is_display() { 1000 } else { 5000 };
+    let ws_idle = midnight_env::ws_idle_timeout(SyncStream::Shielded);
+    let stall_timeout = midnight_env::stall_timeout(SyncStream::Shielded);
+    let sync_started = Instant::now();
+    let mut last_event_at: Option<Instant> = None;
+
+    if log {
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents (spend wallet): replaying from genesis for Merkle + coins"
+        );
+    }
+
+    for attempt in 0..4 {
+        if log && attempt > 0 {
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents (spend wallet): reconnecting (attempt {}) from event id {}",
+                attempt + 1,
+                last_seen_id.saturating_add(1)
+            );
+        }
+        let mut ws =
+            indexer_ws::connect_and_init(indexer_url, ws_idle, Some("zswapLedgerEvents")).await?;
+        let resume_id = last_seen_id.saturating_add(1);
+        indexer_ws::subscribe(
+            &mut ws,
+            "1",
+            ZSWAP_LEDGER_SUB,
+            serde_json::json!({ "id": resume_id }),
+        )
+        .await?;
+
+        let (dropped, attempt_events) = replay_zswap_ws_loop(
+            &mut ws,
+            keys,
+            None,
+            Some(&mut zswap),
+            &mut last_seen_id,
+            &mut max_id,
+            &mut n_events,
+            &mut n_outputs_decrypted,
+            ws_idle,
+            stall_timeout,
+            sync_started,
+            &mut last_event_at,
+            progress_interval,
+            log,
+            false,
+        )
+        .await?;
+        drop(ws);
+
+        if !dropped && max_id.is_some_and(|m| last_seen_id >= m) {
+            break;
+        }
+        if attempt + 1 < 4 {
+            tokio::time::sleep(Duration::from_millis(
+                250u64.saturating_mul((attempt + 1) as u64),
+            ))
+            .await;
+            continue;
+        }
+        if attempt_events == 0 && max_id.is_some_and(|m| last_seen_id >= m) {
+            break;
+        }
+        return Err(PayError::new(
+            PayErrorCode::HttpTransport,
+            format!(
+                "zswap ledger spend-wallet sync incomplete: last_seen_id={last_seen_id} max_id={max_id:?}"
+            ),
+        ));
+    }
+
+    if log {
+        let spendable: u128 = zswap.coins.iter().map(|(_, q)| q.value).sum();
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents spend-wallet done: events_seen={n_events} decrypted_outputs={n_outputs_decrypted} spendable_coins={} coins_unspent={spendable} last_seen_id={last_seen_id}",
+            zswap.coins.iter().count()
+        );
+    }
+
+    Ok(zswap)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn replay_zswap_ws_loop(
     ws: &mut IndexerWs,
     keys: &ZswapSecretKeys,
-    owned: &mut BTreeMap<coin::Nullifier, coin::Info>,
+    mut balance: Option<&mut ZswapReplayTarget<'_>>,
+    mut wallet: Option<&mut ZswapLocalState<InMemoryDB>>,
     last_seen_id: &mut i64,
     max_id: &mut Option<i64>,
     n_events: &mut u64,
@@ -393,22 +585,18 @@ indexer may be stalled",
                     )
                 })?;
 
-                match ev.content {
-                    EventDetails::ZswapOutput {
-                        preimage_evidence, ..
-                    } => {
-                        if let Some(ci) = preimage_evidence.try_with_keys(keys) {
-                            *n_outputs_decrypted = n_outputs_decrypted.saturating_add(1);
-                            let nul = ci.nullifier(&transfer::SenderEvidence::User(
-                                std::borrow::Cow::Borrowed(&keys.coin_secret_key),
-                            ));
-                            owned.insert(nul, ci);
-                        }
-                    }
-                    EventDetails::ZswapInput { nullifier, .. } => {
-                        owned.remove(&nullifier);
-                    }
-                    _ => {}
+                if let Some(zswap) = wallet.as_deref_mut() {
+                    apply_zswap_ledger_event_wallet(zswap, keys, &ev, n_outputs_decrypted)?;
+                } else if let Some(ZswapReplayTarget::Balance { owned, qualified }) =
+                    balance.as_deref_mut()
+                {
+                    apply_zswap_ledger_event_balance(
+                        owned,
+                        qualified,
+                        keys,
+                        &ev,
+                        n_outputs_decrypted,
+                    );
                 }
 
                 if log && (*n_events == 1 || n_events.is_multiple_of(progress_interval)) {
@@ -436,6 +624,7 @@ indexer may be stalled",
 
 fn encode_zswap_owned_coins(
     owned: &BTreeMap<coin::Nullifier, coin::Info>,
+    qualified: &BTreeMap<coin::Nullifier, QualifiedCoinInfo>,
 ) -> Result<Vec<shielded_sync_cache::ZswapOwnedCoinRecord>, PayError> {
     let mut out = Vec::with_capacity(owned.len());
     for (nul, ci) in owned {
@@ -445,18 +634,53 @@ fn encode_zswap_owned_coins(
             .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
         tagged_serialize(ci, &mut ci_b)
             .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
+        let mt_index = qualified.get(nul).map(|q| q.mt_index);
         out.push(shielded_sync_cache::ZswapOwnedCoinRecord {
             nullifier_hex: hex::encode(nul_b),
             coin_hex: hex::encode(ci_b),
+            mt_index,
         });
     }
     Ok(out)
 }
 
+type ZswapOwnedSnapshotMaps = (
+    BTreeMap<coin::Nullifier, coin::Info>,
+    BTreeMap<coin::Nullifier, QualifiedCoinInfo>,
+);
+
+/// Qualified unspent coins from the wallet's on-disk zswap-ledger snapshot (if any).
+pub(super) fn load_zswap_qualified_coins_from_snapshot(
+    indexer_url: &str,
+    scope: &SyncCacheScope,
+    seed_fp: &str,
+) -> BTreeMap<coin::Nullifier, QualifiedCoinInfo> {
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    let zswap_cache_key = shielded_sync_cache::zswap_cache_key(seed_fp);
+    let Some(path) = shielded_sync_cache::snapshot_path(indexer_url, &zswap_cache_key, scope)
+    else {
+        return BTreeMap::new();
+    };
+    let Some(snap) = shielded_sync_cache::try_load_snapshot(&path) else {
+        return BTreeMap::new();
+    };
+    if snap.indexer_fingerprint != fp
+        || !cache_io::snapshot_chain_matches(scope, &snap.chain_id)
+        || snap.viewing_key_fingerprint != zswap_cache_key
+        || snap.zswap_owned_coins.is_empty()
+    {
+        return BTreeMap::new();
+    }
+    decode_zswap_owned_coins(&snap.zswap_owned_coins)
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+}
+
 fn decode_zswap_owned_coins(
     records: &[shielded_sync_cache::ZswapOwnedCoinRecord],
-) -> Result<BTreeMap<coin::Nullifier, coin::Info>, PayError> {
+) -> Result<ZswapOwnedSnapshotMaps, PayError> {
     let mut owned = BTreeMap::new();
+    let mut qualified = BTreeMap::new();
     for rec in records {
         let nul_b = hex::decode(
             rec.nullifier_hex
@@ -491,8 +715,11 @@ fn decode_zswap_owned_coins(
             )
         })?;
         owned.insert(nul, ci);
+        if let Some(mt_index) = rec.mt_index {
+            qualified.insert(nul, ci.qualify(mt_index));
+        }
     }
-    Ok(owned)
+    Ok((owned, qualified))
 }
 
 #[derive(Debug, Default, Deserialize)]
