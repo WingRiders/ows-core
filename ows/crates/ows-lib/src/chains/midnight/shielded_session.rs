@@ -251,7 +251,7 @@ pub(super) fn shielded_sync_done(
 
 pub(super) fn token_type_hex(ci: &coin::Info) -> String {
     let t = ci.type_.into_inner();
-    format!("0x{}", hex::encode(t.0))
+    hex::encode(t.0)
 }
 
 /// Synced shielded wallet state used to build Zswap offers (e.g. DApp Connector `makeIntent`).

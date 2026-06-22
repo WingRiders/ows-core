@@ -630,7 +630,7 @@ spend wallet should come from zswapLedgerEvents replay only)"
                 .map(|(_, qci)| qci.value)
                 .sum();
             return Err(err(format!(
-                "insufficient shielded balance for token 0x{wire}: short by {need} in zswap wallet \
+                "insufficient shielded balance for token {wire}: short by {need} in zswap wallet \
 state (have {have}). Run `ows fund balance` to confirm zswapLedgerEvents sync, then sign again"
             )));
         }

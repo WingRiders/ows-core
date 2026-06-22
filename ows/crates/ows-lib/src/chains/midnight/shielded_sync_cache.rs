@@ -158,7 +158,7 @@ mod tests {
             max_zswap_id_when_saved: 2815,
             block_height_when_saved: 0,
             saved_at_unix: 1,
-            balances: BTreeMap::from([("0x01".into(), 1u128)]),
+            balances: BTreeMap::from([("01".into(), 1u128)]),
             zswap_owned_coins: vec![],
             zswap_state_hex: String::new(),
         };
