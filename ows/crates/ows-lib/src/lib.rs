@@ -1,3 +1,4 @@
+pub mod chains;
 pub mod error;
 pub mod key_ops;
 pub mod key_store;

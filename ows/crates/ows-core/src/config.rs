@@ -81,6 +81,33 @@ impl Config {
             "eip155:999".into(),
             "https://rpc.hyperliquid.xyz/evm".into(),
         );
+        // Midnight uses a public indexer (GraphQL HTTP endpoint) for balance queries.
+        // WebSocket URL is derived automatically as `.../graphql/ws`.
+        rpc.insert(
+            "midnight:mainnet".into(),
+            "https://indexer.mainnet.midnight.network/api/v4/graphql".into(),
+        );
+        rpc.insert(
+            "midnight:preview".into(),
+            "https://indexer.preview.midnight.network/api/v4/graphql".into(),
+        );
+        rpc.insert(
+            "midnight:preprod".into(),
+            "https://indexer.preprod.midnight.network/api/v4/graphql".into(),
+        );
+        // Substrate HTTP JSON-RPC for transaction submission (`Midnight::send_mn_transaction`).
+        rpc.insert(
+            "midnight:mainnet:node".into(),
+            "https://rpc.mainnet.midnight.network".into(),
+        );
+        rpc.insert(
+            "midnight:preview:node".into(),
+            "https://rpc.preview.midnight.network".into(),
+        );
+        rpc.insert(
+            "midnight:preprod:node".into(),
+            "https://rpc.preprod.midnight.network".into(),
+        );
         rpc
     }
 }
@@ -224,6 +251,10 @@ mod tests {
             config.rpc_url("eip155:999"),
             Some("https://rpc.hyperliquid.xyz/evm")
         );
+        assert_eq!(
+            config.rpc_url("midnight:preview:node"),
+            Some("https://rpc.preview.midnight.network")
+        );
     }
 
     #[test]
@@ -266,7 +297,7 @@ mod tests {
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default_from(std::path::Path::new("/nonexistent/config.json"));
         // Should have all default RPCs
-        assert_eq!(config.rpc.len(), 23);
+        assert_eq!(config.rpc.len(), 29);
         assert_eq!(config.rpc_url("eip155:1"), Some("https://eth.llamarpc.com"));
         assert_eq!(
             config.rpc_url("near:mainnet"),
