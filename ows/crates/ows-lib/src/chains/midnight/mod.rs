@@ -11,7 +11,7 @@
 //! - [`prover`] — proof generation client (`OwsProver`).
 //! - [`balance`] / [`sign`] — wallet-style balance → sign → prove → seal
 //!   pipeline used to turn a dapp's unsealed payload into a submittable tx.
-//! - [`submit`] — Substrate `author_submitExtrinsic` submission for sealed txs.
+//! - [`submit`] — node `author_submitExtrinsic` submission for sealed txs.
 //! - [`cache_io`] / [`dust_sync_cache`] / [`shielded_sync_cache`] — disk snapshots for
 //!   the unshielded / shielded / dust sync streams.
 //! - [`indexer_ws`] / [`midnight_env`] — shared WebSocket plumbing and env/network helpers.

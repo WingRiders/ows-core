@@ -1,5 +1,5 @@
 //! Submit a finalized Midnight ledger transaction (`midnight:transaction…` bytes)
-//! to a node via Substrate `author_submitExtrinsic`
+//! to a Midnight node via `author_submitExtrinsic`
 //! (`Midnight::send_mn_transaction`).
 //!
 //! If `submit` fails, we also try `system_dryRun` and `payment_queryInfo` so the
@@ -221,7 +221,7 @@ fn node_http_url(node_rpc_url: &str) -> Result<String, PayError> {
     let trimmed = trimmed.trim_end_matches('/');
 
     fn strip_ws_path_suffix(url: &str) -> String {
-        // Many Substrate providers expose WebSocket at `/ws` while HTTP JSON-RPC is at `/`.
+        // Many node deployments expose WebSocket at `/ws` while HTTP JSON-RPC is at `/`.
         // If a user pastes the WS URL (e.g. `wss://host/ws`), we want `https://host` for dry-run.
         url.strip_suffix("/ws")
             .or_else(|| url.strip_suffix("/ws/"))
@@ -345,7 +345,7 @@ async fn payment_query_info(
 
 /// Submit a finalized Midnight ledger transaction (`midnight:transaction…` bytes) to a node.
 ///
-/// `node_rpc_url` is a standard Substrate HTTP JSON-RPC endpoint (e.g.
+/// `node_rpc_url` is a standard Midnight node HTTP JSON-RPC endpoint (e.g.
 /// `https://rpc.preview.midnight.network/`). The extrinsic used is
 /// `Midnight::send_mn_transaction` wrapping the raw ledger bytes.
 ///

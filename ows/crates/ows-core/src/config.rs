@@ -95,7 +95,7 @@ impl Config {
             "midnight:preprod".into(),
             "https://indexer.preprod.midnight.network/api/v4/graphql".into(),
         );
-        // Substrate HTTP JSON-RPC for transaction submission (`Midnight::send_mn_transaction`).
+        // Node HTTP JSON-RPC for transaction submission (`Midnight::send_mn_transaction`).
         rpc.insert(
             "midnight:mainnet:node".into(),
             "https://rpc.mainnet.midnight.network".into(),
