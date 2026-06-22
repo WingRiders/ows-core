@@ -4,15 +4,7 @@ use super::async_runtime::block_on;
 use super::cache_io::SyncCacheScope;
 use super::ledger_params;
 
-/// Populate [`SyncCacheScope::indexer_block_height`] once per signing/balance flow when unset.
-pub(crate) fn ensure_indexer_block_height(scope: &mut SyncCacheScope, indexer_url: &str) {
-    if scope.indexer_block_height.is_some() {
-        return;
-    }
-    refresh_indexer_block_height(scope, indexer_url);
-}
-
-/// Always fetch the latest indexer `block.height` (signing / post-submit paths).
+/// Always fetch the latest indexer `block.height` (balance, signing, post-submit paths).
 pub(crate) fn refresh_indexer_block_height(scope: &mut SyncCacheScope, indexer_url: &str) {
     if let Ok(height) = block_on(ledger_params::fetch_indexer_block_height(indexer_url)) {
         scope.indexer_block_height = Some(height);

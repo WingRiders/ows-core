@@ -278,21 +278,14 @@ async fn zswap_ledger_replay_scoped(
         }
         return Ok(ZswapLedgerReplayState { owned });
     }
-    if snapshot_at_saved_tip
+    if !purpose.must_catch_up_to_indexer_tip()
+        && snapshot_at_saved_tip
         && super::tip_verify::indexer_block_height_matches_saved(indexer_url, saved_block_height)
             .await
     {
         if log {
             eprintln!(
                 "[ows-midnight] zswapLedgerEvents: HTTP tip unchanged on re-check (block height={saved_block_height}), using snapshot"
-            );
-        }
-        return Ok(ZswapLedgerReplayState { owned });
-    }
-    if snapshot_at_saved_tip && !purpose.must_catch_up_to_indexer_tip() {
-        if log {
-            eprintln!(
-                "[ows-midnight] zswapLedgerEvents: display mode — complete on-disk snapshot, skipping WebSocket catch-up"
             );
         }
         return Ok(ZswapLedgerReplayState { owned });

@@ -102,6 +102,7 @@ fn print_dust_status(
             Some(Ok((dust_utxo_count, dust_sum))) => {
                 eprintln!("  DUST UTXOs: {dust_utxo_count}");
                 let dust = format_dust_specks(dust_sum);
+                eprintln!("  DUST balance (specks): {dust_sum}");
                 eprintln!("  DUST balance: {dust} (best-effort, wall-clock time)");
             }
             Some(Err(e)) => {
@@ -135,7 +136,7 @@ pub fn print_fund_balance(
 
     let indexer_url = resolve_indexer_url(chain_id)?;
     let mut sync_scope = sync_scope_for_wallet(wallet_name, Some(chain_id), vault_path);
-    super::tip_verify::ensure_indexer_block_height(&mut sync_scope, &indexer_url);
+    super::tip_verify::refresh_indexer_block_height(&mut sync_scope, &indexer_url);
 
     let (shielded_seed, dust_seed) = decrypt_auxiliary_seeds_with_fallback(
         wallet_name,

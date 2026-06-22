@@ -304,7 +304,23 @@ cannot refresh spend wallet"
                     let dsk = midnight_ledger::dust::DustSecretKey::derive_secret_key(seed);
                     match dust_sync::sync_dust_local_state_scoped(indexer_url, &dsk, &scope).await {
                         Ok(_) => {
-                            if log {
+                            let cursor = dust_sync::snapshot_last_seen_dust_event_id_for_key(
+                                indexer_url,
+                                &scope,
+                                &dsk,
+                            )?;
+                            if let Some(required) = tx_summary.max_dust_ledger_event_id {
+                                if cursor.is_none_or(|c| c < required) {
+                                    ready = false;
+                                    if log {
+                                        eprintln!(
+                                            "[ows-midnight] post-submit: dust snapshot cursor \
+{cursor:?} has not reached submitted tx event id {required}; retrying…"
+                                        );
+                                    }
+                                }
+                            }
+                            if ready && log {
                                 eprintln!(
                                     "[ows-midnight] post-submit: dust ledger snapshot refreshed"
                                 );

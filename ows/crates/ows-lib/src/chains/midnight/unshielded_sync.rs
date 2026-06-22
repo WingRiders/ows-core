@@ -387,11 +387,13 @@ async fn get_unshielded_utxos_inner(
     }
 
     let log_progress = midnight_sync_log_enabled();
-    if super::tip_verify::snapshot_fresh_by_http_tip(
-        scope,
-        saved_block_height,
-        snapshot_at_saved_tip,
-    ) {
+    if !purpose.must_catch_up_to_indexer_tip()
+        && super::tip_verify::snapshot_fresh_by_http_tip(
+            scope,
+            saved_block_height,
+            snapshot_at_saved_tip,
+        )
+    {
         if log_progress {
             eprintln!(
                 "[ows-midnight] unshielded sync: HTTP tip unchanged (block height={saved_block_height}), using snapshot"
@@ -401,23 +403,14 @@ async fn get_unshielded_utxos_inner(
         session_cache::put_unshielded(scope, &fp, address, list.clone());
         return Ok(list);
     }
-    if snapshot_at_saved_tip
+    if !purpose.must_catch_up_to_indexer_tip()
+        && snapshot_at_saved_tip
         && super::tip_verify::indexer_block_height_matches_saved(indexer_url, saved_block_height)
             .await
     {
         if log_progress {
             eprintln!(
                 "[ows-midnight] unshielded sync: HTTP tip unchanged on re-check (block height={saved_block_height}), using snapshot"
-            );
-        }
-        let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
-        session_cache::put_unshielded(scope, &fp, address, list.clone());
-        return Ok(list);
-    }
-    if snapshot_at_saved_tip && !purpose.must_catch_up_to_indexer_tip() {
-        if log_progress {
-            eprintln!(
-                "[ows-midnight] unshielded sync: display mode — complete on-disk snapshot, skipping WebSocket catch-up"
             );
         }
         let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();

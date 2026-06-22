@@ -211,6 +211,37 @@ pub(crate) async fn sync_dust_local_state_scoped(
     .await
 }
 
+/// `last_seen_event_id` from the on-disk dust snapshot when site keys match.
+pub(super) fn snapshot_last_seen_dust_event_id(
+    indexer_url: &str,
+    scope: &super::cache_io::SyncCacheScope,
+    dust_pk_hex: &str,
+) -> Option<i64> {
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    let path = super::dust_sync_cache::snapshot_path(indexer_url, dust_pk_hex, scope)?;
+    let snap = super::dust_sync_cache::try_load_snapshot(&path)?;
+    if snap.indexer_fingerprint != fp
+        || !cache_io::snapshot_chain_matches(scope, &snap.chain_id)
+        || snap.dust_public_key_hex != dust_pk_hex
+    {
+        return None;
+    }
+    Some(snap.last_seen_event_id)
+}
+
+pub(super) fn snapshot_last_seen_dust_event_id_for_key(
+    indexer_url: &str,
+    scope: &super::cache_io::SyncCacheScope,
+    dust_sk: &DustSecretKey,
+) -> Result<Option<i64>, PayError> {
+    let dust_pk_hex = dust_public_key_hex(dust_sk)?;
+    Ok(snapshot_last_seen_dust_event_id(
+        indexer_url,
+        scope,
+        &dust_pk_hex,
+    ))
+}
+
 pub async fn sync_dust_local_state_scoped_with_options(
     indexer_url: &str,
     dust_sk: &DustSecretKey,
@@ -268,11 +299,13 @@ async fn sync_dust_local_state_inner(
 
     let log_progress = options.log_progress;
     let snapshot_at_saved_tip = saved_max_id > 0 && start_id.saturating_sub(1) >= saved_max_id;
-    if super::tip_verify::snapshot_fresh_by_http_tip(
-        scope,
-        saved_block_height,
-        snapshot_at_saved_tip,
-    ) {
+    if !options.purpose.must_catch_up_to_indexer_tip()
+        && super::tip_verify::snapshot_fresh_by_http_tip(
+            scope,
+            saved_block_height,
+            snapshot_at_saved_tip,
+        )
+    {
         if log_progress {
             eprintln!(
                 "[ows-midnight] dust sync: HTTP tip unchanged (block height={saved_block_height}), using snapshot"
@@ -281,22 +314,14 @@ async fn sync_dust_local_state_inner(
         finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
         return Ok(state);
     }
-    if snapshot_at_saved_tip
+    if !options.purpose.must_catch_up_to_indexer_tip()
+        && snapshot_at_saved_tip
         && super::tip_verify::indexer_block_height_matches_saved(indexer_url, saved_block_height)
             .await
     {
         if log_progress {
             eprintln!(
                 "[ows-midnight] dust sync: HTTP tip unchanged on re-check (block height={saved_block_height}), using snapshot"
-            );
-        }
-        finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
-        return Ok(state);
-    }
-    if snapshot_at_saved_tip && !options.purpose.must_catch_up_to_indexer_tip() {
-        if log_progress {
-            eprintln!(
-                "[ows-midnight] dust sync: display mode — complete on-disk snapshot, skipping WebSocket tip-verify"
             );
         }
         finish_dust_sync_with_session_cache(&state, scope, &fp, &dust_pk_hex);
