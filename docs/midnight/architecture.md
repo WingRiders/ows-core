@@ -1,6 +1,6 @@
 # Midnight OWS Integration — Architecture
 
-> Status: implemented in this fork (Preview / Preprod / mainnet). This document describes how
+> Status: implemented (Preview / Preprod / mainnet). This document describes how
 > Midnight is wired into OWS end-to-end: crates, cryptography, external services, dependencies,
 > and how it differs from other chain families.
 
@@ -197,8 +197,8 @@ Pinned in `ows-signer` / `ows-lib` `Cargo.toml` (versions may change with worksp
 | `tokio`, `tokio-tungstenite`, `reqwest` | Async indexer HTTP + WebSocket |
 | `bech32`, `k256` (via signer) | Address encoding and Schnorr |
 
-General OWS crates (`ows-core`, `ows-signer` HD/mnemonic/vault) are unchanged; Midnight adds the
-rows above only where chain-specific logic is required.
+Shared OWS crates (`ows-core`, `ows-signer` vault/HD/mnemonic) handle wallet storage and derivation;
+the crates in the table above cover Midnight-specific ledger, sync, and proving logic.
 
 ## Peculiarities vs other OWS chains
 
@@ -206,7 +206,7 @@ rows above only where chain-specific logic is required.
 |-------|-----------------------------------|----------|
 | Accounts per family | One derivation path → one address | **Three roles** (unshielded / dust / shielded); wallet file stores **unshielded only** |
 | CAIP-10 `address` | Chain-native address | Unshielded Bech32m only; shielded/dust not in `account_id` |
-| CAIP-2 namespace | Registered or de-facto (`eip155`, `solana`, …) | **`midnight` — OWS-defined**, unofficial ([addressing.md](./addressing.md)) |
+| CAIP-2 namespace | Registered or de-facto (`eip155`, `solana`, …) | **`midnight` — provisional** until a CAIP namespace profile is registered ([addressing.md](./addressing.md)) |
 | Curve in `ChainSigner` | One curve per family | secp256k1 Schnorr; shielded/dust use **additional seeds**, not `derive_address()` |
 | Transaction model | Often opaque hex / RLP / protobuf | Tagged **`midnight:transaction[...]`** + unsealed preimage/proof variants |
 | Pre-sign sync | Usually none (nonce/UTXO from RPC) | **Indexer replay** required for balancing and fund balance |
@@ -218,7 +218,7 @@ rows above only where chain-specific logic is required.
 
 ## Public references
 
-Official Midnight documentation and specs (external to OWS):
+Midnight documentation and specs:
 
 - [Midnight developer docs](https://docs.midnight.network/)
 - [Midnight network](https://midnight.network/)
@@ -231,12 +231,13 @@ Chain-agnostic identifiers (OWS uses CAIP-shaped ids; see [addressing.md](./addr
 - [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces) (no Midnight profile yet)
 - [SLIP-44 coin type 2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md)
 
-## Related docs in this repo
+## Related documentation
 
 | Document | Contents |
 |----------|----------|
 | [addressing.md](./addressing.md) | CAIP-2/10 mapping, HRPs, derivation roles |
 | [swap-intent.md](./swap-intent.md) | Cross-domain `makeIntent` / balancing workflow |
+| [chain-plugin-interface.md](./chain-plugin-interface.md) | Chain plugin interface (operations contract) |
 | [07-supported-chains.md](../07-supported-chains.md) | Registry table, aliases, indexer sync note |
 | `ows-lib/src/chains/midnight/mod.rs` | Module map and public exports |
 

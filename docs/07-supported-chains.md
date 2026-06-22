@@ -40,7 +40,7 @@ OWS groups chains into families that share a cryptographic curve and address der
 | Spark | secp256k1 | 8797555 | `m/84'/0'/0'/0/{index}` | `spark:` + compressed pubkey hex | `spark` |
 | Filecoin | secp256k1 | 461 | `m/44'/461'/0'/0/{index}` | `f1` + base32(blake2b-160) | `fil` |
 | NEAR | ed25519 | 397 | `m/44'/397'/{index}'` | 64-char lowercase hex of pubkey (implicit account) | `near` |
-| Midnight (unshielded/Night) | secp256k1 (Schnorr) | [2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (BIP-44) | `m/44'/2400'/0'/0/{index}` (unshielded); shielded `.../3/{index}`; dust `.../2/{index}` | Bech32m `mn_addr1...` / `mn_addr_preview1...` / `mn_addr_preprod1...` (SHA-256 of x-only pubkey) | `midnight` (OWS-defined; unofficial) |
+| Midnight (unshielded/Night) | secp256k1 (Schnorr) | [2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (BIP-44) | `m/44'/2400'/0'/0/{index}` (unshielded); shielded `.../3/{index}`; dust `.../2/{index}` | Bech32m `mn_addr1...` / `mn_addr_preview1...` / `mn_addr_preprod1...` (SHA-256 of x-only pubkey) | `midnight` (provisional; see [addressing](./midnight/addressing.md)) |
 
 ## Known Networks
 
@@ -89,7 +89,7 @@ Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`
 
 Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
-Midnight-specific documentation lives under [`docs/midnight/`](./midnight/) ([architecture](./midnight/architecture.md), [addressing](./midnight/addressing.md), [swap intents](./midnight/swap-intent.md)). CAIP identifiers are **OWS-defined and unofficial** (no accepted Midnight namespace profile exists yet).
+Midnight-specific documentation lives under [`docs/midnight/`](./midnight/) ([chain plugin interface](./midnight/chain-plugin-interface.md), [architecture](./midnight/architecture.md), [addressing](./midnight/addressing.md), [swap intents](./midnight/swap-intent.md)). The `midnight` CAIP-2 namespace is **provisional** until a profile is registered in the [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces).
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
