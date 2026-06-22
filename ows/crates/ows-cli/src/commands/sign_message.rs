@@ -1,3 +1,4 @@
+use ows_lib::types::SignResult;
 use ows_signer::chains::EvmSigner;
 use ows_signer::signer_for_chain;
 
@@ -27,7 +28,7 @@ pub fn run(
                 Some(index),
                 None,
             )?;
-            return print_result(&result.signature, result.recovery_id, json_output);
+            return print_result(&result, json_output);
         }
         let result = ows_lib::sign_message(
             wallet_name,
@@ -38,7 +39,7 @@ pub fn run(
             Some(index),
             None,
         )?;
-        return print_result(&result.signature, result.recovery_id, json_output);
+        return print_result(&result, json_output);
     }
 
     // Owner mode: resolve key directly (existing behavior)
@@ -47,13 +48,14 @@ pub fn run(
 
     let signer = signer_for_chain(chain.chain_type);
 
-    let output = if let Some(td_json) = typed_data {
+    let result = if let Some(td_json) = typed_data {
         if chain.chain_type != ows_core::ChainType::Evm {
             return Err(CliError::InvalidArgs(
                 "--typed-data is only supported for EVM chains".into(),
             ));
         }
-        EvmSigner.sign_typed_data(key.expose(), td_json)?
+        let output = EvmSigner.sign_typed_data(key.expose(), td_json)?;
+        SignResult::detached_signature(hex::encode(&output.signature), output.recovery_id)
     } else {
         let msg_bytes = match encoding {
             "utf8" => message.as_bytes().to_vec(),
@@ -65,29 +67,23 @@ pub fn run(
                 )))
             }
         };
-        signer.sign_message(key.expose(), &msg_bytes)?
+        let output = signer.sign_message(key.expose(), &msg_bytes)?;
+        ows_lib::sign_result_from_message_output(chain.chain_type, &output)
+            .map_err(|e| CliError::InvalidArgs(e.to_string()))?
     };
 
-    print_result(
-        &hex::encode(&output.signature),
-        output.recovery_id,
-        json_output,
-    )
+    print_result(&result, json_output)
 }
 
-fn print_result(
-    signature: &str,
-    recovery_id: Option<u8>,
-    json_output: bool,
-) -> Result<(), CliError> {
+fn print_result(result: &SignResult, json_output: bool) -> Result<(), CliError> {
     if json_output {
         let obj = serde_json::json!({
-            "signature": signature,
-            "recovery_id": recovery_id,
+            "signature": result.signature,
+            "recovery_id": result.recovery_id,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
-        println!("{signature}");
+        println!("{}", result.signature);
     }
     Ok(())
 }
