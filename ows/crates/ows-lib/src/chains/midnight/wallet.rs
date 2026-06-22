@@ -12,9 +12,10 @@ use ows_signer::{
 
 use super::{
     block_on, build_make_transfer_unsealed_tx, chain_needs_dust_fee_registration,
-    is_balance_unsealed_payload, materialize_connector_request, parse_connector_tx_json,
-    post_submit_sync::refresh_after_submit, prepare_sealed_from_unsealed, seal_imbalanced_unsealed,
-    submit_unshielded_tx, ConnectorTxRequest, PayError, SyncCacheScope,
+    is_balance_unsealed_payload, is_sealed_midnight_payload, materialize_connector_request,
+    parse_connector_tx_json, parse_maker_swap_input, post_submit_sync::refresh_after_submit,
+    prepare_balanced_sealed_from_maker_offer, prepare_sealed_from_unsealed,
+    seal_imbalanced_unsealed, submit_unshielded_tx, ConnectorTxRequest, PayError, SyncCacheScope,
 };
 use crate::error::OwsLibError;
 use crate::types::{SendResult, SignResult};
@@ -360,6 +361,9 @@ pub fn policy_context_tx_bytes(chain: &Chain, tx_arg: &str) -> Result<Vec<u8>, O
     if chain.chain_type == ChainType::Midnight && trimmed.starts_with('{') {
         match parse_connector_tx_json(trimmed).map_err(pay_to_invalid)? {
             ConnectorTxRequest::MakeIntent(_) => return Ok(Vec::new()),
+            ConnectorTxRequest::BalanceSealedTransaction(b) => {
+                return parse_maker_swap_input(chain.chain_id, &b.maker_tx).map_err(pay_to_invalid);
+            }
             ConnectorTxRequest::MakeTransfer(t) => {
                 return build_make_transfer_unsealed_tx(chain.chain_id, None, None, None, &t)
                     .map_err(pay_to_invalid);
@@ -376,6 +380,7 @@ pub(crate) fn decode_midnight_transaction_input(
     tx_arg: &str,
     sender_private_key: Option<&[u8]>,
     shielded_seed: Option<&[u8]>,
+    dust_seed: Option<&[u8]>,
     sync_scope: Option<&SyncCacheScope>,
     for_self_submit: bool,
 ) -> Result<DecodedTxInput, OwsLibError> {
@@ -383,9 +388,9 @@ pub(crate) fn decode_midnight_transaction_input(
     if trimmed.starts_with('{') {
         let req = parse_connector_tx_json(trimmed).map_err(pay_to_invalid)?;
         let key32 = match &req {
-            ConnectorTxRequest::MakeIntent(_) => {
+            ConnectorTxRequest::MakeIntent(_) | ConnectorTxRequest::BalanceSealedTransaction(_) => {
                 let key = sender_private_key.ok_or_else(|| {
-                    invalid_input("makeIntent requires a resolved wallet signing key")
+                    invalid_input("this connector method requires a resolved wallet signing key")
                 })?;
                 key.try_into()
                     .map_err(|_| invalid_input("Midnight signing key must be 32 bytes"))?
@@ -398,11 +403,13 @@ pub(crate) fn decode_midnight_transaction_input(
         let default_scope = SyncCacheScope::default();
         let scope = sync_scope.unwrap_or(&default_scope);
         let shielded32 = shielded_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
+        let dust32 = dust_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
         let (bytes, pay_fees, balance) = materialize_connector_request(
             chain.chain_id,
             &indexer_url,
             &key32,
             shielded32,
+            dust32,
             req,
             scope,
             for_self_submit,
@@ -443,20 +450,21 @@ pub(crate) fn resolve_transaction_material(
         index,
         vault_path,
     )?;
-    let decoded = decode_midnight_transaction_input(
-        chain,
-        tx_arg,
-        Some(sender_private_key),
-        shielded_seed.as_ref().map(|s| s.expose()),
-        Some(&sync_scope),
-        for_self_submit,
-    )?;
     let dust_seed = maybe_load_dust_seed_with_credential(
         wallet_name_or_id,
         chain,
         credential,
         index,
         vault_path,
+    )?;
+    let decoded = decode_midnight_transaction_input(
+        chain,
+        tx_arg,
+        Some(sender_private_key),
+        shielded_seed.as_ref().map(|s| s.expose()),
+        dust_seed.as_ref().map(|s| s.expose()),
+        Some(&sync_scope),
+        for_self_submit,
     )?;
     Ok(ResolvedTxMaterial {
         sync_scope,
@@ -634,6 +642,7 @@ pub fn prepare_midnight_owner_tx_context(
         tx_hex,
         Some(signing_key),
         shielded_seed.as_ref().map(|s| s.expose()),
+        dust_seed.as_ref().map(|s| s.expose()),
         Some(&sync_scope),
         for_self_submit,
     )?;
@@ -705,6 +714,30 @@ fn seal_imbalanced_unsealed_local(
     seal_imbalanced_unsealed(chain_id, &indexer_url, private_key, tx_bytes).map_err(pay_to_invalid)
 }
 
+fn run_balance_sealed_transaction(
+    chain_id: &str,
+    private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
+    dust_seed: Option<&[u8]>,
+    tx_bytes: &[u8],
+    sync_scope: Option<&SyncCacheScope>,
+    pay_fees: bool,
+) -> Result<Vec<u8>, OwsLibError> {
+    let indexer_url = resolve_indexer_url(chain_id)?;
+    let mut scope = sync_scope.cloned().unwrap_or_default();
+    prepare_balanced_sealed_from_maker_offer(
+        chain_id,
+        &indexer_url,
+        private_key,
+        shielded_seed,
+        dust_seed,
+        tx_bytes,
+        &mut scope,
+        pay_fees,
+    )
+    .map_err(pay_to_invalid)
+}
+
 /// Sign a Midnight transaction with an already-resolved private key.
 #[allow(clippy::too_many_arguments)]
 pub fn sign_transaction(
@@ -731,6 +764,19 @@ pub fn sign_transaction(
         } else {
             seal_imbalanced_unsealed_local(chain.chain_id, private_key, tx_bytes)?
         };
+        return Ok(SignResult::midnight_transaction(hex::encode(&signed_wire)));
+    }
+
+    if is_sealed_midnight_payload(tx_bytes) && balance_before_sign {
+        let signed_wire = run_balance_sealed_transaction(
+            chain.chain_id,
+            private_key,
+            shielded_seed,
+            dust_seed,
+            tx_bytes,
+            sync_scope,
+            pay_fees,
+        )?;
         return Ok(SignResult::midnight_transaction(hex::encode(&signed_wire)));
     }
 
@@ -769,6 +815,16 @@ pub fn sign_and_send(
         } else {
             seal_imbalanced_unsealed_local(chain.chain_id, private_key, tx_bytes)?
         })
+    } else if is_sealed_midnight_payload(tx_bytes) && balance_before_sign {
+        std::borrow::Cow::Owned(run_balance_sealed_transaction(
+            chain.chain_id,
+            private_key,
+            shielded_seed,
+            dust_seed,
+            tx_bytes,
+            sync_scope,
+            pay_fees,
+        )?)
     } else if tx_bytes.starts_with(SEALED_TAG) {
         std::borrow::Cow::Borrowed(tx_bytes)
     } else {

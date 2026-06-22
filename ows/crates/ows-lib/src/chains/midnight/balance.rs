@@ -327,7 +327,7 @@ fn tx_balance_imbalances(tx: &TxProven) -> Result<Vec<String>, PayError> {
     Ok(imbalances)
 }
 
-fn select_dust_spends_preimage(
+pub(super) fn select_dust_spends_preimage(
     mut st: DustLocalState<InMemoryDB>,
     dsk: &DustSecretKey,
     fee_dust: u128,

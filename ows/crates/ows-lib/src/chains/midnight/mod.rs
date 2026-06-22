@@ -25,6 +25,7 @@ pub type ShieldedBalances = std::collections::BTreeMap<String, u128>;
 
 mod async_runtime;
 mod balance;
+mod balance_sealed;
 mod cache_io;
 mod dapp_connector;
 mod dust_sync;
@@ -59,7 +60,8 @@ pub use sign_result::{
 pub use cache_io::{midnight_sync_log_enabled, SyncCacheScope};
 pub use dapp_connector::{
     build_make_intent_unsealed_tx, build_make_transfer_unsealed_tx, materialize_connector_request,
-    parse_connector_tx_json, ConnectorTxRequest, MakeIntentRequest, MakeTransferRequest,
+    parse_connector_tx_json, BalanceSealedTransactionRequest, ConnectorTxRequest,
+    MakeIntentRequest, MakeTransferRequest,
 };
 pub use dust_sync::{
     format_dust_specks, fund_balance_skip_dust_sync, get_dust_balance_for_display_scoped,
@@ -295,6 +297,58 @@ pub fn seal_imbalanced_unsealed(
     }
     sign::sign_prove_and_seal(chain_id, indexer_url, tx_bytes, &key32)
 }
+
+/// Run [`balance_sealed::balance_sealed_transaction`] on a maker swap offer.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_balanced_sealed_from_maker_offer(
+    chain_id: &str,
+    indexer_url: &str,
+    sender_private_key: &[u8],
+    shielded_seed: Option<&[u8]>,
+    dust_seed: Option<&[u8]>,
+    maker_input: &[u8],
+    sync_scope: &mut SyncCacheScope,
+    pay_fees: bool,
+) -> Result<Vec<u8>, PayError> {
+    let key32: [u8; 32] = sender_private_key.try_into().map_err(|_| {
+        PayError::new(
+            PayErrorCode::InvalidInput,
+            "Midnight signing key must be 32 bytes",
+        )
+    })?;
+    let shielded_seed32 = shielded_seed
+        .map(|s| {
+            <[u8; 32]>::try_from(s).map_err(|_| {
+                PayError::new(
+                    PayErrorCode::InvalidInput,
+                    "Midnight shielded seed must be 32 bytes",
+                )
+            })
+        })
+        .transpose()?;
+    let dust_seed32 = dust_seed
+        .map(|s| {
+            <[u8; 32]>::try_from(s).map_err(|_| {
+                PayError::new(
+                    PayErrorCode::InvalidInput,
+                    "Midnight dust seed must be 32 bytes",
+                )
+            })
+        })
+        .transpose()?;
+    balance_sealed::balance_sealed_transaction(
+        chain_id,
+        indexer_url,
+        &key32,
+        shielded_seed32,
+        dust_seed32,
+        maker_input,
+        sync_scope,
+        pay_fees,
+    )
+}
+
+pub use balance_sealed::{is_sealed_midnight_payload, parse_maker_swap_input};
 
 #[cfg(test)]
 mod tests {

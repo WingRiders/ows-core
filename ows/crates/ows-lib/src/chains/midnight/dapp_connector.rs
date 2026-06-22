@@ -44,6 +44,14 @@ pub const MAKE_TRANSFER_SEGMENT: u16 = 1;
 pub enum ConnectorTxRequest {
     MakeTransfer(MakeTransferRequest),
     MakeIntent(MakeIntentRequest),
+    BalanceSealedTransaction(BalanceSealedTransactionRequest),
+}
+
+/// `balanceSealedTransaction(tx, options?)`
+#[derive(Debug, Clone)]
+pub struct BalanceSealedTransactionRequest {
+    pub maker_tx: String,
+    pub pay_fees: bool,
 }
 
 /// `makeTransfer(desiredOutputs, options?)`
@@ -136,6 +144,16 @@ struct PayFeesOptions {
     pay_fees: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BalanceSealedTransactionJson {
+    #[serde(default, rename = "method")]
+    _method: Option<String>,
+    tx: String,
+    #[serde(default)]
+    options: Option<PayFeesOptions>,
+}
+
 fn default_pay_fees() -> bool {
     true
 }
@@ -184,16 +202,52 @@ pub fn parse_connector_tx_json(json: &str) -> Result<ConnectorTxRequest, PayErro
     if method.as_deref() == Some("makeintent") {
         return parse_make_intent_value(v);
     }
+    if method.as_deref() == Some("balancesealedtransaction") {
+        return parse_balance_sealed_value(v);
+    }
 
     let has_inputs = obj.contains_key("desiredInputs");
     let has_outputs = obj.contains_key("desiredOutputs");
     match (has_inputs, has_outputs) {
         (true, _) => parse_make_intent_value(v),
         (false, true) => parse_make_transfer_value(v),
+        _ if obj.contains_key("transaction") && obj.contains_key("version") => {
+            parse_mip6_offer_as_balance_sealed(v)
+        }
+        _ if obj.contains_key("tx") => parse_balance_sealed_value(v),
         _ => Err(err(
-            "unrecognized DApp Connector JSON (expected makeTransfer or makeIntent fields)",
+            "unrecognized DApp Connector JSON (expected makeTransfer, makeIntent, or balanceSealedTransaction fields)",
         )),
     }
+}
+
+fn parse_balance_sealed_value(v: serde_json::Value) -> Result<ConnectorTxRequest, PayError> {
+    let req: BalanceSealedTransactionJson = serde_json::from_value(v)
+        .map_err(|e| err(format!("invalid balanceSealedTransaction JSON: {e}")))?;
+    if req.tx.trim().is_empty() {
+        return Err(err("balanceSealedTransaction requires a tx field"));
+    }
+    Ok(ConnectorTxRequest::BalanceSealedTransaction(
+        BalanceSealedTransactionRequest {
+            maker_tx: req.tx,
+            pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
+        },
+    ))
+}
+
+fn parse_mip6_offer_as_balance_sealed(
+    v: serde_json::Value,
+) -> Result<ConnectorTxRequest, PayError> {
+    let tx = v
+        .get("transaction")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| err("MIP-0006 offer payload requires a transaction field"))?;
+    Ok(ConnectorTxRequest::BalanceSealedTransaction(
+        BalanceSealedTransactionRequest {
+            maker_tx: tx.to_string(),
+            pay_fees: true,
+        },
+    ))
 }
 
 fn parse_make_transfer_value(v: serde_json::Value) -> Result<ConnectorTxRequest, PayError> {
@@ -688,11 +742,13 @@ fn build_zswap_offer(
         .ok_or_else(|| err("shielded Zswap offer is empty"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn materialize_connector_request(
     chain_id: &str,
     indexer_url: &str,
     sender_private_key: &[u8; 32],
     shielded_seed: Option<[u8; 32]>,
+    dust_seed: Option<[u8; 32]>,
     req: ConnectorTxRequest,
     scope: &SyncCacheScope,
     for_self_submit: bool,
@@ -725,6 +781,21 @@ pub fn materialize_connector_request(
                 scope,
             )?;
             Ok((bytes, pay_fees, false))
+        }
+        ConnectorTxRequest::BalanceSealedTransaction(b) => {
+            let maker_bytes = super::balance_sealed::parse_maker_swap_input(chain_id, &b.maker_tx)?;
+            let mut scope_mut = scope.clone();
+            let balanced = super::prepare_balanced_sealed_from_maker_offer(
+                chain_id,
+                indexer_url,
+                sender_private_key,
+                shielded_seed.as_ref().map(|s| s.as_slice()),
+                dust_seed.as_ref().map(|s| s.as_slice()),
+                &maker_bytes,
+                &mut scope_mut,
+                b.pay_fees,
+            )?;
+            Ok((balanced, b.pay_fees, false))
         }
     }
 }
@@ -872,6 +943,31 @@ mod tests {
         MidnightSigner
             .derive_shielded_address_from_seed_for_chain_id("midnight:preview", &seed)
             .expect("preview shielded address")
+    }
+
+    #[test]
+    fn parse_balance_sealed_transaction_json() {
+        let json =
+            r#"{"method":"balanceSealedTransaction","tx":"0102","options":{"payFees":false}}"#;
+        match parse_connector_tx_json(json).unwrap() {
+            ConnectorTxRequest::BalanceSealedTransaction(b) => {
+                assert_eq!(b.maker_tx, "0102");
+                assert!(!b.pay_fees);
+            }
+            other => panic!("expected balanceSealedTransaction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mip6_payload_as_balance_sealed() {
+        let json = r#"{"version":1,"transaction":"zswapoffer1qq","gives":[],"wants":[]}"#;
+        match parse_connector_tx_json(json).unwrap() {
+            ConnectorTxRequest::BalanceSealedTransaction(b) => {
+                assert_eq!(b.maker_tx, "zswapoffer1qq");
+                assert!(b.pay_fees);
+            }
+            other => panic!("expected balanceSealedTransaction, got {other:?}"),
+        }
     }
 
     #[test]
