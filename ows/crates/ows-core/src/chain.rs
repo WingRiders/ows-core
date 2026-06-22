@@ -18,10 +18,11 @@ pub enum ChainType {
     Xrpl,
     Nano,
     Near,
+    Midnight,
 }
 
 /// All supported chain families, used for universal wallet derivation.
-pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
+pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
     ChainType::Evm,
     ChainType::Solana,
     ChainType::Bitcoin,
@@ -34,6 +35,7 @@ pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
     ChainType::Xrpl,
     ChainType::Nano,
     ChainType::Near,
+    ChainType::Midnight,
 ];
 
 /// A specific chain (e.g. "ethereum", "arbitrum") with its family type and CAIP-2 ID.
@@ -194,6 +196,21 @@ pub const KNOWN_CHAINS: &[Chain] = &[
         chain_id: "near:testnet",
     },
     Chain {
+        name: "midnight",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:mainnet",
+    },
+    Chain {
+        name: "midnight-preview",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:preview",
+    },
+    Chain {
+        name: "midnight-preprod",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:preprod",
+    },
+    Chain {
         name: "tempo",
         chain_type: ChainType::Evm,
         chain_id: "eip155:4217",
@@ -267,7 +284,7 @@ pub fn parse_chain(s: &str) -> Result<Chain, String> {
            EVM:     ethereum, base, arbitrum, optimism, polygon, bsc, avalanche, plasma, etherlink\n  \
            Solana:  solana\n  \
            Bitcoin: bitcoin\n  \
-           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near\n\n\
+           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near, midnight\n\n\
          Or use a CAIP-2 ID (eip155:8453) or bare EVM chain ID (8453)"
     ))
 }
@@ -275,6 +292,17 @@ pub fn parse_chain(s: &str) -> Result<Chain, String> {
 /// Returns the default `Chain` for a given `ChainType` (first match in registry).
 pub fn default_chain_for_type(ct: ChainType) -> Chain {
     *KNOWN_CHAINS.iter().find(|c| c.chain_type == ct).unwrap()
+}
+
+/// Accounts per universal wallet: one per [`ALL_CHAIN_TYPES`].
+pub const UNIVERSAL_WALLET_ACCOUNT_COUNT: usize = ALL_CHAIN_TYPES.len();
+
+/// Ordered [`Chain`] rows for universal-wallet derivation (one default network per family).
+pub fn universal_wallet_chains() -> Vec<Chain> {
+    ALL_CHAIN_TYPES
+        .iter()
+        .map(|ct| default_chain_for_type(*ct))
+        .collect()
 }
 
 impl ChainType {
@@ -293,6 +321,7 @@ impl ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Midnight => "midnight",
         }
     }
 
@@ -311,6 +340,7 @@ impl ChainType {
             ChainType::Xrpl => 144,
             ChainType::Nano => 165,
             ChainType::Near => 397,
+            ChainType::Midnight => 2400,
         }
     }
 
@@ -329,6 +359,7 @@ impl ChainType {
             "xrpl" => Some(ChainType::Xrpl),
             "nano" => Some(ChainType::Nano),
             "near" => Some(ChainType::Near),
+            "midnight" => Some(ChainType::Midnight),
             _ => None,
         }
     }
@@ -349,6 +380,7 @@ impl fmt::Display for ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Midnight => "midnight",
         };
         write!(f, "{}", s)
     }
@@ -371,6 +403,7 @@ impl FromStr for ChainType {
             "xrpl" => Ok(ChainType::Xrpl),
             "nano" => Ok(ChainType::Nano),
             "near" => Ok(ChainType::Near),
+            "midnight" => Ok(ChainType::Midnight),
             _ => Err(format!("unknown chain type: {}", s)),
         }
     }
@@ -404,6 +437,7 @@ mod tests {
             (ChainType::Xrpl, "\"xrpl\""),
             (ChainType::Nano, "\"nano\""),
             (ChainType::Near, "\"near\""),
+            (ChainType::Midnight, "\"midnight\""),
         ] {
             let json = serde_json::to_string(&chain).unwrap();
             assert_eq!(json, expected);
@@ -426,6 +460,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.namespace(), "xrpl");
         assert_eq!(ChainType::Nano.namespace(), "nano");
         assert_eq!(ChainType::Near.namespace(), "near");
+        assert_eq!(ChainType::Midnight.namespace(), "midnight");
     }
 
     #[test]
@@ -442,6 +477,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.default_coin_type(), 144);
         assert_eq!(ChainType::Nano.default_coin_type(), 165);
         assert_eq!(ChainType::Near.default_coin_type(), 397);
+        assert_eq!(ChainType::Midnight.default_coin_type(), 2400);
     }
 
     #[test]
@@ -461,6 +497,10 @@ mod tests {
         assert_eq!(ChainType::from_namespace("xrpl"), Some(ChainType::Xrpl));
         assert_eq!(ChainType::from_namespace("nano"), Some(ChainType::Nano));
         assert_eq!(ChainType::from_namespace("near"), Some(ChainType::Near));
+        assert_eq!(
+            ChainType::from_namespace("midnight"),
+            Some(ChainType::Midnight)
+        );
         assert_eq!(ChainType::from_namespace("unknown"), None);
     }
 
@@ -579,6 +619,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chain_midnight() {
+        let chain = parse_chain("midnight").unwrap();
+        assert_eq!(chain.chain_type, ChainType::Midnight);
+        assert_eq!(chain.chain_id, "midnight:mainnet");
+
+        let preview = parse_chain("midnight:preview").unwrap();
+        assert_eq!(preview.chain_type, ChainType::Midnight);
+        assert_eq!(preview.chain_id, "midnight:preview");
+
+        let preview_alias = parse_chain("midnight-preview").unwrap();
+        assert_eq!(preview_alias.chain_type, ChainType::Midnight);
+        assert_eq!(preview_alias.chain_id, "midnight:preview");
+
+        let preprod = parse_chain("midnight:preprod").unwrap();
+        assert_eq!(preprod.chain_type, ChainType::Midnight);
+        assert_eq!(preprod.chain_id, "midnight:preprod");
+
+        let preprod_alias = parse_chain("midnight-preprod").unwrap();
+        assert_eq!(preprod_alias.chain_type, ChainType::Midnight);
+        assert_eq!(preprod_alias.chain_id, "midnight:preprod");
+    }
+
+    #[test]
     fn test_parse_chain_bare_numeric_known() {
         // "8453" → Base (eip155:8453)
         let chain = parse_chain("8453").unwrap();
@@ -641,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_all_chain_types() {
-        assert_eq!(ALL_CHAIN_TYPES.len(), 12);
+        assert_eq!(ALL_CHAIN_TYPES.len(), 13);
     }
 
     #[test]
@@ -666,5 +729,19 @@ mod tests {
         let chain = default_chain_for_type(ChainType::Evm);
         assert_eq!(chain.name, "ethereum");
         assert_eq!(chain.chain_id, "eip155:1");
+    }
+
+    #[test]
+    fn test_universal_wallet_chains_order_and_count() {
+        let chains = universal_wallet_chains();
+        assert_eq!(chains.len(), UNIVERSAL_WALLET_ACCOUNT_COUNT);
+        assert_eq!(chains.len(), ALL_CHAIN_TYPES.len());
+        let midnight_idx = ALL_CHAIN_TYPES
+            .iter()
+            .position(|c| *c == ChainType::Midnight)
+            .unwrap();
+        assert_eq!(chains[midnight_idx].chain_id, "midnight:mainnet");
+        assert_eq!(chains[midnight_idx].chain_type, ChainType::Midnight);
+        assert_eq!(chains[midnight_idx - 1].chain_type, ChainType::Near);
     }
 }

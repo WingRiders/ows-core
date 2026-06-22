@@ -40,6 +40,7 @@ OWS groups chains into families that share a cryptographic curve and address der
 | Spark | secp256k1 | 8797555 | `m/84'/0'/0'/0/{index}` | `spark:` + compressed pubkey hex | `spark` |
 | Filecoin | secp256k1 | 461 | `m/44'/461'/0'/0/{index}` | `f1` + base32(blake2b-160) | `fil` |
 | NEAR | ed25519 | 397 | `m/44'/397'/{index}'` | 64-char lowercase hex of pubkey (implicit account) | `near` |
+| Midnight (unshielded/Night) | secp256k1 (Schnorr) | [2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (BIP-44) | `m/44'/2400'/0'/0/{index}` (unshielded); shielded `.../3/{index}`; dust `.../2/{index}` | Bech32m `mn_addr1...` / `mn_addr_preview1...` / `mn_addr_preprod1...` (SHA-256 of x-only pubkey) | `midnight` |
 
 ## Known Networks
 
@@ -76,6 +77,17 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Filecoin | `fil:mainnet` |
 | NEAR | `near:mainnet` |
 | NEAR (testnet) | `near:testnet` |
+| Midnight | `midnight:mainnet` |
+| Midnight Preview | `midnight:preview` |
+| Midnight Preprod | `midnight:preprod` |
+
+### Midnight indexer sync (OWS)
+
+`ows fund balance --chain midnight:*` and unsealed transaction signing replay indexer state (unshielded UTXOs, shielded balances, DUST ledger on Preview/Preprod). OWS caches snapshots under `{vault}/sync/midnight/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
+
+Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`, etc.) and node RPC (`rpc["midnight:preview:node"]`, etc.). Useful environment variables are documented on [`cache_io`](../../ows/crates/ows-lib/src/chains/midnight/cache_io.rs) in `ows-lib` (`OWS_MIDNIGHT_SYNC_CACHE`, `OWS_MIDNIGHT_SNAPSHOT_MAX_AGE_SECS`, `OWS_MIDNIGHT_SYNC_LOG`, …).
+
+Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
@@ -109,6 +121,9 @@ spark     → spark:mainnet
 filecoin  → fil:mainnet
 near          → near:mainnet
 near-testnet  → near:testnet
+midnight  → midnight:mainnet
+midnight-preview → midnight:preview
+midnight-preprod → midnight:preprod
 ```
 
 Aliases MUST be resolved to full CAIP-2 identifiers before any processing. They MUST NOT appear in wallet files, policy files, or audit logs.
