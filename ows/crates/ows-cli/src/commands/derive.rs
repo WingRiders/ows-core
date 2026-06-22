@@ -17,7 +17,7 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
         let curve = signer.curve();
 
         let key = HdDeriver::derive_from_mnemonic_cached(&mnemonic, "", &path, curve)?;
-        let address = signer.derive_address(key.expose())?;
+        let address = signer.derive_address_for_chain_id(chain.chain_id, key.expose())?;
 
         println!("{address}");
     } else {
@@ -29,7 +29,7 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
             let curve = signer.curve();
 
             let key = HdDeriver::derive_from_mnemonic_cached(&mnemonic, "", &path, curve)?;
-            let address = signer.derive_address(key.expose())?;
+            let address = signer.derive_address_for_chain_id(chain.chain_id, key.expose())?;
 
             println!("{} → {}", chain.chain_id, address);
         }
