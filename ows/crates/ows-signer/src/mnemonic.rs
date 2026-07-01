@@ -1,4 +1,5 @@
 use crate::zeroizing::SecretBytes;
+use coins_bip39::wordlist::Wordlist;
 use coins_bip39::{English, Mnemonic as Bip39Mnemonic};
 
 /// Mnemonic strength / word count.
@@ -41,6 +42,38 @@ impl Mnemonic {
     pub fn phrase(&self) -> SecretBytes {
         let phrase_str = self.inner.to_phrase();
         SecretBytes::new(phrase_str.into_bytes())
+    }
+
+    /// Raw BIP-39 entropy bytes (English wordlist; checksum bits excluded).
+    /// NOTE: assumes that the phrase is valid and in the English wordlist.
+    pub fn entropy(&self) -> SecretBytes {
+        let phrase = self.inner.to_phrase();
+        let words: Vec<&str> = phrase.split(' ').collect();
+
+        let total_bits = words.len() * 11;
+        let ent_bits = total_bits - (total_bits / 33);
+        let mut bits = Vec::with_capacity(total_bits);
+        for w in &words {
+            let idx = English::get_index(w).unwrap();
+            let idx = idx as u16;
+            for shift in (0..11).rev() {
+                bits.push((idx >> shift) & 1 == 1);
+            }
+        }
+        let ent_bytes = ent_bits / 8;
+        let mut out = vec![0u8; ent_bytes];
+        for (i, chunk) in bits[..ent_bits].chunks(8).enumerate() {
+            let mut byte = 0u8;
+            for (j, bit) in chunk.iter().enumerate() {
+                if *bit {
+                    byte |= 1 << (7 - j);
+                }
+            }
+            out[i] = byte;
+        }
+        let mut phrase = phrase;
+        zeroize::Zeroize::zeroize(unsafe { phrase.as_mut_vec() });
+        SecretBytes::new(out)
     }
 
     /// Derive a BIP-39 seed from this mnemonic with an optional passphrase.
@@ -123,6 +156,14 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_entropy_abandon_all_zero() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+        let ent = mnemonic.entropy();
+        assert_eq!(ent.expose(), &[0u8; 16]);
     }
 
     #[test]
