@@ -2,7 +2,7 @@
 
 > Status: work in progress. This document specifies the Cardano integration parts
 > that are **implemented** in this fork, and flags the parts that are still
-> **planned**. It is scoped to four deliverables that are complete:
+> **planned**. It is scoped to five deliverables that are complete:
 >
 > 1. **Analysis, architecture, and setup** — codebase familiarization, build/test
 >    pipeline, and a map of where Cardano fits into the existing abstractions (see
@@ -14,6 +14,11 @@
 >    signing/witness encoding, all via `cardano-serialization-lib` and its
 >    `cardano-message-signing` companion (see
 >    [Transaction and Message Signing](#3-transaction-and-message-signing-chain-plugin-interface)).
+> 5. **Policy engine support** — parsing an unsigned Cardano transaction (CBOR) into
+>    the chain-agnostic `TransactionContext` that the OWS Policy Engine evaluates,
+>    resolving input UTxO values via the configured Koios RPC provider so that ADA
+>    and native-asset flows can be computed per address (see
+>    [Policy Engine Support](#4-policy-engine-support)).
 >
 > Transaction *building* (input selection, fee/change calculation) and balance/UTxO
 > fetching remain out of scope for these deliverables and are tracked separately;
@@ -40,6 +45,11 @@ transaction signing that produces and CBOR-encodes the `Vkeywitness`es required 
 make a transaction submittable. Address encoding, transaction (de)serialization,
 and witness construction use `cardano-serialization-lib` (CSL), while the COSE
 message structures use Emurgo's `cardano-message-signing` companion library.
+Finally, it wires Cardano into the OWS Policy Engine: `make_transaction_context`
+parses an unsigned transaction (CBOR) and, because UTxO inputs carry no value,
+resolves them through the configured Koios RPC provider to compute per-address ADA
+and native-asset flows (`TransactionEffect`s) that built-in and executable policies
+can evaluate before a key is used.
 
 ## Motivation
 
@@ -463,6 +473,101 @@ passing `None` keeps the prior behavior. Cardano does not use the default check 
 it performs richer, address-kind-aware selection and verification inline (see
 [§3.3](#33-cip-8-message-signing-sign_message)).
 
+### 4. Policy engine support
+
+OWS gates every signing request through a **Policy Engine**: before a key is
+decrypted and used, the request is turned into a chain-agnostic
+`PolicyContext` (`ows-core/src/policy.rs`) that built-in rules and custom
+**executable** policies evaluate and can veto. The core of that context is a
+`TransactionContext`, whose `effects` field is a list of per-address asset
+deltas:
+
+```rust
+pub struct TransactionEffect {
+    pub address: String,
+    pub diff: Vec<(String, i64)>, // (asset_id, signed change)
+}
+
+pub struct TransactionContext {
+    pub effects: Vec<TransactionEffect>,
+    pub raw_hex: String,          // the raw unsigned transaction
+    pub data: Option<String>,     // calldata (EVM only)
+}
+```
+
+Each `ChainSigner` produces this context from raw transaction bytes via
+`make_transaction_context(tx_bytes, rpc_url)`. The trait's default implementation
+returns empty `effects` (just the `raw_hex`), which suffices for chains where the
+transaction already carries enough information — or where flow analysis is not yet
+implemented. This deliverable overrides it for Cardano so that a policy can reason
+about the **actual ADA and native-asset movement** a transaction causes, per
+address.
+
+#### 4.1 Why Cardano needs the RPC provider
+
+Cardano is UTxO-based. A transaction body lists its inputs only as
+`(transaction_hash, index)` references — it does **not** carry the value or assets
+locked at those UTxOs. To compute how much each address gains or loses, the signer
+must resolve every referenced input to its underlying UTxO. This is the
+architectural consequence flagged in the scope: unlike the account-based effects on
+other chains, building a Cardano `TransactionContext` **depends on network access**
+to the configured RPC provider (Koios).
+
+Accordingly, `make_transaction_context` takes an `Option<&str>` RPC URL, and the
+`ows-lib` call sites that build the policy context — `sign_and_send`
+(`ops.rs`) and `sign_with_api_key` (`key_ops.rs`) — now resolve the Koios endpoint
+for Cardano and pass it through. Resolution reuses the generic precedence
+(explicit override → config exact `chain_id` → config namespace → built-in
+default; see [§1.4](#14-rpc-configuration-koios-keyless)); `resolve_rpc_url` was
+made `pub(crate)`-visible for this. For every non-Cardano chain the URL stays
+`None`, so no network call is introduced anywhere else.
+
+#### 4.2 Parsing and input resolution (Koios `utxo_info`)
+
+`CardanoSigner::make_transaction_context` (`ows-signer/src/chains/cardano.rs`):
+
+1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure),
+   and record the raw hex for `TransactionContext.raw_hex`.
+2. Collect input references as `(tx_hash_hex, index)` pairs from `tx.body().inputs()`.
+3. If there are inputs, an RPC URL is **required** (else `InvalidMessage`); resolve
+   the inputs by calling Koios `POST {rpc}/utxo_info` with
+   `{"_utxo_refs": ["<hash>#<index>", …], "_extended": true}`. `_extended: true` is
+   required so the response includes each UTxO's `asset_list`; without it the asset
+   list comes back null.
+   - Requests are **chunked** at `KOIOS_UTXO_INFO_CHUNK = 80` refs per call and use a
+     blocking `reqwest` client with a `45s` timeout.
+   - Non-2xx responses become `SignerError::RpcError`; a chunk that returns fewer
+     matching UTxO rows than requested is treated as `InvalidTransaction` (a missing
+     input would silently understate the flow, so it is rejected rather than
+     ignored).
+
+Each resolved row (`KoiosUtxoInfoRow`) carries the input's `address`, its lovelace
+`value`, and an optional `asset_list` of `(policy_id, asset_name, quantity)`.
+
+#### 4.3 Computing per-address effects
+
+The signer builds two `address → (asset_id → amount)` maps and diffs them:
+
+- **Inputs** map is populated from the resolved Koios UTxOs (value → `lovelace`,
+  each native asset → `policy_id ‖ asset_name`).
+- **Outputs** map is read directly from `tx.body().outputs()`: the `coin` becomes
+  `lovelace`, and each `multiasset` entry becomes `policy_id_hex ‖ asset_name_hex`.
+- ADA is represented by the reserved asset id **`"lovelace"`**; every native asset
+  is keyed by the concatenation of its (hex) policy id and (hex) asset name, so the
+  same token nets out across inputs and outputs.
+
+For every address touched by either side, and every asset id it involves, the
+effect is `output_balance − input_balance` as a signed `i64`. Zero-diff assets and
+zero-diff addresses are dropped; the remaining `diff` entries are sorted by asset
+id and the `effects` list is sorted by address, so the context is deterministic
+(important for reproducible policy decisions and stable test vectors). A pure
+self-transfer, for example, yields a single effect on the sender with only the
+negative fee.
+
+The result is returned as `TransactionContext { effects, raw_hex, data: None }` and
+handed to the policy engine, which passes it (as part of `PolicyContext`) to
+built-in rules and to executable policies over stdin.
+
 ## Rationale
 
 - **`cip34` namespace.** CIP-34 is the Cardano-native CAIP-2 registration and
@@ -512,6 +617,35 @@ it performs richer, address-kind-aware selection and verification inline (see
   the fixed 101-byte `Vkeywitness` size. This keeps `SignOutput.signature` a flat
   byte string (consistent with other chains) while still supporting the
   multi-witness (payment + stake) case.
+- **RPC-resolved transaction effects for policy.** Cardano inputs carry no value,
+  so a meaningful `TransactionContext` cannot be built from the transaction bytes
+  alone. Rather than inventing a Cardano-only policy path, the existing
+  `make_transaction_context` hook is overridden to resolve inputs via Koios and emit
+  the same chain-agnostic `TransactionEffect` shape every other chain uses — so
+  executable policies see uniform per-address asset deltas regardless of chain. The
+  RPC dependency is threaded only for Cardano; all other chains keep passing `None`.
+- **Reject missing input UTxOs.** If Koios returns fewer rows than requested,
+  `make_transaction_context` errors instead of proceeding. An unresolved input would
+  silently understate the ADA/asset outflow and could let a spending policy pass a
+  transaction it should have denied, so a partial resolution is treated as a hard
+  failure.
+
+  > **⚠️ Warning — chained/unconfirmed transactions.** This same strictness breaks
+  > transaction *chaining*. If a transaction spends an input that was created by an
+  > earlier transaction which has **not yet been confirmed in a block**, Koios does
+  > not know that UTxO yet and omits it from the `utxo_info` response. Because the
+  > returned row count is then lower than the requested count,
+  > `make_transaction_context` fails (surfaced as `InvalidTransaction` —
+  > "expected N UTxO rows, got M") and the signing request is rejected, even though
+  > the transaction itself is well-formed. In other words, a transaction cannot be
+  > signed through the policy engine until every input it references has been
+  > confirmed and indexed by Koios. Building and submitting a chain of dependent
+  > transactions back-to-back (before the parents confirm) is therefore not currently
+  > supported.
+- **Deterministic effect ordering.** Effects are sorted by address and each `diff`
+  by asset id, and ADA is normalized to the single `"lovelace"` key. This makes the
+  context stable across runs, so policy decisions are reproducible and reference
+  vectors are exact.
 
 ### Acceptance Criteria
 
@@ -545,17 +679,24 @@ These deliverables are considered complete when:
 11. `default_derivation_paths` returns both CIP-1852 paths for Cardano, and
     `encode_keys` returns the 192-byte payment ‖ stake buffer; all other chains
     remain on their single-path defaults.
+12. `make_transaction_context` parses an unsigned Cardano transaction, resolves its
+    inputs via Koios `utxo_info`, and produces per-address `TransactionEffect`s with
+    correct signed ADA and native-asset diffs (verified against mocked Koios
+    responses for self-transfer, external+change, asset-carrying, and
+    multi-input/multi-output cases); it errors when the RPC URL is missing for a
+    transaction with inputs, or when Koios returns fewer UTxOs than requested.
 
 ### Implementation Plan
 
-All four deliverables are landed and covered by unit/integration tests (see
+All five deliverables are landed and covered by unit/integration tests (see
 [Testing](#testing)): the chain-registry/addressing layer, Ed25519-BIP32 key
-derivation, and the chain plugin interface (Shelley base/enterprise/reward address
-encoding, raw signing, CIP-8 message signing, and transaction
-signing/witness encoding). Remaining Cardano work (separate deliverables) proceeds
-as: transaction *building* and context resolution via Koios (input selection,
-fee/change), balance/UTxO fetching, persisting both payment and stake paths per
-`WalletAccount`, and optional alternative RPC providers (e.g. Blockfrost).
+derivation, the chain plugin interface (Shelley base/enterprise/reward address
+encoding, raw signing, CIP-8 message signing, and transaction signing/witness
+encoding), and policy-engine support (`make_transaction_context` with Koios input
+resolution). Remaining Cardano work (separate deliverables) proceeds as:
+transaction *building* (input selection, fee/change), general balance/UTxO
+fetching, persisting both payment and stake paths per `WalletAccount`, and optional
+alternative RPC providers (e.g. Blockfrost).
 
 ## Backwards Compatibility Assessment
 
@@ -574,6 +715,17 @@ fee/change), balance/UTxO fetching, persisting both payment and stake paths per
   every chain's non-Cardano message signing is unchanged when no address is given.
   `default_derivation_paths` and `encode_keys` are purely additive (defaults mirror
   the old inline single-path derivation).
+- **Policy context is additive.** `make_transaction_context` already existed on
+  `ChainSigner` with a default-empty implementation; Cardano overrides it and the new
+  `SignerError::RpcError` variant is additive, so no other chain's behavior changes.
+  The lib call sites resolve an RPC URL only for Cardano (all other chains keep
+  passing `None`), so no new network call is introduced for existing chains.
+- **New network dependency for Cardano signing requests.** Building a Cardano
+  policy context now performs a Koios call when the transaction has inputs; a Cardano
+  signing request that previously would have proceeded with empty effects now
+  requires provider reachability (and errors if none is configured/available). This
+  is intended — the policy engine needs the flow to make a decision — but it is a
+  behavioral change for Cardano relative to the prior default-empty context.
 - **Known abstraction gap.** `WalletAccount` still stores a single
   `derivation_path`, so the stored Cardano account currently records only the
   payment leaf even though the signer now derives both payment and stake keys at
@@ -613,6 +765,16 @@ fee/change), balance/UTxO fetching, persisting both payment and stake paths per
   key. Transaction *content* is not otherwise inspected or policy-checked here —
   the signer trusts the caller-provided unsigned CBOR — so transaction building and
   vetting remain the responsibility of upstream layers.
+- **Trust in the RPC-derived context.** Cardano input values come from Koios, so the
+  `TransactionContext` a policy evaluates is only as trustworthy as the RPC
+  provider: a malicious or compromised endpoint could misreport input values and
+  skew the computed effects. The keyless Koios default trades authentication for
+  operational simplicity; deployments with stronger requirements should point RPC
+  config at a trusted provider. To limit silent under-reporting, a transaction with
+  inputs and no RPC URL is rejected, and any input Koios fails to return aborts
+  context construction rather than degrading to a partial view. Unparseable
+  quantities are coerced to `0`, which can understate a flow — a known limitation of
+  the current implementation.
 
 ## Implementation
 
@@ -630,12 +792,17 @@ Components modified or added:
 - `ows-signer/src/chains/cardano.rs` — `CardanoSigner`, CIP-1852 path helpers,
   network selection, and the full `ChainSigner` impl: base/enterprise/reward
   address encoding, `sign`, CIP-8 `sign_message`, `sign_transaction`,
-  `encode_signed_transaction`, and the `default_derivation_paths` / `encode_keys`
-  overrides.
+  `encode_signed_transaction`, the `default_derivation_paths` / `encode_keys`
+  overrides, and the `make_transaction_context` override plus its Koios `utxo_info`
+  client (`fetch_utxos`, `KoiosUtxoInfoRow`/`KoiosAssetListItem`).
 - `ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
   default methods `verify_sign_message_address`, `default_derivation_paths`, and
-  `encode_keys`; new
-  `SignerError::AddressMismatch`.
+  `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
+  (`make_transaction_context` already existed as a default-empty hook; Cardano now
+  overrides it.)
+- `ows-lib/src/ops.rs` & `ows-lib/src/key_ops.rs` — `sign_and_send` and
+  `sign_with_api_key` resolve the Koios RPC URL for Cardano and pass it into
+  `make_transaction_context`; `resolve_rpc_url` is exposed for reuse.
 - `ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
   signature and calls `verify_sign_message_address`.
 - `ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
@@ -659,6 +826,10 @@ Dependencies added (`ows-signer/Cargo.toml`):
 - `cardano-serialization-lib = "14.1.1"` — Cardano network parameters
   (`NetworkInfo`), Shelley address encoding, and transaction/witness encoding.
 - `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers.
+- `reqwest = "0.12"` (blocking, `json`, `rustls-tls`, no default features) — Koios
+  `utxo_info` HTTP client used to resolve transaction inputs for the policy context.
+- `mockito = "1"` (dev-dependency) — mocks the Koios `utxo_info` endpoint in the
+  `make_transaction_context` tests.
 
 ## Testing
 
@@ -696,6 +867,14 @@ Implemented and passing for these deliverables:
 - **Integration** (`lib.rs`): `signer_for_chain` derives a mainnet `addr1…` base
   address via `default_derivation_paths`, `encode_keys`, and `derive_address`, now
   passing end-to-end.
+- **Policy context** (`cardano.rs`): `make_transaction_context` is exercised with a
+  mocked Koios `utxo_info` endpoint (`mockito`) across the flow shapes that matter
+  for policy evaluation — a self-transfer (only the negative fee shows up), a single
+  input with an external payment plus change, the same with a native asset split
+  between external and change outputs, and multi-input/multi-output transactions
+  that rebalance across the wallet's own addresses and to a third party. Each asserts
+  the exact sorted `effects` (per-address signed lovelace and asset diffs) and that
+  the mock endpoint was hit.
 
 ## References
 
