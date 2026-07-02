@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::cache_io::{self, SyncCacheScope, SyncPurpose};
 use super::dust_sync;
-use super::error::PayError;
+use super::error::{PayError, PayErrorCode};
 use super::ledger_params;
 use super::midnight_env::{midnight_sync_log_enabled, post_submit_indexer_wait_timeout};
 use super::session_cache;
@@ -33,6 +33,8 @@ pub(super) struct PostSubmitSyncPlan {
     pub needs_unshielded: bool,
     pub needs_zswap: bool,
     pub needs_dust: bool,
+    /// True when the submitted tx included DUST spends (not registration-only).
+    pub needs_dust_spends_in_tx: bool,
 }
 
 fn normalize_ledger_tx_hash(h: &str) -> String {
@@ -57,6 +59,7 @@ pub(super) fn plan_from_sealed_tx(sealed_bytes: &[u8]) -> PostSubmitSyncPlan {
             needs_unshielded: true,
             needs_zswap: true,
             needs_dust: true,
+            needs_dust_spends_in_tx: false,
         };
     };
     let Transaction::Standard(stx) = tx else {
@@ -88,18 +91,43 @@ pub(super) fn plan_from_sealed_tx(sealed_bytes: &[u8]) -> PostSubmitSyncPlan {
             }
         }
         if let Some(dust) = intent.dust_actions.as_ref() {
-            if dust_actions_active(dust.deref()) {
+            let dust = dust.deref();
+            if dust_actions_active(dust) {
                 plan.needs_dust = true;
+            }
+            if dust.spends.iter_deref().count() > 0 {
+                plan.needs_dust_spends_in_tx = true;
             }
         }
     }
     plan
 }
 
+fn post_submit_timeout_error(
+    wait_timeout: Duration,
+    target: &str,
+    blocker: Option<String>,
+) -> PayError {
+    let detail = blocker
+        .unwrap_or_else(|| "indexer did not reflect the submitted transaction in time".to_string());
+    PayError::new(
+        PayErrorCode::HttpTransport,
+        format!(
+            "post-submit sync timed out after {}s for tx {target}: {detail}. \
+             The transaction was already accepted by the node; run `ows fund balance` or retry \
+             after the indexer catches up. Increase OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS \
+             if the indexer is slow.",
+            wait_timeout.as_secs()
+        ),
+    )
+}
+
 /// Wait for the indexer to index `ledger_tx_hash`, refresh local snapshots, then return.
 ///
-/// Best-effort on timeout (same as [`unshielded_sync::refresh_unshielded_after_submit`]):
-/// session cache is always cleared; disk snapshots are updated when sync succeeds.
+/// Post-submit indexer sync must finish before `sign send-tx` returns; timeout is an error so
+/// the next sign does not build DUST spends from stale ledger state (tx may already be on-chain).
+/// Session cache is always cleared; disk snapshots are updated when sync succeeds.
+#[allow(clippy::too_many_arguments)]
 pub async fn refresh_after_submit(
     indexer_url: &str,
     scope: &SyncCacheScope,
@@ -118,52 +146,56 @@ pub async fn refresh_after_submit(
     }
 
     let plan = plan_from_sealed_tx(sealed_bytes);
+    let sync_dust_after_submit = dust_seed.is_some() || plan.needs_dust;
     let target = normalize_ledger_tx_hash(ledger_tx_hash);
     let log = midnight_sync_log_enabled();
 
     let mut scope = scope.clone();
+    let mut last_blocker: Option<String> = None;
 
     if log {
         eprintln!(
             "[ows-midnight] post-submit: waiting for indexer to reflect tx {target} \
-(unshielded={} zswap={} dust={}; up to {}s)…",
+(unshielded={} zswap={} dust={} dust_always={}; up to {}s)…",
             plan.needs_unshielded,
             plan.needs_zswap,
             plan.needs_dust,
-            wait_timeout.as_secs()
+            sync_dust_after_submit,
+            wait_timeout.as_secs(),
         );
     }
 
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         session_cache::invalidate_site(&scope, &fp);
+        last_blocker = None;
 
-        let tx_summary = match ledger_params::fetch_indexer_transaction_by_hash(
-            indexer_url,
-            &target,
-        )
-        .await
-        {
-            Ok(Some(summary)) => summary,
-            Ok(None) => {
-                if log {
-                    eprintln!(
-                        "[ows-midnight] post-submit: tx {target} not in indexer HTTP API yet; retrying…"
-                    );
+        let tx_summary =
+            match ledger_params::fetch_indexer_transaction_by_hash(indexer_url, &target).await {
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    last_blocker = Some(format!("tx {target} not in indexer HTTP API yet"));
+                    if log {
+                        eprintln!(
+                            "[ows-midnight] post-submit: {}; retrying…",
+                            last_blocker.as_deref().unwrap_or("")
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-            Err(e) => {
-                if log {
-                    eprintln!(
-                        "[ows-midnight] post-submit: indexer tx query failed ({e}); retrying…"
-                    );
+                Err(e) => {
+                    last_blocker = Some(format!("indexer tx query failed: {e}"));
+                    if log {
+                        eprintln!(
+                            "[ows-midnight] post-submit: {}; retrying…",
+                            last_blocker.as_deref().unwrap_or("")
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
+            };
 
         if let Ok(height) = ledger_params::fetch_indexer_block_height(indexer_url).await {
             scope.indexer_block_height = Some(height);
@@ -184,17 +216,21 @@ pub async fn refresh_after_submit(
                     Ok(true) => {}
                     Ok(false) => {
                         ready = false;
+                        last_blocker = Some(format!("tx {target} not in unshielded stream yet"));
                         if log {
                             eprintln!(
-                                "[ows-midnight] post-submit: tx {target} not in unshielded stream yet; retrying…"
+                                "[ows-midnight] post-submit: {}; retrying…",
+                                last_blocker.as_deref().unwrap_or("")
                             );
                         }
                     }
                     Err(e) => {
                         ready = false;
+                        last_blocker = Some(format!("unshielded refresh failed: {e}"));
                         if log {
                             eprintln!(
-                                "[ows-midnight] post-submit: unshielded refresh failed ({e}); retrying…"
+                                "[ows-midnight] post-submit: {}; retrying…",
+                                last_blocker.as_deref().unwrap_or("")
                             );
                         }
                     }
@@ -206,18 +242,24 @@ pub async fn refresh_after_submit(
             match shielded_seed {
                 None => {
                     ready = false;
+                    last_blocker = Some(
+                        "tx uses shielded zswap but no shielded seed; cannot refresh spend wallet"
+                            .to_string(),
+                    );
                     if log {
                         eprintln!(
-                            "[ows-midnight] post-submit: tx uses shielded zswap but no shielded seed; \
-cannot refresh spend wallet"
+                            "[ows-midnight] post-submit: {}; retrying…",
+                            last_blocker.as_deref().unwrap_or("")
                         );
                     }
                 }
                 Some(_) if tx_summary.zswap_ledger_event_count == 0 => {
                     ready = false;
+                    last_blocker = Some(format!("tx {target} indexed but zswapLedgerEvents empty"));
                     if log {
                         eprintln!(
-                            "[ows-midnight] post-submit: tx {target} indexed but zswapLedgerEvents empty; retrying…"
+                            "[ows-midnight] post-submit: {}; retrying…",
+                            last_blocker.as_deref().unwrap_or("")
                         );
                     }
                 }
@@ -238,9 +280,11 @@ cannot refresh spend wallet"
                                 shielded_session::ensure_shielded_merkle_ready(&mut wallet)
                             {
                                 ready = false;
+                                last_blocker = Some(format!("shielded merkle not ready: {e}"));
                                 if log {
                                     eprintln!(
-                                        "[ows-midnight] post-submit: shielded merkle not ready ({e}); retrying…"
+                                        "[ows-midnight] post-submit: {}; retrying…",
+                                        last_blocker.as_deref().unwrap_or("")
                                     );
                                 }
                             }
@@ -253,10 +297,14 @@ cannot refresh spend wallet"
                             if let Some(required) = tx_summary.max_zswap_ledger_event_id {
                                 if cursor.is_none_or(|c| c < required) {
                                     ready = false;
+                                    last_blocker = Some(format!(
+                                        "zswap snapshot cursor {cursor:?} has not reached \
+                                         submitted tx event id {required}"
+                                    ));
                                     if log {
                                         eprintln!(
-                                            "[ows-midnight] post-submit: zswap snapshot cursor \
-{cursor:?} has not reached submitted tx event id {required}; retrying…"
+                                            "[ows-midnight] post-submit: {}; retrying…",
+                                            last_blocker.as_deref().unwrap_or("")
                                         );
                                     }
                                 }
@@ -271,9 +319,11 @@ cannot refresh spend wallet"
                         }
                         Err(e) => {
                             ready = false;
+                            last_blocker = Some(format!("zswap wallet refresh failed: {e}"));
                             if log {
                                 eprintln!(
-                                    "[ows-midnight] post-submit: zswap wallet refresh failed ({e}); retrying…"
+                                    "[ows-midnight] post-submit: {}; retrying…",
+                                    last_blocker.as_deref().unwrap_or("")
                                 );
                             }
                         }
@@ -282,56 +332,76 @@ cannot refresh spend wallet"
             }
         }
 
-        if plan.needs_dust {
+        if sync_dust_after_submit {
             match dust_seed {
                 None => {
-                    ready = false;
-                    if log {
-                        eprintln!(
-                            "[ows-midnight] post-submit: tx uses dust but no dust seed; cannot refresh dust ledger"
+                    if plan.needs_dust {
+                        ready = false;
+                        last_blocker = Some(
+                            "no dust seed; cannot refresh dust ledger after submit".to_string(),
                         );
-                    }
-                }
-                Some(_) if tx_summary.dust_ledger_event_count == 0 => {
-                    ready = false;
-                    if log {
-                        eprintln!(
-                            "[ows-midnight] post-submit: tx {target} indexed but dustLedgerEvents empty; retrying…"
-                        );
+                        if log {
+                            eprintln!(
+                                "[ows-midnight] post-submit: {}; retrying…",
+                                last_blocker.as_deref().unwrap_or("")
+                            );
+                        }
                     }
                 }
                 Some(seed) => {
-                    let dsk = midnight_ledger::dust::DustSecretKey::derive_secret_key(seed);
-                    match dust_sync::sync_dust_local_state_scoped(indexer_url, &dsk, &scope).await {
-                        Ok(_) => {
-                            let cursor = dust_sync::snapshot_last_seen_dust_event_id_for_key(
-                                indexer_url,
-                                &scope,
-                                &dsk,
-                            )?;
-                            if let Some(required) = tx_summary.max_dust_ledger_event_id {
-                                if cursor.is_none_or(|c| c < required) {
-                                    ready = false;
-                                    if log {
-                                        eprintln!(
-                                            "[ows-midnight] post-submit: dust snapshot cursor \
-{cursor:?} has not reached submitted tx event id {required}; retrying…"
-                                        );
+                    if plan.needs_dust_spends_in_tx && tx_summary.dust_ledger_event_count == 0 {
+                        ready = false;
+                        last_blocker = Some(format!(
+                            "tx {target} indexed but dustLedgerEvents empty (tx included DUST spends)"
+                        ));
+                        if log {
+                            eprintln!(
+                                "[ows-midnight] post-submit: {}; retrying…",
+                                last_blocker.as_deref().unwrap_or("")
+                            );
+                        }
+                    } else {
+                        let dsk = midnight_ledger::dust::DustSecretKey::derive_secret_key(seed);
+                        match dust_sync::sync_dust_local_state_scoped(indexer_url, &dsk, &scope)
+                            .await
+                        {
+                            Ok(_) => {
+                                let cursor = dust_sync::snapshot_last_seen_dust_event_id_for_key(
+                                    indexer_url,
+                                    &scope,
+                                    &dsk,
+                                )?;
+                                if let Some(required) = tx_summary.max_dust_ledger_event_id {
+                                    if cursor.is_none_or(|c| c < required) {
+                                        ready = false;
+                                        last_blocker = Some(format!(
+                                            "dust snapshot cursor {cursor:?} has not reached \
+                                             submitted tx event id {required}"
+                                        ));
+                                        if log {
+                                            eprintln!(
+                                                "[ows-midnight] post-submit: {}; retrying…",
+                                                last_blocker.as_deref().unwrap_or("")
+                                            );
+                                        }
                                     }
                                 }
+                                if ready && log {
+                                    eprintln!(
+                                        "[ows-midnight] post-submit: dust ledger snapshot refreshed \
+(cursor={cursor:?})"
+                                    );
+                                }
                             }
-                            if ready && log {
-                                eprintln!(
-                                    "[ows-midnight] post-submit: dust ledger snapshot refreshed"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            ready = false;
-                            if log {
-                                eprintln!(
-                                    "[ows-midnight] post-submit: dust refresh failed ({e}); retrying…"
-                                );
+                            Err(e) => {
+                                ready = false;
+                                last_blocker = Some(format!("dust refresh failed: {e}"));
+                                if log {
+                                    eprintln!(
+                                        "[ows-midnight] post-submit: {}; retrying…",
+                                        last_blocker.as_deref().unwrap_or("")
+                                    );
+                                }
                             }
                         }
                     }
@@ -341,7 +411,9 @@ cannot refresh spend wallet"
 
         if ready {
             if log {
-                eprintln!("[ows-midnight] post-submit: indexer and local snapshots caught up for tx {target}");
+                eprintln!(
+                    "[ows-midnight] post-submit: indexer and local snapshots caught up for tx {target}"
+                );
             }
             return Ok(());
         }
@@ -352,11 +424,17 @@ cannot refresh spend wallet"
     if log {
         eprintln!(
             "[ows-midnight] post-submit: timed out after {}s waiting for indexer tx {target} \
-(set OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS to increase)",
-            wait_timeout.as_secs()
+({})",
+            wait_timeout.as_secs(),
+            last_blocker.as_deref().unwrap_or("not ready")
         );
     }
-    Ok(())
+
+    Err(post_submit_timeout_error(
+        wait_timeout,
+        &target,
+        last_blocker,
+    ))
 }
 
 #[cfg(test)]
@@ -369,5 +447,6 @@ mod tests {
         assert!(plan.needs_unshielded);
         assert!(plan.needs_zswap);
         assert!(plan.needs_dust);
+        assert!(!plan.needs_dust_spends_in_tx);
     }
 }

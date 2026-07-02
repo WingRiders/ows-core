@@ -857,7 +857,7 @@ pub fn sign_and_send(
             });
             let shielded_seed32 = shielded_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
             let dust_seed32 = dust_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
-            let _ = block_on(refresh_after_submit(
+            block_on(refresh_after_submit(
                 &indexer_url,
                 scope,
                 &tx_hash,
@@ -865,7 +865,8 @@ pub fn sign_and_send(
                 unshielded_address.as_deref(),
                 shielded_seed32.as_ref(),
                 dust_seed32.as_ref(),
-            ));
+            ))
+            .map_err(|e| invalid_input(format!("{e} (ledger tx hash {tx_hash})")))?;
         }
     }
 

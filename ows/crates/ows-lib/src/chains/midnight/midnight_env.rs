@@ -86,8 +86,9 @@ impl SyncPurpose {
 }
 
 /// Max time to wait after node submit for the indexer to reflect the tx and refresh local
-/// sync snapshots (unshielded, shielded zswap wallet, dust).
-/// Set `OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS=0` to skip (still invalidates session cache).
+/// sync snapshots (unshielded, shielded zswap wallet, dust). On timeout, `sign send-tx` fails
+/// (the tx may already be on-chain). Set `OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS=0` to skip
+/// the wait (still invalidates session cache).
 pub fn post_submit_indexer_wait_timeout() -> Duration {
     Duration::from_secs(env_parse_u64(
         &["OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS"],
