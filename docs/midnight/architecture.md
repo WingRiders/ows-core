@@ -127,6 +127,9 @@ prover stack.
 The indexer drives **three sync streams** (unshielded UTXOs, shielded Zswap state, DUST ledger events).
 The node RPC submits **sealed** transactions via `author_submitExtrinsic`.
 
+For ad-hoc or private deployments, add entries for any `midnight:<network>` chain id — see
+[custom-networks.md](./custom-networks.md).
+
 Disk snapshots live under `{vault}/sync/midnight/{unshielded|shielded|dust}/` (see `cache_io.rs`).
 Environment toggles (stall timeouts, VK-free shielded sync, logging) are centralized in
 `midnight_env.rs`.

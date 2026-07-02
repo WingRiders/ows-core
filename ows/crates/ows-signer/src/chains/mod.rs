@@ -16,7 +16,10 @@ pub use self::bitcoin::BitcoinSigner;
 pub use self::cosmos::CosmosSigner;
 pub use self::evm::EvmSigner;
 pub use self::filecoin::FilecoinSigner;
-pub use self::midnight::{MidnightSigner, MidnightStandardTxKind};
+pub use self::midnight::{
+    hrp_for_network, is_mainnet_network_reference, network_reference_from_chain_id,
+    MidnightSigner, MidnightStandardTxKind,
+};
 pub use self::nano::NanoSigner;
 pub use self::near::NearSigner;
 pub use self::solana::SolanaSigner;

@@ -61,15 +61,20 @@ async fn get_shielded_balances_impl(
     let zswap_cache_key = shielded_sync_cache::zswap_cache_key(&seed_fp);
     let session_sync = midnight_env::shielded_indexer_session_sync_enabled();
     let (viewing_key, vk_fp) = if session_sync {
-        let vk = shielded_session::viewing_key_from_secret_keys(indexer_url, &keys)?;
+        let vk = shielded_session::viewing_key_from_secret_keys(
+            indexer_url,
+            scope.chain_id.as_deref(),
+            &keys,
+        )?;
         let fp = shielded_sync_cache::viewing_key_fingerprint(&vk);
         (Some(vk), fp)
     } else {
         (None, String::new())
     };
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
-    let network = MidnightNetwork::from_indexer_url(indexer_url);
-    let zswap_sync = midnight_env::shielded_zswap_ledger_sync_enabled(network);
+    let network = MidnightNetwork::resolve(scope.chain_id.as_deref(), indexer_url)
+        .map_err(|e| PayError::new(PayErrorCode::InvalidInput, e))?;
+    let zswap_sync = midnight_env::shielded_zswap_ledger_sync_enabled(&network);
 
     if session_cache::session_cache_shortcut_allowed(purpose) {
         if let Some(cached) = session_cache::get_shielded(scope, &fp, &zswap_cache_key) {

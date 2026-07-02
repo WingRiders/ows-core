@@ -642,6 +642,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chain_midnight_custom_network() {
+        let custom = parse_chain("midnight:custom-net").unwrap();
+        assert_eq!(custom.chain_type, ChainType::Midnight);
+        assert_eq!(custom.chain_id, "midnight:custom-net");
+        assert_eq!(custom.name, "midnight:custom-net");
+
+        let hyphenated = parse_chain("midnight:my-feature-testnet").unwrap();
+        assert_eq!(hyphenated.chain_type, ChainType::Midnight);
+        assert_eq!(hyphenated.chain_id, "midnight:my-feature-testnet");
+    }
+
+    #[test]
     fn test_parse_chain_bare_numeric_known() {
         // "8453" → Base (eip155:8453)
         let chain = parse_chain("8453").unwrap();

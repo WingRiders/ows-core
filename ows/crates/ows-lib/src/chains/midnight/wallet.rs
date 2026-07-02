@@ -703,6 +703,9 @@ fn run_prepare_sealed_from_unsealed(
 ) -> Result<Vec<u8>, OwsLibError> {
     let indexer_url = resolve_indexer_url(chain_id)?;
     let mut scope = sync_scope.cloned().unwrap_or_default();
+    if scope.chain_id.is_none() {
+        scope = scope.with_chain_id(chain_id);
+    }
     prepare_sealed_from_unsealed(
         chain_id,
         &indexer_url,
@@ -736,6 +739,9 @@ fn run_balance_sealed_transaction(
 ) -> Result<Vec<u8>, OwsLibError> {
     let indexer_url = resolve_indexer_url(chain_id)?;
     let mut scope = sync_scope.cloned().unwrap_or_default();
+    if scope.chain_id.is_none() {
+        scope = scope.with_chain_id(chain_id);
+    }
     prepare_balanced_sealed_from_maker_offer(
         chain_id,
         &indexer_url,

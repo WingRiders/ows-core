@@ -71,6 +71,10 @@ Network HRPs:
 | Preview | `mn_addr_preview` |
 | Preprod | `mn_addr_preprod` |
 
+For any other network reference `<network>` (e.g. `midnight:my-feature-testnet`), OWS uses
+`mn_addr_<network>`, `mn_shield-addr_<network>`, and `mn_dust_<network>`. Mainnet is the only
+network with unsuffixed HRPs. See [custom-networks.md](./custom-networks.md).
+
 OWS stores the mainnet-HRP unshielded address in universal wallets, and re-encodes it to preview /
 preprod HRPs at operation time when the same underlying key is used against another network. This is
 intentional and mirrors the “same key, different network encoding” pattern used by XRPL.

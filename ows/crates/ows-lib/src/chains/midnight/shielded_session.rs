@@ -76,14 +76,17 @@ fn bech32m_encode(hrp: &str, payload: &[u8]) -> Result<String, PayError> {
 /// bytes; the indexer accepts those bech32 strings but indexes relevance under the canonical key only.
 pub(super) fn viewing_key_from_secret_keys(
     indexer_url: &str,
+    chain_id: Option<&str>,
     keys: &ZswapSecretKeys,
 ) -> Result<String, PayError> {
-    let hrp = MidnightNetwork::from_indexer_url(indexer_url).viewing_key_hrp();
+    let hrp = MidnightNetwork::resolve(chain_id, indexer_url)
+        .map_err(|e| PayError::new(PayErrorCode::InvalidInput, e))?
+        .viewing_key_hrp();
     let mut payload = Vec::new();
     keys.encryption_secret_key
         .serialize(&mut payload)
         .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
-    bech32m_encode(hrp, &payload)
+    bech32m_encode(&hrp, &payload)
 }
 
 pub(super) async fn connect_session(
@@ -489,16 +492,21 @@ pub async fn sync_shielded_wallet_state_scoped(
     scope: &SyncCacheScope,
 ) -> Result<ShieldedWalletState, PayError> {
     let keys = zswap_secret_keys_from_seed(shielded_seed_32)?;
-    let network = MidnightNetwork::from_indexer_url(indexer_url);
+    let network = MidnightNetwork::resolve(scope.chain_id.as_deref(), indexer_url)
+        .map_err(|e| PayError::new(PayErrorCode::InvalidInput, e))?;
     let session_sync = midnight_env::shielded_indexer_session_sync_enabled();
     let viewing_key = if session_sync {
-        Some(viewing_key_from_secret_keys(indexer_url, &keys)?)
+        Some(viewing_key_from_secret_keys(
+            indexer_url,
+            scope.chain_id.as_deref(),
+            &keys,
+        )?)
     } else {
         None
     };
 
     tokio::time::timeout(SHIELDED_SYNC_TIMEOUT, async {
-        let mut wallet = if midnight_env::shielded_zswap_spend_wallet_enabled(network) {
+        let mut wallet = if midnight_env::shielded_zswap_spend_wallet_enabled(&network) {
             if midnight_env::midnight_sync_log_enabled() {
                 eprintln!(
                     "[ows-midnight] shielded spend: building wallet from zswapLedgerEvents replay"
@@ -572,7 +580,7 @@ pub async fn sync_shielded_wallet_state_scoped(
             );
         }
 
-        if midnight_env::shielded_zswap_spend_hydrate_enabled(network) {
+        if midnight_env::shielded_zswap_spend_hydrate_enabled(&network) {
             hydrate_wallet_from_zswap_snapshot(indexer_url, shielded_seed_32, scope, &mut wallet);
         }
         ensure_shielded_merkle_ready(&mut wallet)?;
@@ -881,8 +889,10 @@ fn maybe_save_session_snapshot(
     else {
         return;
     };
-    let network = MidnightNetwork::from_indexer_url(indexer_url);
-    if balances.is_empty() && midnight_env::shielded_zswap_fallback_enabled(network) {
+    let Ok(network) = MidnightNetwork::resolve(scope.chain_id.as_deref(), indexer_url) else {
+        return;
+    };
+    if balances.is_empty() && midnight_env::shielded_zswap_fallback_enabled(&network) {
         return;
     }
     if let Some(path) = shielded_sync_cache::snapshot_path(indexer_url, vk_fp, scope) {
@@ -993,6 +1003,7 @@ mod viewing_key_tests {
 
         let vk = viewing_key_from_secret_keys(
             "https://indexer.preview.midnight.network/api/v4/graphql",
+            Some("midnight:preview"),
             &keys,
         )
         .unwrap();
@@ -1002,10 +1013,12 @@ mod viewing_key_tests {
         );
 
         // Legacy wrong encodings must differ from canonical viewing key.
-        let hrp = MidnightNetwork::Preview.viewing_key_hrp();
-        let vk_repr = bech32m_encode(hrp, &esk.repr()).unwrap();
+        let hrp = MidnightNetwork::from_chain_id("midnight:preview")
+            .unwrap()
+            .viewing_key_hrp();
+        let vk_repr = bech32m_encode(&hrp, &esk.repr()).unwrap();
         assert_ne!(vk, vk_repr);
-        let vk_tagged = bech32m_encode(hrp, &tagged).unwrap();
+        let vk_tagged = bech32m_encode(&hrp, &tagged).unwrap();
         assert_ne!(vk, vk_tagged);
     }
 }

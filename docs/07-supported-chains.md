@@ -89,9 +89,11 @@ Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`
 
 Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
-Midnight-specific documentation lives under [`docs/midnight/`](./midnight/) ([chain plugin interface](./midnight/chain-plugin-interface.md), [architecture](./midnight/architecture.md), [addressing](./midnight/addressing.md), [swap intents](./midnight/swap-intent.md)). The `midnight` CAIP-2 namespace is **provisional** until a profile is registered in the [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces).
+Midnight-specific documentation lives under [`docs/midnight/`](./midnight/) ([chain plugin interface](./midnight/chain-plugin-interface.md), [architecture](./midnight/architecture.md), [addressing](./midnight/addressing.md), [custom networks](./midnight/custom-networks.md), [swap intents](./midnight/swap-intent.md)). The `midnight` CAIP-2 namespace is **provisional** until a profile is registered in the [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces).
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
+
+**Custom networks:** any `midnight:<network>` chain id is accepted; configure indexer and node RPC URLs in `~/.ows/config.json`. See [custom-networks.md](./midnight/custom-networks.md).
 
 ## Shorthand Aliases
 

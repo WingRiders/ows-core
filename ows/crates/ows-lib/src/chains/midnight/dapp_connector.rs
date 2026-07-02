@@ -820,8 +820,8 @@ fn shielded_recipient_keys(
     chain_id: &str,
     recipient: &str,
 ) -> Result<(CoinPublicKey, encryption::PublicKey), PayError> {
-    let hrp = MidnightSigner::shielded_hrp_for_chain_id(chain_id);
-    let payload = decode_bech32m_payload(recipient, hrp)?;
+    let hrp = MidnightSigner::shielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
+    let payload = decode_bech32m_payload(recipient, &hrp)?;
     if payload.len() != 64 {
         return Err(err(format!(
             "shielded recipient address payload must be 64 bytes, got {}",
@@ -909,8 +909,8 @@ fn user_address_from_unshielded_recipient(
     chain_id: &str,
     recipient: &str,
 ) -> Result<UserAddress, PayError> {
-    let hrp = MidnightSigner::unshielded_hrp_for_chain_id(chain_id);
-    let payload = decode_bech32m_payload(recipient, hrp)?;
+    let hrp = MidnightSigner::unshielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
+    let payload = decode_bech32m_payload(recipient, &hrp)?;
     if payload.len() != 32 {
         return Err(err(format!(
             "unshielded recipient address payload must be 32 bytes, got {}",
@@ -1053,8 +1053,8 @@ mod tests {
     #[test]
     fn build_make_transfer_tx_has_preimage_header() {
         use bech32::Bech32m;
-        let hrp = MidnightSigner::unshielded_hrp_for_chain_id("midnight:preview");
-        let recipient = bech32::encode::<Bech32m>(Hrp::parse(hrp).unwrap(), &[0xABu8; 32]).unwrap();
+        let hrp = MidnightSigner::unshielded_hrp_for_chain_id("midnight:preview").unwrap();
+        let recipient = bech32::encode::<Bech32m>(Hrp::parse(&hrp).unwrap(), &[0xABu8; 32]).unwrap();
         let req = MakeTransferRequest {
             desired_outputs: vec![DesiredOutput {
                 kind: TransferKind::Unshielded,

@@ -20,6 +20,45 @@ use ows_core::ChainType;
 /// Midnight WalletEngine specification.
 pub struct MidnightSigner;
 
+/// Extract the ledger / DApp connector network id from a CAIP-2 Midnight chain id
+/// (`midnight:<network>`).
+pub fn network_reference_from_chain_id(chain_id: &str) -> Result<String, SignerError> {
+    let trimmed = chain_id.trim();
+    let (namespace, reference) = trimmed.split_once(':').ok_or_else(|| {
+        SignerError::AddressDerivationFailed(format!(
+            "expected midnight CAIP-2 chain id (midnight:<network>), got {chain_id:?}"
+        ))
+    })?;
+    if !namespace.eq_ignore_ascii_case("midnight") {
+        return Err(SignerError::AddressDerivationFailed(format!(
+            "expected midnight namespace in chain id, got {chain_id:?}"
+        )));
+    }
+    if reference.is_empty() {
+        return Err(SignerError::AddressDerivationFailed(
+            "midnight chain id must include a network reference after 'midnight:'".into(),
+        ));
+    }
+    Ok(reference.to_string())
+}
+
+/// True when the network reference is mainnet (no Bech32m HRP suffix).
+pub fn is_mainnet_network_reference(network_ref: &str) -> bool {
+    network_ref.eq_ignore_ascii_case("mainnet")
+}
+
+/// Build a Bech32m HRP for a Midnight address type on the given network.
+///
+/// Mainnet uses the base HRP with no suffix (`mn_addr`). Every other network appends
+/// `_{network}` (`mn_addr_preview`, `mn_addr_my-feature`, …).
+pub fn hrp_for_network(base_hrp: &str, network_ref: &str) -> String {
+    if is_mainnet_network_reference(network_ref) {
+        base_hrp.to_string()
+    } else {
+        format!("{base_hrp}_{network_ref}")
+    }
+}
+
 /// Midnight has three address types (unshielded, shielded, dust).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MidnightAddresses {
@@ -31,47 +70,23 @@ pub struct MidnightAddresses {
 impl MidnightSigner {
     /// Bech32m HRP for a Midnight unshielded (Night) address on the given chain id.
     ///
-    /// - `midnight:preview` → `mn_addr_preview`
-    /// - `midnight:preprod` → `mn_addr_preprod`
-    /// - any other (incl. `midnight:mainnet`) → `mn_addr`
-    pub fn unshielded_hrp_for_chain_id(chain_id: &str) -> &'static str {
-        if chain_id.eq_ignore_ascii_case("midnight:preview") {
-            "mn_addr_preview"
-        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
-            "mn_addr_preprod"
-        } else {
-            "mn_addr"
-        }
+    /// Mainnet (`midnight:mainnet`) → `mn_addr`. Every other network uses
+    /// `mn_addr_{network}` (e.g. `mn_addr_preview`, `mn_addr_my-feature-testnet`).
+    pub fn unshielded_hrp_for_chain_id(chain_id: &str) -> Result<String, SignerError> {
+        let network = network_reference_from_chain_id(chain_id)?;
+        Ok(hrp_for_network("mn_addr", &network))
     }
 
     /// Bech32m HRP for a Midnight shielded (Zswap) address on the given chain id.
-    ///
-    /// - `midnight:preview` → `mn_shield-addr_preview`
-    /// - `midnight:preprod` → `mn_shield-addr_preprod`
-    /// - any other (incl. `midnight:mainnet`) → `mn_shield-addr`
-    pub fn shielded_hrp_for_chain_id(chain_id: &str) -> &'static str {
-        if chain_id.eq_ignore_ascii_case("midnight:preview") {
-            "mn_shield-addr_preview"
-        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
-            "mn_shield-addr_preprod"
-        } else {
-            "mn_shield-addr"
-        }
+    pub fn shielded_hrp_for_chain_id(chain_id: &str) -> Result<String, SignerError> {
+        let network = network_reference_from_chain_id(chain_id)?;
+        Ok(hrp_for_network("mn_shield-addr", &network))
     }
 
     /// Bech32m HRP for a Midnight DUST address on the given chain id.
-    ///
-    /// - `midnight:preview` → `mn_dust_preview`
-    /// - `midnight:preprod` → `mn_dust_preprod`
-    /// - any other (incl. `midnight:mainnet`) → `mn_dust`
-    pub fn dust_hrp_for_chain_id(chain_id: &str) -> &'static str {
-        if chain_id.eq_ignore_ascii_case("midnight:preview") {
-            "mn_dust_preview"
-        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
-            "mn_dust_preprod"
-        } else {
-            "mn_dust"
-        }
+    pub fn dust_hrp_for_chain_id(chain_id: &str) -> Result<String, SignerError> {
+        let network = network_reference_from_chain_id(chain_id)?;
+        Ok(hrp_for_network("mn_dust", &network))
     }
 
     /// Re-encode a stored unshielded address for another Midnight network.
@@ -89,8 +104,8 @@ impl MidnightSigner {
             SignerError::AddressDerivationFailed(format!("invalid midnight address bech32m: {e}"))
         })?;
         let payload = checked.byte_iter().collect::<Vec<u8>>();
-        let hrp_str = Self::unshielded_hrp_for_chain_id(target_chain_id);
-        let hrp = Hrp::parse(hrp_str).map_err(|e| {
+        let hrp_str = Self::unshielded_hrp_for_chain_id(target_chain_id)?;
+        let hrp = Hrp::parse(&hrp_str).map_err(|e| {
             SignerError::AddressDerivationFailed(format!("invalid midnight hrp: {e}"))
         })?;
         bech32::encode::<Bech32m>(hrp, &payload)
@@ -207,8 +222,8 @@ impl MidnightSigner {
         chain_id: &str,
         seed: &[u8],
     ) -> Result<String, SignerError> {
-        let hrp = Self::shielded_hrp_for_chain_id(chain_id);
-        self.derive_shielded_address_with_hrp(seed, hrp)
+        let hrp = Self::shielded_hrp_for_chain_id(chain_id)?;
+        self.derive_shielded_address_with_hrp(seed, &hrp)
     }
 
     /// Derive the dust address (type `mn_dust1...`) from a 32-byte dust seed.
@@ -230,8 +245,8 @@ impl MidnightSigner {
         chain_id: &str,
         seed: &[u8],
     ) -> Result<String, SignerError> {
-        let hrp = Self::dust_hrp_for_chain_id(chain_id);
-        self.derive_dust_address_from_seed_with_hrp(seed, hrp)
+        let hrp = Self::dust_hrp_for_chain_id(chain_id)?;
+        self.derive_dust_address_from_seed_with_hrp(seed, &hrp)
     }
 
     fn derive_dust_address_from_seed_with_hrp(
@@ -367,8 +382,8 @@ impl ChainSigner for MidnightSigner {
         chain_id: &str,
         private_key: &[u8],
     ) -> Result<String, SignerError> {
-        let hrp = Self::unshielded_hrp_for_chain_id(chain_id);
-        self.derive_unshielded_address_with_hrp(private_key, hrp)
+        let hrp = Self::unshielded_hrp_for_chain_id(chain_id)?;
+        self.derive_unshielded_address_with_hrp(private_key, &hrp)
     }
 
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
@@ -904,6 +919,108 @@ mod tests {
             .byte_iter()
             .collect::<Vec<u8>>();
         assert_eq!(mainnet_payload, preview_payload);
+    }
+
+    #[test]
+    fn custom_network_reference_hrp_and_address() {
+        let chain = "midnight:my-feature-testnet";
+        assert_eq!(
+            super::network_reference_from_chain_id(chain).unwrap(),
+            "my-feature-testnet"
+        );
+        assert_eq!(
+            MidnightSigner::unshielded_hrp_for_chain_id(chain).unwrap(),
+            "mn_addr_my-feature-testnet"
+        );
+        assert_eq!(
+            MidnightSigner::shielded_hrp_for_chain_id(chain).unwrap(),
+            "mn_shield-addr_my-feature-testnet"
+        );
+        assert_eq!(
+            MidnightSigner::dust_hrp_for_chain_id(chain).unwrap(),
+            "mn_dust_my-feature-testnet"
+        );
+
+        let signer = MidnightSigner;
+        let key = [11u8; 32];
+        let addr = signer
+            .derive_address_for_chain_id(chain, &key)
+            .expect("custom network address");
+        assert!(addr.starts_with("mn_addr_my-feature-testnet1"));
+    }
+
+    #[test]
+    fn custom_network_unshielded_reencode_round_trip() {
+        let chain = "midnight:custom-net";
+        let signer = MidnightSigner;
+        let key = [11u8; 32];
+
+        let custom_addr = signer
+            .derive_address_for_chain_id(chain, &key)
+            .expect("custom network address");
+        assert!(custom_addr.starts_with("mn_addr_custom-net1"));
+
+        let mainnet_addr = signer.derive_address(&key).expect("mainnet address");
+        let reencoded =
+            MidnightSigner::reencode_unshielded_address_for_chain_id(chain, &mainnet_addr)
+                .expect("reencode stored mainnet address");
+        assert_eq!(reencoded, custom_addr);
+    }
+
+    #[test]
+    fn custom_network_shielded_and_dust_share_mainnet_payload() {
+        use bech32::primitives::decode::CheckedHrpstring;
+
+        let chain = "midnight:custom-net";
+        let signer = MidnightSigner;
+        let shielded_seed = [22u8; 32];
+        let dust_seed = [33u8; 32];
+
+        let mainnet_shielded = signer
+            .derive_shielded_address_from_seed(&shielded_seed)
+            .expect("mainnet shielded");
+        let custom_shielded = signer
+            .derive_shielded_address_from_seed_for_chain_id(chain, &shielded_seed)
+            .expect("custom shielded");
+        assert!(custom_shielded.starts_with("mn_shield-addr_custom-net1"));
+        let mainnet_shielded_payload = CheckedHrpstring::new::<Bech32m>(&mainnet_shielded)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        let custom_shielded_payload = CheckedHrpstring::new::<Bech32m>(&custom_shielded)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        assert_eq!(mainnet_shielded_payload, custom_shielded_payload);
+
+        let mainnet_dust = signer
+            .derive_dust_address_from_seed(&dust_seed)
+            .expect("mainnet dust");
+        let custom_dust = signer
+            .derive_dust_address_from_seed_for_chain_id(chain, &dust_seed)
+            .expect("custom dust");
+        assert!(custom_dust.starts_with("mn_dust_custom-net1"));
+        let mainnet_dust_payload = CheckedHrpstring::new::<Bech32m>(&mainnet_dust)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        let custom_dust_payload = CheckedHrpstring::new::<Bech32m>(&custom_dust)
+            .unwrap()
+            .byte_iter()
+            .collect::<Vec<u8>>();
+        assert_eq!(mainnet_dust_payload, custom_dust_payload);
+    }
+
+    #[test]
+    fn network_reference_from_chain_id_rejects_invalid_ids() {
+        let err = super::network_reference_from_chain_id("preview").unwrap_err();
+        assert!(err.to_string().contains("midnight CAIP-2"), "{err}");
+
+        let err = super::network_reference_from_chain_id("midnight:").unwrap_err();
+        assert!(err.to_string().contains("network reference"), "{err}");
+
+        let err = super::network_reference_from_chain_id("eip155:1").unwrap_err();
+        assert!(err.to_string().contains("midnight namespace"), "{err}");
     }
 
     #[test]

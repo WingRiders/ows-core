@@ -276,6 +276,18 @@ mod tests {
     }
 
     #[test]
+    fn custom_chain_id_produces_distinct_snapshot_paths() {
+        let base = SyncCacheScope::for_wallet("wallet-abc", None);
+        let custom = base.clone().with_chain_id("midnight:custom-net");
+        let preview = base.with_chain_id("midnight:preview");
+        let url = "https://indexer.example/graphql";
+        let key = "same-dust-pk";
+        let p_custom = snapshot_path("dust", url, key, &custom).unwrap();
+        let p_preview = snapshot_path("dust", url, key, &preview).unwrap();
+        assert_ne!(p_custom, p_preview);
+    }
+
+    #[test]
     fn sync_site_fingerprint_includes_chain_id() {
         let scope = SyncCacheScope::default().with_chain_id("midnight:preview");
         let fp = sync_site_fingerprint("https://indexer.example/graphql", &scope);

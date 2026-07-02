@@ -139,14 +139,22 @@ pub fn parse_token_type(token: Option<&str>) -> Result<TokenType, PayError> {
     }
 }
 
-/// Preview / Preprod unshielded transactions require a DUST fee registration on the intent.
+/// Preview / Preprod (and other non-mainnet) unshielded transactions require a DUST fee registration on the intent.
 pub fn chain_needs_dust_fee_registration(chain_id: &str) -> bool {
-    MidnightNetwork::from_chain_id(chain_id).needs_dust_fee_registration()
+    MidnightNetwork::from_chain_id(chain_id)
+        .unwrap_or_else(|e| {
+            panic!("Midnight dust fee check requires chain id midnight:<network>: {e}")
+        })
+        .needs_dust_fee_registration()
 }
 
 /// CAIP-2 chain id → `StandardTransaction.network_id` string used by the ledger.
-pub fn ledger_network_id(chain_id: &str) -> &'static str {
-    MidnightNetwork::from_chain_id(chain_id).ledger_network_id()
+pub fn ledger_network_id(chain_id: &str) -> String {
+    MidnightNetwork::from_chain_id(chain_id)
+        .map(|n| n.ledger_network_id().to_string())
+        .unwrap_or_else(|e| {
+            panic!("Midnight ledger network id requires chain id midnight:<network>: {e}")
+        })
 }
 
 const TAG_PROOF_EMBEDDED_FR: &[u8] =
@@ -393,5 +401,25 @@ mod tests {
         assert!(is_balance_unsealed_payload(&proven));
         assert!(!is_balance_unsealed_payload(b"midnight:not-a-tx"));
         assert_eq!(classify_unsealed_payload(b"sealed-bytes"), None);
+    }
+
+    #[test]
+    fn ledger_network_id_matches_chain_reference() {
+        assert_eq!(ledger_network_id("midnight:mainnet"), "mainnet");
+        assert_eq!(ledger_network_id("midnight:preview"), "preview");
+        assert_eq!(ledger_network_id("midnight:custom-net"), "custom-net");
+    }
+
+    #[test]
+    fn chain_needs_dust_fee_registration_follows_mainnet_rule() {
+        assert!(!chain_needs_dust_fee_registration("midnight:mainnet"));
+        assert!(chain_needs_dust_fee_registration("midnight:preview"));
+        assert!(chain_needs_dust_fee_registration("midnight:custom-net"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Midnight ledger network id requires chain id midnight:<network>")]
+    fn ledger_network_id_rejects_invalid_chain_id() {
+        let _ = ledger_network_id("not-midnight");
     }
 }

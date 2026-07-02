@@ -76,6 +76,9 @@ Swap workflows and `ows sign export-mip6-offer` are in [swap-intent.md](./swap-i
 | Preview | `midnight:preview` |
 | Preprod | `midnight:preprod` |
 
+Any other deployment uses `midnight:<network>` with matching config keys — see
+[custom-networks.md](./custom-networks.md).
+
 Indexer GraphQL and node RPC URLs are set in `~/.ows/config.json` (`rpc["midnight:<network>"]`,
 `rpc["midnight:<network>:node"]`). The `midnight` namespace is **provisional** until registered in
 the [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces). See

@@ -786,7 +786,8 @@ fn build_preimage_dust_actions(
         ttl,
     );
     let intents0: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_no_dust);
-    let tx0: TxPreimage = Transaction::from_intents(super::ledger_network_id(chain_id), intents0);
+    let network_id = super::ledger_network_id(chain_id);
+    let tx0: TxPreimage = Transaction::from_intents(&network_id, intents0);
     let tx0p = tx0
         .mock_prove()
         .map_err(|e| err(format!("fee mock-prove failed: {e:?}")))?;

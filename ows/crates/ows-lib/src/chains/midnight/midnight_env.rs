@@ -1,61 +1,54 @@
 //! Midnight network identity and environment-variable helpers for sync modules.
 
+use ows_signer::chains::{
+    hrp_for_network, is_mainnet_network_reference, network_reference_from_chain_id,
+};
 use std::time::Duration;
 
-/// Midnight network (preview / preprod / mainnet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MidnightNetwork {
-    Preview,
-    Preprod,
-    Mainnet,
+/// Midnight network identity (`preview`, `mainnet`, or any ad-hoc testnet name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidnightNetwork {
+    /// Ledger / DApp connector network id (the `<network>` in `midnight:<network>`).
+    pub reference: String,
 }
 
 impl MidnightNetwork {
-    pub fn from_chain_id(chain_id: &str) -> Self {
-        if chain_id.eq_ignore_ascii_case("midnight:preview") {
-            Self::Preview
-        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
-            Self::Preprod
-        } else {
-            Self::Mainnet
-        }
+    pub fn from_chain_id(chain_id: &str) -> Result<Self, String> {
+        let reference = network_reference_from_chain_id(chain_id)
+            .map_err(|e| e.to_string())?;
+        Ok(Self { reference })
     }
 
-    /// Infer network from an indexer URL when no chain id is available.
-    pub fn from_indexer_url(indexer_url: &str) -> Self {
-        let u = indexer_url.to_ascii_lowercase();
-        if u.contains("preview") {
-            Self::Preview
-        } else if u.contains("preprod") {
-            Self::Preprod
-        } else {
-            Self::Mainnet
-        }
+    /// Require an explicit CAIP-2 chain id (`midnight:<network>`).
+    ///
+    /// Network identity is never inferred from the indexer URL — callers must supply
+    /// `chain_id` so addresses, ledger state, and sync behavior stay aligned.
+    pub fn resolve(chain_id: Option<&str>, _indexer_url: &str) -> Result<Self, String> {
+        let cid = chain_id.ok_or_else(|| {
+            "Midnight operations require a chain id (midnight:<network>)".to_string()
+        })?;
+        Self::from_chain_id(cid)
     }
 
-    pub fn ledger_network_id(self) -> &'static str {
-        match self {
-            Self::Preview => "preview",
-            Self::Preprod => "preprod",
-            Self::Mainnet => "mainnet",
-        }
+    pub fn is_mainnet(&self) -> bool {
+        is_mainnet_network_reference(&self.reference)
     }
 
-    pub fn needs_dust_fee_registration(self) -> bool {
-        matches!(self, Self::Preview | Self::Preprod)
+    pub fn ledger_network_id(&self) -> &str {
+        &self.reference
     }
 
-    /// Default for the zswap-ledger fallback on preview/preprod indexers.
-    pub fn shielded_zswap_fallback_default(self) -> bool {
-        matches!(self, Self::Preview | Self::Preprod)
+    pub fn needs_dust_fee_registration(&self) -> bool {
+        !self.is_mainnet()
     }
 
-    pub fn viewing_key_hrp(self) -> &'static str {
-        match self {
-            Self::Preview => "mn_shield-esk_preview",
-            Self::Preprod => "mn_shield-esk_preprod",
-            Self::Mainnet => "mn_shield-esk",
-        }
+    /// Default for the zswap-ledger fallback on non-mainnet indexers.
+    pub fn shielded_zswap_fallback_default(&self) -> bool {
+        !self.is_mainnet()
+    }
+
+    pub fn viewing_key_hrp(&self) -> String {
+        hrp_for_network("mn_shield-esk", &self.reference)
     }
 }
 
@@ -180,11 +173,11 @@ pub fn shielded_vk_free_sync_enabled() -> bool {
 
 /// Primary shielded sync uses `zswapLedgerEvents` + `ZswapLocalState::replay_events`, matching
 /// `@midnight-ntwrk/wallet-sdk-shielded` (Lace). Enabled by default on preview/preprod.
-pub fn shielded_zswap_ledger_sync_enabled(network: MidnightNetwork) -> bool {
+pub fn shielded_zswap_ledger_sync_enabled(network: &MidnightNetwork) -> bool {
     shielded_vk_free_sync_enabled() || shielded_zswap_fallback_enabled(network)
 }
 
-pub fn shielded_zswap_fallback_enabled(network: MidnightNetwork) -> bool {
+pub fn shielded_zswap_fallback_enabled(network: &MidnightNetwork) -> bool {
     if shielded_vk_free_sync_enabled() {
         return true;
     }
@@ -208,7 +201,7 @@ pub fn shielded_indexer_session_sync_enabled() -> bool {
 /// After viewing-key session sync, merge qualified coins from the on-disk zswap-ledger snapshot
 /// into spend state. **Off by default** — zswap `mt_index` values are not valid in the session
 /// Merkle tree and cause `InvalidIndex` on spend. Opt in with `OWS_MIDNIGHT_SHIELDED_ZSWAP_HYDRATE=1`.
-pub fn shielded_zswap_spend_hydrate_enabled(_network: MidnightNetwork) -> bool {
+pub fn shielded_zswap_spend_hydrate_enabled(_network: &MidnightNetwork) -> bool {
     if shielded_vk_free_sync_enabled() {
         return false;
     }
@@ -216,7 +209,7 @@ pub fn shielded_zswap_spend_hydrate_enabled(_network: MidnightNetwork) -> bool {
 }
 
 /// Build spend wallet state from `zswapLedgerEvents` + `ZswapLocalState::replay_events` (Lace model).
-pub fn shielded_zswap_spend_wallet_enabled(network: MidnightNetwork) -> bool {
+pub fn shielded_zswap_spend_wallet_enabled(network: &MidnightNetwork) -> bool {
     shielded_zswap_ledger_sync_enabled(network)
 }
 
@@ -284,20 +277,71 @@ mod tests {
 
     #[test]
     fn network_from_chain_id() {
-        assert_eq!(
-            MidnightNetwork::from_chain_id("midnight:preview"),
-            MidnightNetwork::Preview
-        );
-        assert_eq!(
-            MidnightNetwork::from_chain_id("midnight:mainnet"),
-            MidnightNetwork::Mainnet
-        );
+        let preview = MidnightNetwork::from_chain_id("midnight:preview").unwrap();
+        assert_eq!(preview.reference, "preview");
+        assert_eq!(preview.ledger_network_id(), "preview");
+
+        let mainnet = MidnightNetwork::from_chain_id("midnight:mainnet").unwrap();
+        assert_eq!(mainnet.reference, "mainnet");
+        assert!(mainnet.is_mainnet());
+
+        let custom =
+            MidnightNetwork::from_chain_id("midnight:my-feature-testnet").unwrap();
+        assert_eq!(custom.reference, "my-feature-testnet");
+        assert_eq!(custom.ledger_network_id(), "my-feature-testnet");
+        assert!(!custom.is_mainnet());
+        assert!(custom.needs_dust_fee_registration());
+    }
+
+    #[test]
+    fn resolve_requires_chain_id() {
+        let err = MidnightNetwork::resolve(None, "https://indexer.example/graphql")
+            .unwrap_err();
+        assert!(err.contains("chain id"), "{err}");
+
+        let err = MidnightNetwork::resolve(Some("not-midnight"), "https://indexer.example/graphql")
+            .unwrap_err();
+        assert!(err.contains("midnight"), "{err}");
+    }
+
+    #[test]
+    fn resolve_uses_explicit_chain_id() {
+        let net = MidnightNetwork::resolve(
+            Some("midnight:undeployed"),
+            "https://indexer.preview.midnight.network/api/v4/graphql",
+        )
+        .unwrap();
+        assert_eq!(net.reference, "undeployed");
     }
 
     #[test]
     fn ledger_network_ids() {
-        assert_eq!(MidnightNetwork::Preview.ledger_network_id(), "preview");
-        assert_eq!(MidnightNetwork::Preprod.ledger_network_id(), "preprod");
-        assert_eq!(MidnightNetwork::Mainnet.ledger_network_id(), "mainnet");
+        assert_eq!(
+            MidnightNetwork::from_chain_id("midnight:preview")
+                .unwrap()
+                .ledger_network_id(),
+            "preview"
+        );
+        assert_eq!(
+            MidnightNetwork::from_chain_id("midnight:preprod")
+                .unwrap()
+                .ledger_network_id(),
+            "preprod"
+        );
+        assert_eq!(
+            MidnightNetwork::from_chain_id("midnight:mainnet")
+                .unwrap()
+                .ledger_network_id(),
+            "mainnet"
+        );
+    }
+
+    #[test]
+    fn custom_network_hrp_and_non_mainnet_defaults() {
+        let custom =
+            MidnightNetwork::from_chain_id("midnight:custom-net").expect("custom network");
+        assert_eq!(custom.viewing_key_hrp(), "mn_shield-esk_custom-net");
+        assert!(custom.needs_dust_fee_registration());
+        assert!(custom.shielded_zswap_fallback_default());
     }
 }
