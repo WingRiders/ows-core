@@ -1143,3 +1143,53 @@ fn wrap_proven_standard(
         binding_randomness: stx_in.binding_randomness,
     }))
 }
+
+#[cfg(test)]
+mod network_id_tests {
+    use super::balance_unsealed_preimage_standard_tx;
+    use super::balance_unsealed_proven_standard_tx;
+    use super::SyncCacheScope;
+    use crate::chains::midnight::test_tx::{
+        assert_network_mismatch, minimal_preimage_tx_bytes, minimal_proven_tx_bytes,
+    };
+
+    const INDEXER: &str = "https://indexer.example/graphql";
+    const KEY: [u8; 32] = [9u8; 32];
+
+    fn scope(chain_id: &str) -> SyncCacheScope {
+        SyncCacheScope::default().with_chain_id(chain_id)
+    }
+
+    #[test]
+    fn balance_preimage_rejects_network_mismatch() {
+        let tx = minimal_preimage_tx_bytes("preview");
+        let err = balance_unsealed_preimage_standard_tx(
+            "midnight:mainnet",
+            INDEXER,
+            &KEY,
+            None,
+            &tx,
+            &scope("midnight:mainnet"),
+            false,
+        )
+        .unwrap_err();
+        assert_network_mismatch(&err);
+    }
+
+    #[test]
+    fn balance_proven_rejects_network_mismatch() {
+        let tx = minimal_proven_tx_bytes("preview");
+        let err = balance_unsealed_proven_standard_tx(
+            "midnight:mainnet",
+            INDEXER,
+            &KEY,
+            None,
+            None,
+            &tx,
+            &scope("midnight:mainnet"),
+            false,
+        )
+        .unwrap_err();
+        assert_network_mismatch(&err);
+    }
+}

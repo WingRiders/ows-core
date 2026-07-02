@@ -44,6 +44,8 @@ mod shielded_sync;
 mod shielded_sync_cache;
 mod sign;
 mod submit;
+#[cfg(test)]
+mod test_tx;
 mod tip_verify;
 mod unshielded_sync;
 mod urls;
@@ -508,5 +510,24 @@ mod tests {
     #[test]
     fn ensure_tx_network_id_accepts_match() {
         super::ensure_tx_network_id_matches_chain("midnight:preview", "preview").unwrap();
+    }
+
+    #[test]
+    fn network_id_from_midnight_wire_reads_preimage_and_proven() {
+        let preview_preimage = super::test_tx::minimal_preimage_tx_bytes("preview");
+        assert_eq!(
+            super::network_id_from_midnight_wire(&preview_preimage).unwrap(),
+            "preview"
+        );
+        let mainnet_proven = super::test_tx::minimal_proven_tx_bytes("mainnet");
+        assert_eq!(
+            super::network_id_from_midnight_wire(&mainnet_proven).unwrap(),
+            "mainnet"
+        );
+        let preview_sealed = super::test_tx::minimal_sealed_tx_bytes("preview");
+        assert_eq!(
+            super::network_id_from_midnight_wire(&preview_sealed).unwrap(),
+            "preview"
+        );
     }
 }

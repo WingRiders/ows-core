@@ -954,4 +954,13 @@ mod tests {
         assert!(is_balance_sealed_maker_payload(TAG_PROVEN));
         assert!(!is_balance_sealed_maker_payload(b"other"));
     }
+
+    #[test]
+    fn parse_maker_tx_rejects_proven_network_mismatch() {
+        let tx = crate::chains::midnight::test_tx::minimal_proven_tx_bytes("preview");
+        let err = parse_maker_tx("midnight:mainnet", &tx)
+            .err()
+            .expect("expected network mismatch");
+        crate::chains::midnight::test_tx::assert_network_mismatch(&err);
+    }
 }

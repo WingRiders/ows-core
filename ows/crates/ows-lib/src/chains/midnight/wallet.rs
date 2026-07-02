@@ -929,4 +929,38 @@ mod tests {
             "expected mnemonic-only error, got: {err}"
         );
     }
+
+    #[test]
+    fn sign_transaction_rejects_unsealed_network_mismatch() {
+        use crate::chains::midnight::test_tx::{
+            assert_network_mismatch, minimal_preimage_tx_bytes,
+        };
+        use ows_core::{Chain, ChainType};
+
+        let chain = Chain {
+            chain_type: ChainType::Midnight,
+            chain_id: "midnight:mainnet",
+            name: "midnight:mainnet",
+        };
+        let tx = minimal_preimage_tx_bytes("preview");
+        let err =
+            sign_transaction(&chain, &[9u8; 32], None, None, &tx, None, false, true).unwrap_err();
+        assert_network_mismatch(&err);
+    }
+
+    #[test]
+    fn sign_transaction_rejects_sealed_wire_network_mismatch() {
+        use crate::chains::midnight::test_tx::{assert_network_mismatch, minimal_sealed_tx_bytes};
+        use ows_core::{Chain, ChainType};
+
+        let chain = Chain {
+            chain_type: ChainType::Midnight,
+            chain_id: "midnight:mainnet",
+            name: "midnight:mainnet",
+        };
+        let tx = minimal_sealed_tx_bytes("preview");
+        let err =
+            sign_transaction(&chain, &[9u8; 32], None, None, &tx, None, false, false).unwrap_err();
+        assert_network_mismatch(&err);
+    }
 }

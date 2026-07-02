@@ -170,3 +170,28 @@ pub(super) fn sign_and_seal(
     tagged_serialize(&sealed, &mut out).map_err(|e| err(format!("serialize sealed tx: {e}")))?;
     Ok(out)
 }
+
+#[cfg(test)]
+mod network_id_tests {
+    use super::{sign_and_seal, sign_prove_and_seal};
+    use crate::chains::midnight::test_tx::{
+        assert_network_mismatch, minimal_preimage_tx_bytes, minimal_proven_tx_bytes,
+    };
+
+    const INDEXER: &str = "https://indexer.example/graphql";
+    const KEY: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn sign_prove_and_seal_rejects_network_mismatch() {
+        let tx = minimal_preimage_tx_bytes("preview");
+        let err = sign_prove_and_seal("midnight:mainnet", INDEXER, &tx, &KEY).unwrap_err();
+        assert_network_mismatch(&err);
+    }
+
+    #[test]
+    fn sign_and_seal_rejects_network_mismatch() {
+        let tx = minimal_proven_tx_bytes("preview");
+        let err = sign_and_seal("midnight:mainnet", &tx, &KEY).unwrap_err();
+        assert_network_mismatch(&err);
+    }
+}
