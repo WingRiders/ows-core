@@ -553,7 +553,7 @@ fn build_make_intent_standard_tx(
         fallible_coins = fallible_coins.insert(segment, offer);
     }
     let mut stx = StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents,
         guaranteed_coins: None,
         fallible_coins,
@@ -820,7 +820,8 @@ fn shielded_recipient_keys(
     chain_id: &str,
     recipient: &str,
 ) -> Result<(CoinPublicKey, encryption::PublicKey), PayError> {
-    let hrp = MidnightSigner::shielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
+    let hrp =
+        MidnightSigner::shielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
     let payload = decode_bech32m_payload(recipient, &hrp)?;
     if payload.len() != 64 {
         return Err(err(format!(
@@ -909,7 +910,8 @@ fn user_address_from_unshielded_recipient(
     chain_id: &str,
     recipient: &str,
 ) -> Result<UserAddress, PayError> {
-    let hrp = MidnightSigner::unshielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
+    let hrp =
+        MidnightSigner::unshielded_hrp_for_chain_id(chain_id).map_err(|e| err(e.to_string()))?;
     let payload = decode_bech32m_payload(recipient, &hrp)?;
     if payload.len() != 32 {
         return Err(err(format!(
@@ -1054,7 +1056,8 @@ mod tests {
     fn build_make_transfer_tx_has_preimage_header() {
         use bech32::Bech32m;
         let hrp = MidnightSigner::unshielded_hrp_for_chain_id("midnight:preview").unwrap();
-        let recipient = bech32::encode::<Bech32m>(Hrp::parse(&hrp).unwrap(), &[0xABu8; 32]).unwrap();
+        let recipient =
+            bech32::encode::<Bech32m>(Hrp::parse(&hrp).unwrap(), &[0xABu8; 32]).unwrap();
         let req = MakeTransferRequest {
             desired_outputs: vec![DesiredOutput {
                 kind: TransferKind::Unshielded,

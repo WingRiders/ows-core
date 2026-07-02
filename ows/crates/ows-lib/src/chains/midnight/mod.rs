@@ -149,12 +149,84 @@ pub fn chain_needs_dust_fee_registration(chain_id: &str) -> bool {
 }
 
 /// CAIP-2 chain id → `StandardTransaction.network_id` string used by the ledger.
-pub fn ledger_network_id(chain_id: &str) -> String {
-    MidnightNetwork::from_chain_id(chain_id)
-        .map(|n| n.ledger_network_id().to_string())
-        .unwrap_or_else(|e| {
-            panic!("Midnight ledger network id requires chain id midnight:<network>: {e}")
-        })
+pub fn ledger_network_id(chain_id: &str) -> Result<String, String> {
+    MidnightNetwork::from_chain_id(chain_id).map(|n| n.ledger_network_id().to_string())
+}
+
+/// Reject when a deserialized tx's ledger `network_id` does not match `--chain`.
+pub(crate) fn ensure_tx_network_id_matches_chain(
+    chain_id: &str,
+    tx_network_id: &str,
+) -> Result<(), PayError> {
+    let expected =
+        ledger_network_id(chain_id).map_err(|e| PayError::new(PayErrorCode::InvalidInput, e))?;
+    if tx_network_id != expected {
+        return Err(PayError::new(
+            PayErrorCode::InvalidInput,
+            format!(
+                "transaction network_id {tx_network_id:?} does not match chain id {chain_id:?} \
+                 (expected {expected:?})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read `StandardTransaction.network_id` from tagged Midnight v9 wire bytes.
+pub(crate) fn network_id_from_midnight_wire(tx_bytes: &[u8]) -> Result<String, PayError> {
+    use midnight_base_crypto::signatures::Signature;
+    use midnight_ledger::structure::{ProofKind, ProofMarker, ProofPreimageMarker, Transaction};
+    use midnight_serialize::tagged_deserialize;
+    use midnight_storage::db::InMemoryDB;
+    use transient_crypto::commitment::PedersenRandomness;
+
+    if !tx_bytes.starts_with(b"midnight:transaction") {
+        return Err(PayError::new(
+            PayErrorCode::InvalidInput,
+            "expected tagged midnight transaction bytes (prefix `midnight:transaction`)",
+        ));
+    }
+
+    type PedPre = <ProofPreimageMarker as ProofKind<InMemoryDB>>::Pedersen;
+    type PedSealed = <ProofMarker as ProofKind<InMemoryDB>>::Pedersen;
+    type TxPre = Transaction<Signature, ProofPreimageMarker, PedPre, InMemoryDB>;
+    type TxProven = Transaction<Signature, ProofMarker, PedersenRandomness, InMemoryDB>;
+    type TxSealed = Transaction<Signature, ProofMarker, PedSealed, InMemoryDB>;
+
+    let mut reader: &[u8] = tx_bytes;
+    if let Ok(tx) = tagged_deserialize::<TxPre>(&mut reader) {
+        let Transaction::Standard(stx) = tx else {
+            return Err(PayError::new(
+                PayErrorCode::InvalidInput,
+                "expected Standard transaction",
+            ));
+        };
+        return Ok(stx.network_id.clone());
+    }
+    let mut reader: &[u8] = tx_bytes;
+    if let Ok(tx) = tagged_deserialize::<TxProven>(&mut reader) {
+        let Transaction::Standard(stx) = tx else {
+            return Err(PayError::new(
+                PayErrorCode::InvalidInput,
+                "expected Standard transaction",
+            ));
+        };
+        return Ok(stx.network_id.clone());
+    }
+    let mut reader: &[u8] = tx_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut reader).map_err(|e| {
+        PayError::new(
+            PayErrorCode::InvalidInput,
+            format!("failed to parse midnight transaction bytes: {e}"),
+        )
+    })?;
+    let Transaction::Standard(stx) = tx else {
+        return Err(PayError::new(
+            PayErrorCode::InvalidInput,
+            "expected Standard transaction",
+        ));
+    };
+    Ok(stx.network_id.clone())
 }
 
 const TAG_PROOF_EMBEDDED_FR: &[u8] =
@@ -280,7 +352,7 @@ pub fn prepare_sealed_from_unsealed(
                 sync_scope,
                 pay_fees,
             )?;
-            sign::sign_and_seal(&balanced, &key32)
+            sign::sign_and_seal(chain_id, &balanced, &key32)
         }
     }
 }
@@ -405,9 +477,12 @@ mod tests {
 
     #[test]
     fn ledger_network_id_matches_chain_reference() {
-        assert_eq!(ledger_network_id("midnight:mainnet"), "mainnet");
-        assert_eq!(ledger_network_id("midnight:preview"), "preview");
-        assert_eq!(ledger_network_id("midnight:custom-net"), "custom-net");
+        assert_eq!(ledger_network_id("midnight:mainnet").unwrap(), "mainnet");
+        assert_eq!(ledger_network_id("midnight:preview").unwrap(), "preview");
+        assert_eq!(
+            ledger_network_id("midnight:custom-net").unwrap(),
+            "custom-net"
+        );
     }
 
     #[test]
@@ -418,8 +493,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Midnight ledger network id requires chain id midnight:<network>")]
     fn ledger_network_id_rejects_invalid_chain_id() {
-        let _ = ledger_network_id("not-midnight");
+        let err = ledger_network_id("not-midnight").unwrap_err();
+        assert!(err.contains("midnight"), "{err}");
+    }
+
+    #[test]
+    fn ensure_tx_network_id_rejects_mismatch() {
+        let err =
+            super::ensure_tx_network_id_matches_chain("midnight:preview", "mainnet").unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn ensure_tx_network_id_accepts_match() {
+        super::ensure_tx_network_id_matches_chain("midnight:preview", "preview").unwrap();
     }
 }

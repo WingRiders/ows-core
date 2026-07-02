@@ -136,7 +136,7 @@ fn wrap_zswap_offer_as_proven_tx(
         MnHashMap::new();
     fallible = fallible.insert(segment, offer);
     let stx = StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents: MnHashMap::new(),
         guaranteed_coins: None,
         fallible_coins: fallible,
@@ -153,23 +153,25 @@ enum ParsedMaker {
     Proven(TxProven),
 }
 
-fn parse_maker_tx(bytes: &[u8]) -> Result<ParsedMaker, PayError> {
+fn parse_maker_tx(chain_id: &str, bytes: &[u8]) -> Result<ParsedMaker, PayError> {
     if bytes.starts_with(TAG_SEALED) {
         let mut r: &[u8] = bytes;
         let tx: TxSealed = tagged_deserialize(&mut r)
             .map_err(|e| err(format!("failed to parse sealed maker tx: {e}")))?;
-        let Transaction::Standard(_) = tx else {
+        let Transaction::Standard(stx) = &tx else {
             return Err(err("expected Standard transaction"));
         };
+        super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
         return Ok(ParsedMaker::Sealed(tx));
     }
     if bytes.starts_with(TAG_PROVEN) {
         let mut r: &[u8] = bytes;
         let tx: TxProven = tagged_deserialize(&mut r)
             .map_err(|e| err(format!("failed to parse proven maker tx: {e}")))?;
-        let Transaction::Standard(_) = tx else {
+        let Transaction::Standard(stx) = &tx else {
             return Err(err("expected Standard transaction"));
         };
+        super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
         return Ok(ParsedMaker::Proven(tx));
     }
     Err(err(
@@ -271,17 +273,17 @@ fn build_zswap_only_proven_tx(
     segment: u16,
     offer: ZswapOffer<ZswapProof, InMemoryDB>,
     binding_delta: PedersenRandomness,
-) -> TxProven {
+) -> Result<TxProven, PayError> {
     let mut fallible: MnHashMap<u16, ZswapOffer<ZswapProof, InMemoryDB>, InMemoryDB> =
         MnHashMap::new();
     fallible = fallible.insert(segment, offer);
-    Transaction::Standard(StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+    Ok(Transaction::Standard(StandardTransaction {
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents: MnHashMap::new(),
         guaranteed_coins: None,
         fallible_coins: fallible,
         binding_randomness: binding_delta,
-    })
+    }))
 }
 
 fn seal_proven_tx(tx: TxProven) -> Result<TxSealed, PayError> {
@@ -338,7 +340,7 @@ fn merge_taker_zswap_complement_sealed(
             .block_on(preimage.prove(prover.clone(), segment))
             .map_err(|e| err(format!("prove taker zswap offer failed: {e:?}")))?;
         let taker_proven =
-            build_zswap_only_proven_tx(chain_id, segment, proven_offer, binding_delta);
+            build_zswap_only_proven_tx(chain_id, segment, proven_offer, binding_delta)?;
         let taker_sealed = seal_proven_tx(taker_proven)?;
         merged = merged
             .merge(&taker_sealed)
@@ -401,7 +403,7 @@ fn merge_taker_zswap_complement_proven(
         let (_seg, proven_offer) = rt
             .block_on(preimage.prove(prover.clone(), segment))
             .map_err(|e| err(format!("prove taker zswap offer failed: {e:?}")))?;
-        let taker_tx = build_zswap_only_proven_tx(chain_id, segment, proven_offer, binding_delta);
+        let taker_tx = build_zswap_only_proven_tx(chain_id, segment, proven_offer, binding_delta)?;
         merged = merged
             .merge(&taker_tx)
             .map_err(|e| err(format!("merge taker zswap partial failed: {e:?}")))?;
@@ -581,7 +583,7 @@ fn merge_taker_unshielded_complement_sealed(
 
     let intent_binding = proven_intent.binding_commitment;
     let mut unshielded_proven: TxProven = Transaction::Standard(StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents: MnHashMap::new().insert(seg, proven_intent),
         guaranteed_coins: None,
         fallible_coins: MnHashMap::new(),
@@ -763,7 +765,7 @@ fn cover_dust_fees_sealed(
         // adds partial bindings, so a zero here causes PedersenCheckFailure (185) at submit.
         let intent_binding = proven_intent.binding_commitment;
         let mut fee_proven: TxProven = Transaction::Standard(StandardTransaction {
-            network_id: super::ledger_network_id(chain_id).to_string(),
+            network_id: super::ledger_network_id(chain_id).map_err(err)?,
             intents: MnHashMap::new().insert(seg, proven_intent),
             guaranteed_coins: None,
             fallible_coins: MnHashMap::new(),
@@ -838,7 +840,7 @@ pub fn balance_sealed_transaction(
     super::tip_verify::refresh_indexer_block_height(scope, indexer_url);
     super::session_cache::invalidate_wallet_indexer_session_cache(indexer_url, scope);
 
-    match parse_maker_tx(maker_input)? {
+    match parse_maker_tx(chain_id, maker_input)? {
         ParsedMaker::Sealed(maker) => {
             let needs_shielded = !shielded_imbalances(&maker)?.is_empty();
             let mut merged = if needs_shielded {
@@ -904,7 +906,7 @@ pub fn balance_sealed_transaction(
                 scope,
                 pay_fees,
             )?;
-            super::sign::sign_and_seal(&balanced, sender_private_key)
+            super::sign::sign_and_seal(chain_id, &balanced, sender_private_key)
         }
     }
 }

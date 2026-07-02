@@ -20,6 +20,11 @@ use ows_core::ChainType;
 /// Midnight WalletEngine specification.
 pub struct MidnightSigner;
 
+/// Bech32m HRP bases used for Midnight addresses; network references must produce valid
+/// combined HRPs for each (`mn_addr_{network}`, …).
+const MIDNIGHT_ADDRESS_BASE_HRPS: &[&str] =
+    &["mn_addr", "mn_shield-addr", "mn_dust", "mn_shield-esk"];
+
 /// Extract the ledger / DApp connector network id from a CAIP-2 Midnight chain id
 /// (`midnight:<network>`).
 pub fn network_reference_from_chain_id(chain_id: &str) -> Result<String, SignerError> {
@@ -39,7 +44,40 @@ pub fn network_reference_from_chain_id(chain_id: &str) -> Result<String, SignerE
             "midnight chain id must include a network reference after 'midnight:'".into(),
         ));
     }
+    validate_network_reference(reference)?;
     Ok(reference.to_string())
+}
+
+/// Reject network references that are not safe Midnight network id strings or would produce
+/// invalid Bech32m HRPs when suffixed.
+fn validate_network_reference(network_ref: &str) -> Result<(), SignerError> {
+    if !network_ref
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(SignerError::AddressDerivationFailed(format!(
+            "invalid midnight network reference {network_ref:?}: must contain only lowercase letters, digits, and hyphens"
+        )));
+    }
+    if network_ref.starts_with('-') || network_ref.ends_with('-') {
+        return Err(SignerError::AddressDerivationFailed(format!(
+            "invalid midnight network reference {network_ref:?}: must not start or end with a hyphen"
+        )));
+    }
+    validate_network_reference_for_bech32_hrp(network_ref)
+}
+
+/// Reject network references that would produce invalid Bech32m HRPs when suffixed.
+fn validate_network_reference_for_bech32_hrp(network_ref: &str) -> Result<(), SignerError> {
+    for base in MIDNIGHT_ADDRESS_BASE_HRPS {
+        let hrp = hrp_for_network(base, network_ref);
+        Hrp::parse(&hrp).map_err(|e| {
+            SignerError::AddressDerivationFailed(format!(
+                "invalid midnight network reference {network_ref:?} (Bech32m HRP {hrp:?}): {e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// True when the network reference is mainnet (no Bech32m HRP suffix).
@@ -1021,6 +1059,27 @@ mod tests {
 
         let err = super::network_reference_from_chain_id("eip155:1").unwrap_err();
         assert!(err.to_string().contains("midnight namespace"), "{err}");
+
+        let err = super::network_reference_from_chain_id("midnight:foo/bar").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid midnight network reference"),
+            "{err}"
+        );
+
+        let err = super::network_reference_from_chain_id("midnight:Preview").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid midnight network reference"),
+            "{err}"
+        );
+
+        let err = super::network_reference_from_chain_id("midnight:-bad").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid midnight network reference"),
+            "{err}"
+        );
     }
 
     #[test]

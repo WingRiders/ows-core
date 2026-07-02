@@ -68,6 +68,7 @@ pub(super) fn sign_prove_and_seal(
     let Transaction::Standard(stx) = tx else {
         return Err(err("expected Standard transaction"));
     };
+    super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
     if stx.intents.iter().count() != 1 {
         return Err(err("expected exactly one intent segment"));
     }
@@ -89,7 +90,7 @@ pub(super) fn sign_prove_and_seal(
     // Preserve any shielded zswap offers + binding randomness from the inbound tx; the unshielded
     // offer doesn't contribute to the Pedersen binding, so the existing sum is still correct.
     let stx_unproven = StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents,
         guaranteed_coins: stx.guaranteed_coins.clone(),
         fallible_coins: stx.fallible_coins.clone(),
@@ -122,6 +123,7 @@ pub(super) fn sign_prove_and_seal(
 /// the `prove(...)` step entirely and goes straight from signed intents to a
 /// sealed `proof,pedersen-schnorr` payload.
 pub(super) fn sign_and_seal(
+    chain_id: &str,
     tx_bytes: &[u8],
     sender_private_key: &[u8; 32],
 ) -> Result<Vec<u8>, PayError> {
@@ -131,6 +133,7 @@ pub(super) fn sign_and_seal(
     let Transaction::Standard(stx) = tx else {
         return Err(err("expected Standard transaction"));
     };
+    super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
     if stx.intents.iter().count() != 1 {
         return Err(err("expected exactly one intent segment"));
     }

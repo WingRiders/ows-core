@@ -509,6 +509,7 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
     let Transaction::Standard(stx) = tx else {
         return Err(err("expected Standard transaction"));
     };
+    super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
     if stx.intents.iter().count() != 1 {
         return Err(err("expected exactly one intent segment"));
     }
@@ -581,7 +582,7 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
         PedersenRandomness,
         InMemoryDB,
     > = StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents,
         guaranteed_coins: stx.guaranteed_coins.clone(),
         fallible_coins: stx.fallible_coins.clone(),
@@ -616,6 +617,7 @@ pub(super) fn balance_unsealed_proven_standard_tx(
     let Transaction::Standard(stx) = tx else {
         return Err(err("expected Standard transaction"));
     };
+    super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
 
     let tx = if let Some(offer) = stx.guaranteed_coins.as_ref() {
         if zswap_offer_needs_shielded_inputs(offer.deref())
@@ -697,7 +699,7 @@ pub(super) fn balance_unsealed_proven_standard_tx(
         needs_dust && pay_fees,
         dust_ctime,
     )?;
-    let tx_first: TxProven = wrap_proven_standard(chain_id, &stx, seg_id, intent_out_first);
+    let tx_first: TxProven = wrap_proven_standard(chain_id, &stx, seg_id, intent_out_first)?;
 
     let intent_ttl = dust_ctime
         .map(chain_aligned_intent_ttl)
@@ -737,7 +739,7 @@ pub(super) fn balance_unsealed_proven_standard_tx(
         ttl: intent_ttl,
         binding_commitment: intent_in.binding_commitment,
     };
-    let tx_out = wrap_proven_standard(chain_id, &stx, seg_id, intent_out);
+    let tx_out = wrap_proven_standard(chain_id, &stx, seg_id, intent_out)?;
 
     let imbalances = tx_balance_imbalances(&tx_out)?;
     if !imbalances.is_empty() {
@@ -786,7 +788,7 @@ fn build_preimage_dust_actions(
         ttl,
     );
     let intents0: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_no_dust);
-    let network_id = super::ledger_network_id(chain_id);
+    let network_id = super::ledger_network_id(chain_id).map_err(err)?;
     let tx0: TxPreimage = Transaction::from_intents(&network_id, intents0);
     let tx0p = tx0
         .mock_prove()
@@ -909,7 +911,7 @@ fn cover_proven_dust_fees(
                 ttl: intent_ttl,
                 binding_commitment: intent_in.binding_commitment,
             };
-            let tx_check = wrap_proven_standard(chain_id, stx, seg_id, intent_out);
+            let tx_check = wrap_proven_standard(chain_id, stx, seg_id, intent_out)?;
             if tx_balance_imbalances(&tx_check)?.is_empty() {
                 return Ok(registration);
             }
@@ -938,7 +940,7 @@ fn cover_proven_dust_fees(
             ttl: intent_ttl,
             binding_commitment: intent_in.binding_commitment,
         };
-        let tx_check = wrap_proven_standard(chain_id, stx, seg_id, intent_out);
+        let tx_check = wrap_proven_standard(chain_id, stx, seg_id, intent_out)?;
 
         if tx_balance_imbalances(&tx_check)?.is_empty() {
             return Ok(dust_actions);
@@ -1131,13 +1133,13 @@ fn wrap_proven_standard(
     stx_in: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     seg_id: u16,
     intent_out: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
-) -> TxProven {
+) -> Result<TxProven, PayError> {
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_out);
-    Transaction::Standard(StandardTransaction {
-        network_id: super::ledger_network_id(chain_id).to_string(),
+    Ok(Transaction::Standard(StandardTransaction {
+        network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents,
         guaranteed_coins: stx_in.guaranteed_coins.clone(),
         fallible_coins: stx_in.fallible_coins.clone(),
         binding_randomness: stx_in.binding_randomness,
-    })
+    }))
 }

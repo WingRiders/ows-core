@@ -403,8 +403,15 @@ pub(crate) fn decode_midnight_transaction_input(
                 .unwrap_or([0u8; 32]),
         };
         let indexer_url = resolve_indexer_url(chain.chain_id)?;
-        let default_scope = SyncCacheScope::default();
-        let scope = sync_scope.unwrap_or(&default_scope);
+        let default_scope = SyncCacheScope::default().with_chain_id(chain.chain_id);
+        let owned_scope = sync_scope
+            .filter(|s| s.chain_id.is_none())
+            .map(|s| s.clone().with_chain_id(chain.chain_id));
+        let scope = match (sync_scope, &owned_scope) {
+            (Some(s), _) if s.chain_id.is_some() => s,
+            (_, Some(owned)) => owned,
+            _ => &default_scope,
+        };
         let shielded32 = shielded_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
         let dust32 = dust_seed.and_then(|s| <[u8; 32]>::try_from(s).ok());
         let (bytes, pay_fees, balance) = materialize_connector_request(
@@ -798,6 +805,9 @@ pub fn sign_transaction(
     }
 
     let signer = MidnightSigner;
+    let tx_network_id = super::network_id_from_midnight_wire(tx_bytes).map_err(pay_to_invalid)?;
+    super::ensure_tx_network_id_matches_chain(chain.chain_id, &tx_network_id)
+        .map_err(pay_to_invalid)?;
     let signed_wire = signer.sign_and_encode(private_key, tx_bytes)?;
     Ok(SignResult::midnight_transaction(hex::encode(&signed_wire)))
 }

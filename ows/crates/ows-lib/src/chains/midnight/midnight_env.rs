@@ -14,8 +14,7 @@ pub struct MidnightNetwork {
 
 impl MidnightNetwork {
     pub fn from_chain_id(chain_id: &str) -> Result<Self, String> {
-        let reference = network_reference_from_chain_id(chain_id)
-            .map_err(|e| e.to_string())?;
+        let reference = network_reference_from_chain_id(chain_id).map_err(|e| e.to_string())?;
         Ok(Self { reference })
     }
 
@@ -285,8 +284,7 @@ mod tests {
         assert_eq!(mainnet.reference, "mainnet");
         assert!(mainnet.is_mainnet());
 
-        let custom =
-            MidnightNetwork::from_chain_id("midnight:my-feature-testnet").unwrap();
+        let custom = MidnightNetwork::from_chain_id("midnight:my-feature-testnet").unwrap();
         assert_eq!(custom.reference, "my-feature-testnet");
         assert_eq!(custom.ledger_network_id(), "my-feature-testnet");
         assert!(!custom.is_mainnet());
@@ -295,8 +293,7 @@ mod tests {
 
     #[test]
     fn resolve_requires_chain_id() {
-        let err = MidnightNetwork::resolve(None, "https://indexer.example/graphql")
-            .unwrap_err();
+        let err = MidnightNetwork::resolve(None, "https://indexer.example/graphql").unwrap_err();
         assert!(err.contains("chain id"), "{err}");
 
         let err = MidnightNetwork::resolve(Some("not-midnight"), "https://indexer.example/graphql")
@@ -338,8 +335,7 @@ mod tests {
 
     #[test]
     fn custom_network_hrp_and_non_mainnet_defaults() {
-        let custom =
-            MidnightNetwork::from_chain_id("midnight:custom-net").expect("custom network");
+        let custom = MidnightNetwork::from_chain_id("midnight:custom-net").expect("custom network");
         assert_eq!(custom.viewing_key_hrp(), "mn_shield-esk_custom-net");
         assert!(custom.needs_dust_fee_registration());
         assert!(custom.shielded_zswap_fallback_default());
