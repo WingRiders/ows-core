@@ -162,7 +162,7 @@ pub(crate) fn ensure_tx_network_id_matches_chain(
 ) -> Result<(), PayError> {
     let expected =
         ledger_network_id(chain_id).map_err(|e| PayError::new(PayErrorCode::InvalidInput, e))?;
-    if tx_network_id != expected {
+    if !tx_network_id.eq_ignore_ascii_case(&expected) {
         return Err(PayError::new(
             PayErrorCode::InvalidInput,
             format!(
@@ -510,6 +510,12 @@ mod tests {
     #[test]
     fn ensure_tx_network_id_accepts_match() {
         super::ensure_tx_network_id_matches_chain("midnight:preview", "preview").unwrap();
+    }
+
+    #[test]
+    fn ensure_tx_network_id_accepts_case_insensitive_match() {
+        super::ensure_tx_network_id_matches_chain("midnight:preview", "Preview").unwrap();
+        super::ensure_tx_network_id_matches_chain("midnight:preprod", "Preprod").unwrap();
     }
 
     #[test]
