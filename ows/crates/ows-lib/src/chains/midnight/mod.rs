@@ -345,7 +345,21 @@ pub fn prepare_sealed_from_unsealed(
                 sync_scope,
                 pay_fees,
             )?;
-            sign::sign_and_seal(chain_id, &balanced, &key32)
+            if pay_fees && balance::proven_balanced_tx_needs_separate_dust_fee_segment(&balanced) {
+                let Some(dust_seed) = dust_seed32 else {
+                    return sign::sign_and_seal(chain_id, &balanced, &key32);
+                };
+                sign::sign_and_seal_with_separate_dust_fees(
+                    chain_id,
+                    indexer_url,
+                    &balanced,
+                    &key32,
+                    dust_seed,
+                    sync_scope,
+                )
+            } else {
+                sign::sign_and_seal(chain_id, &balanced, &key32)
+            }
         }
     }
 }
@@ -519,5 +533,18 @@ mod tests {
             super::network_id_from_midnight_wire(&preview_sealed).unwrap(),
             "preview"
         );
+    }
+
+    #[test]
+    fn withdraw_dapp_inbound_fixture_is_proven_unsealed_payload() {
+        let hex_s = include_str!("../../../tests/withdraw_dapp_inbound_fresh.hex");
+        let bytes = hex::decode(hex_s.trim()).expect("hex");
+        assert_eq!(
+            classify_unsealed_payload(&bytes),
+            Some(UnsealedKind::Proven),
+            "dapp withdraw inbound must use proof,embedded-fr header"
+        );
+        assert!(is_balance_unsealed_payload(&bytes));
+        assert!(!is_sealed_midnight_payload(&bytes));
     }
 }

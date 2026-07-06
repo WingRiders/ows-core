@@ -533,6 +533,44 @@ fn preferred_unshielded_offer_segment<
 
 /// Attach dapp-provided non-NIGHT outputs on the ledger segment that matches
 /// contract transcript credits (guaranteed vs fallible).
+fn offer_is_outputs_only(offer: Option<&UnshieldedOffer<MnSig, InMemoryDB>>) -> bool {
+    match offer {
+        Some(o) => o.inputs.iter().count() == 0 && o.outputs.iter().count() > 0,
+        None => false,
+    }
+}
+
+/// Dapp-proven contract withdraw/deposit: guaranteed offer is outputs-only and every
+/// output token is credited on a guaranteed transcript. Rebuilding unshielded offers
+/// (promoting NIGHT to fallible for dust registration) breaks effects checks (ledger 169).
+fn proven_intent_preserves_unshielded_offers<
+    P: ProofKind<InMemoryDB>,
+    B: midnight_storage::Storable<InMemoryDB>,
+>(
+    intent: &Intent<MnSig, P, B, InMemoryDB>,
+    seg_id: u16,
+) -> bool {
+    if intent.dust_actions.is_some() {
+        return false;
+    }
+    if !contract_unshielded_deposit_needs(intent, seg_id).is_empty() {
+        return false;
+    }
+    if intent.fallible_unshielded_offer.is_some() {
+        return false;
+    }
+    let Some(guaranteed) = intent.guaranteed_unshielded_offer.as_deref() else {
+        return false;
+    };
+    if !offer_is_outputs_only(Some(guaranteed)) {
+        return false;
+    }
+    guaranteed
+        .outputs
+        .iter_deref()
+        .all(|o| preferred_unshielded_offer_segment(intent, seg_id, o.type_) == 0)
+}
+
 fn route_and_apply_preserved_outputs<
     P: ProofKind<InMemoryDB>,
     B: midnight_storage::Storable<InMemoryDB>,
@@ -1649,91 +1687,115 @@ pub(super) fn balance_unsealed_proven_standard_tx(
     let (seg_id_sp, intent_sp) = pair_sp.deref();
     let seg_id: u16 = *seg_id_sp.deref();
     let intent_in = intent_sp.deref().clone();
+    let preserve_offers = proven_intent_preserves_unshielded_offers(&intent_in, seg_id);
 
-    let outputs_in: Vec<UtxoOutput> = intent_in
-        .guaranteed_unshielded_offer
-        .as_ref()
-        .map(|sp| {
-            sp.deref()
-                .outputs
-                .iter_deref()
-                .map(|o| UtxoOutput {
-                    value: o.value,
-                    owner: o.owner,
-                    type_: o.type_,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let fallible_outputs_in = outputs_from_offer(intent_in.fallible_unshielded_offer.as_ref());
     let rt = super::async_runtime::runtime();
     let indexer_tip = Some(fetch_indexer_tip_blocking(rt, indexer_url)?);
     let dust_ctime = indexer_tip
         .as_ref()
         .map(|(_, ts)| Timestamp::from_secs(*ts));
-    let mut bal = build_balanced_unshielded_offers(
-        rt,
-        chain_id,
-        indexer_url,
-        sender_private_key,
-        outputs_in,
-        fallible_outputs_in,
-        scope,
-        dust_ctime,
-    )?;
-    route_and_apply_preserved_outputs(&mut bal, seg_id, &intent_in);
-    attach_contract_unshielded_deposit_inputs(
-        rt,
-        chain_id,
-        indexer_url,
-        sender_private_key,
-        scope,
-        seg_id,
-        &intent_in,
-        &mut bal,
-    )?;
 
-    // First pass: assemble intent / tx with an unsigned dust registration (placeholder
-    // `allow_fee_payment` = 0) so we can ask the ledger for an accurate fee estimate
-    // before we know the real `allow_fee_payment`.
-    let intent_out_first = assemble_proven_intent(
-        &intent_in,
-        &bal,
-        dust_seed,
-        sender_private_key,
-        pay_fees,
-        dust_ctime,
-    )?;
-    let tx_first: TxProven = wrap_proven_standard(chain_id, &stx, seg_id, intent_out_first)?;
+    let mut bal = if preserve_offers {
+        balanced_unshielded_from_intent(&intent_in)
+    } else {
+        let outputs_in: Vec<UtxoOutput> = intent_in
+            .guaranteed_unshielded_offer
+            .as_ref()
+            .map(|sp| {
+                sp.deref()
+                    .outputs
+                    .iter_deref()
+                    .map(|o| UtxoOutput {
+                        value: o.value,
+                        owner: o.owner,
+                        type_: o.type_,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fallible_outputs_in = outputs_from_offer(intent_in.fallible_unshielded_offer.as_ref());
+        let mut bal = build_balanced_unshielded_offers(
+            rt,
+            chain_id,
+            indexer_url,
+            sender_private_key,
+            outputs_in,
+            fallible_outputs_in,
+            scope,
+            dust_ctime,
+        )?;
+        route_and_apply_preserved_outputs(&mut bal, seg_id, &intent_in);
+        attach_contract_unshielded_deposit_inputs(
+            rt,
+            chain_id,
+            indexer_url,
+            sender_private_key,
+            scope,
+            seg_id,
+            &intent_in,
+            &mut bal,
+        )?;
+        bal
+    };
 
+    let defer_dust_to_fee_segment = preserve_offers && pay_fees;
     let intent_ttl = dust_ctime
         .map(chain_aligned_intent_ttl)
         .unwrap_or(intent_in.ttl);
 
-    let dust_actions = if pay_fees {
-        if intent_in.dust_actions.is_some() {
-            return Err(err("existing dust actions are not supported yet"));
-        }
-        let seed = dust_seed.ok_or_else(|| err("Midnight requires dust seed"))?;
-        let (ledger_params, tip_secs) = indexer_tip
-            .as_ref()
-            .map(|(lp, ts)| (lp, *ts))
-            .ok_or_else(|| err("Midnight requires chain timestamp for dust"))?;
-        let dust_ctx = DustActionBuildContext {
-            rt,
-            indexer_url,
-            sender_private_key,
-            seed,
-            scope,
-            dust_ctime: Timestamp::from_secs(tip_secs),
-            ledger_params,
+    let (tx_first, dust_actions) = if defer_dust_to_fee_segment {
+        let intent_out = Intent {
+            guaranteed_unshielded_offer: bal.guaranteed.clone().map(Sp::new),
+            fallible_unshielded_offer: bal.fallible.clone().map(Sp::new),
+            actions: intent_in.actions.clone(),
+            dust_actions: None,
+            ttl: intent_ttl,
+            binding_commitment: intent_in.binding_commitment,
         };
-        Some(cover_proven_dust_fees(
-            chain_id, &dust_ctx, &mut bal, &tx_first, &stx, seg_id, &intent_in, intent_ttl,
-        )?)
+        (
+            wrap_proven_standard(chain_id, &stx, seg_id, intent_out)?,
+            None,
+        )
     } else {
-        None
+        // First pass: assemble intent / tx with an unsigned dust registration (placeholder
+        // `allow_fee_payment` = 0) so we can ask the ledger for an accurate fee estimate
+        // before we know the real `allow_fee_payment`.
+        let intent_out_first = assemble_proven_intent(
+            &intent_in,
+            &bal,
+            dust_seed,
+            sender_private_key,
+            pay_fees,
+            dust_ctime,
+        )?;
+        let tx_first = wrap_proven_standard(chain_id, &stx, seg_id, intent_out_first)?;
+        let dust_actions = if pay_fees {
+            if intent_in.dust_actions.is_some() {
+                return Err(err("existing dust actions are not supported yet"));
+            }
+            let seed = dust_seed.ok_or_else(|| err("Midnight requires dust seed"))?;
+            let (ledger_params, tip_secs) = indexer_tip
+                .as_ref()
+                .map(|(lp, ts)| (lp, *ts))
+                .ok_or_else(|| err("Midnight requires chain timestamp for dust"))?;
+            let dust_ctx = DustActionBuildContext {
+                rt,
+                indexer_url,
+                sender_private_key,
+                seed,
+                scope,
+                dust_ctime: Timestamp::from_secs(tip_secs),
+                ledger_params,
+            };
+            Some(cover_proven_dust_fees(
+                chain_id, &dust_ctx, &mut bal, &tx_first, &stx, seg_id, &intent_in, intent_ttl,
+            )?)
+        } else {
+            None
+        };
+        (tx_first, dust_actions)
     };
+    let _ = tx_first;
 
     let intent_out: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> = Intent {
         guaranteed_unshielded_offer: bal.guaranteed.clone().map(Sp::new),
@@ -1756,6 +1818,23 @@ pub(super) fn balance_unsealed_proven_standard_tx(
     let mut out = Vec::new();
     tagged_serialize(&tx_out, &mut out).map_err(|e| err(format!("serialize tx: {e}")))?;
     Ok(out)
+}
+
+/// True when a balanced proven payload still needs a merged dust-fee intent segment.
+pub(super) fn proven_balanced_tx_needs_separate_dust_fee_segment(tx_bytes: &[u8]) -> bool {
+    let mut r: &[u8] = tx_bytes;
+    let Ok(tx) = tagged_deserialize::<TxProven>(&mut r) else {
+        return false;
+    };
+    let Transaction::Standard(stx) = tx else {
+        return false;
+    };
+    for pair in stx.intents.iter() {
+        if pair.deref().1.deref().dust_actions.is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 fn mock_prove_fee_dust(
@@ -3477,6 +3556,203 @@ mod tests {
         );
     }
 
+    /// Regression: `sendNightTokensToUser` withdraw from midnight-wallet-dapp (preview network,
+    /// fixtures under `ows-lib/tests/withdraw_dapp_*.hex`) must keep the dapp-proven guaranteed
+    /// NIGHT output on the guaranteed segment (ledger error 169 / InvalidDustRegistrationSignature
+    /// when rebalancing promotes NIGHT to fallible).
+    mod withdraw_dapp_regression {
+        use super::super::{
+            balanced_unshielded_from_intent, proven_balanced_tx_needs_separate_dust_fee_segment,
+            proven_intent_preserves_unshielded_offers,
+        };
+        use super::*;
+        use midnight_base_crypto::signatures::Signature as MnSig;
+        use midnight_ledger::structure::ProofMarker;
+        use midnight_serialize::{tagged_deserialize, tagged_serialize};
+        use std::ops::Deref as _;
+
+        type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
+
+        fn load_withdraw_inbound() -> (
+            StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+            u16,
+            Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+        ) {
+            let hex_s = include_str!("../../../tests/withdraw_dapp_inbound_fresh.hex");
+            let bytes = hex::decode(hex_s.trim()).expect("hex");
+            let mut r: &[u8] = &bytes;
+            let tx: TxProven = tagged_deserialize(&mut r).expect("deserialize");
+            let Transaction::Standard(stx) = tx else {
+                panic!("expected standard transaction");
+            };
+            assert_eq!(
+                stx.intents.iter().count(),
+                1,
+                "withdraw inbound must have exactly one intent segment"
+            );
+            let pair = stx.intents.iter().next().expect("one intent");
+            let seg = *pair.deref().0.deref();
+            let intent = pair.deref().1.deref().clone();
+            (stx, seg, intent)
+        }
+
+        fn night_output_values(offer: Option<&UnshieldedOffer<MnSig, InMemoryDB>>) -> Vec<u128> {
+            offer
+                .map(|o| {
+                    o.outputs
+                        .iter_deref()
+                        .filter(|out| out.type_ == NIGHT)
+                        .map(|out| out.value)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        #[test]
+        fn inbound_fixture_is_outputs_only_guaranteed_withdraw() {
+            let (_stx, _seg, intent) = load_withdraw_inbound();
+            assert!(intent.fallible_unshielded_offer.is_none());
+            assert!(intent.dust_actions.is_none());
+            let guaranteed = intent
+                .guaranteed_unshielded_offer
+                .as_ref()
+                .map(|sp| sp.deref())
+                .expect("guaranteed unshielded offer");
+            assert_eq!(guaranteed.inputs.iter().count(), 0, "outputs-only withdraw");
+            let night_out = night_output_values(Some(guaranteed));
+            assert_eq!(night_out.len(), 1, "single NIGHT credit output");
+            assert!(night_out[0] > 0);
+        }
+
+        #[test]
+        fn inbound_fixture_selects_preserve_unshielded_path() {
+            let (_stx, seg, intent) = load_withdraw_inbound();
+            assert!(proven_intent_preserves_unshielded_offers(&intent, seg));
+        }
+
+        /// Document the pre-fix failure mode: generic NIGHT balancing drops guaranteed credits.
+        #[test]
+        fn naive_rebalance_moves_night_off_guaranteed_segment() {
+            let (_stx, seg, intent) = load_withdraw_inbound();
+            let guaranteed = intent
+                .guaranteed_unshielded_offer
+                .as_ref()
+                .map(|sp| sp.deref())
+                .expect("guaranteed offer");
+            let night_out: Vec<UtxoOutput> = guaranteed
+                .outputs
+                .iter_deref()
+                .filter(|o| o.type_ == NIGHT)
+                .cloned()
+                .collect();
+            assert!(!night_out.is_empty());
+
+            let mut bal = plan_preview(&night_utxos(8, STARS_PER_NIGHT, true), night_out, vec![]);
+            route_and_apply_preserved_outputs(&mut bal, seg, &intent);
+
+            assert!(
+                night_output_values(bal.guaranteed.as_ref()).is_empty(),
+                "naive rebalance must not leave NIGHT on guaranteed (this caused ledger error 169)"
+            );
+            assert!(
+                !night_output_values(bal.fallible.as_ref()).is_empty(),
+                "naive rebalance incorrectly promotes withdraw NIGHT to fallible"
+            );
+        }
+
+        #[test]
+        fn preserved_balance_keeps_night_on_guaranteed_and_defers_dust() {
+            let (_stx, seg, intent) = load_withdraw_inbound();
+            let inbound_night = night_output_values(
+                intent
+                    .guaranteed_unshielded_offer
+                    .as_ref()
+                    .map(|sp| sp.deref()),
+            );
+
+            let bal = balanced_unshielded_from_intent(&intent);
+            assert_eq!(
+                night_output_values(bal.guaranteed.as_ref()),
+                inbound_night,
+                "preserve path must clone guaranteed NIGHT outputs verbatim"
+            );
+            assert!(bal.fallible.is_none());
+
+            let intent_out = Intent {
+                guaranteed_unshielded_offer: bal.guaranteed.clone().map(Sp::new),
+                fallible_unshielded_offer: None,
+                actions: intent.actions.clone(),
+                dust_actions: None,
+                ttl: intent.ttl,
+                binding_commitment: intent.binding_commitment,
+            };
+
+            let tx_out: TxProven = Transaction::Standard(StandardTransaction {
+                network_id: ledger_network_id(CHAIN_ID).unwrap(),
+                intents: StorageHashMap::new().insert(seg, intent_out),
+                guaranteed_coins: None,
+                fallible_coins: StorageHashMap::new(),
+                binding_randomness: PedersenRandomness::default(),
+            });
+            let mut bytes = Vec::new();
+            tagged_serialize(&tx_out, &mut bytes).expect("serialize");
+            assert!(
+                proven_balanced_tx_needs_separate_dust_fee_segment(&bytes),
+                "withdraw must defer dust to a merged fee-only intent segment"
+            );
+        }
+
+        /// Pre-fix sealed output (ledger error 169 on submit) no longer matches the preserved shape.
+        #[test]
+        fn sealed_fail_fixture_lost_guaranteed_night_credit() {
+            use transient_crypto::commitment::PureGeneratorPedersen;
+
+            type SealedTx = Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
+
+            let (_, seg, inbound_intent) = load_withdraw_inbound();
+            let inbound_night = night_output_values(
+                inbound_intent
+                    .guaranteed_unshielded_offer
+                    .as_ref()
+                    .map(|sp| sp.deref()),
+            );
+
+            let hex_s = include_str!("../../../tests/withdraw_dapp_sealed_fail.hex");
+            let bytes = hex::decode(hex_s.trim()).expect("hex");
+            let mut r: &[u8] = &bytes;
+            let tx: SealedTx = tagged_deserialize(&mut r).expect("deserialize");
+            let Transaction::Standard(stx) = tx else {
+                panic!("expected standard");
+            };
+            let fail_intent = stx
+                .intents
+                .iter()
+                .find(|p| *p.deref().0.deref() == seg)
+                .expect("contract segment")
+                .deref()
+                .1
+                .deref()
+                .clone();
+            let fail_guaranteed_night = night_output_values(
+                fail_intent
+                    .guaranteed_unshielded_offer
+                    .as_ref()
+                    .map(|sp| sp.deref()),
+            );
+            let fail_fallible_night = night_output_values(
+                fail_intent
+                    .fallible_unshielded_offer
+                    .as_ref()
+                    .map(|sp| sp.deref()),
+            );
+
+            assert!(
+                fail_guaranteed_night != inbound_night || !fail_fallible_night.is_empty(),
+                "pre-fix sealed tx must not keep outputs-only guaranteed NIGHT (regression guard)"
+            );
+        }
+    }
+
     /// Inbound `receiveTokens` deposit txs from the dapp must declare their unshielded
     /// deposit needs on the contract intent segment so balancing can attach wallet spends.
     #[test]
@@ -3559,6 +3835,26 @@ mod tests {
             imbalances.is_empty(),
             "expected balanced tx, got {imbalances:?}"
         );
+    }
+
+    #[test]
+    fn proven_intent_preserves_guaranteed_night_withdraw_outputs_only() {
+        let intent = intent_with_call(contract_call_with_transcripts(
+            Some(effects_with_unshielded_output(NIGHT, 2_501)),
+            None,
+        ));
+        let mut guaranteed = make_unshielded_offer(
+            vec![],
+            vec![UtxoOutput {
+                value: 2_501,
+                owner: sender_user(),
+                type_: NIGHT,
+            }],
+        );
+        guaranteed.signatures = vec![].into();
+        let mut intent = intent;
+        intent.guaranteed_unshielded_offer = Some(Sp::new(guaranteed));
+        assert!(super::proven_intent_preserves_unshielded_offers(&intent, 1));
     }
 
     #[test]

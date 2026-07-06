@@ -16,8 +16,8 @@ const LEDGER_BALANCE_CHECK_OUT_OF_BOUNDS: u16 = 192;
 const LEDGER_BALANCE_CHECK_OVERSPEND: u16 = 138;
 /// Node ledger code for DUST spend proof verification failed (`InvalidTransaction::Custom(170)`).
 const LEDGER_INVALID_DUST_SPEND_PROOF: u16 = 170;
-/// DUST registration Schnorr signature failed (`InvalidTransaction::Custom(186)`).
-const LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE: u16 = 186;
+/// DUST registration Schnorr signature failed (`InvalidTransaction::Custom(169)`).
+const LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE: u16 = 169;
 /// Pedersen binding commitment mismatch (`InvalidTransaction::Custom(185)`).
 const LEDGER_PEDERSEN_CHECK_FAILURE: u16 = 185;
 /// Zswap apply failure: unknown Merkle root, double-spend, etc. (`InvalidTransaction::Custom(103)`).
@@ -206,8 +206,8 @@ fn append_invalid_dust_registration_hint(msg: &mut String) {
         msg.push_str(&format!(
             "\n\nLedger error {LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE} \
              (InvalidDustRegistrationSignature): generationless DUST registration was not signed \
-             correctly for the final intent (often after balancing dropped contract claim outputs \
-             from the guaranteed segment). Rebuild with a current `ows` and retry `ows sign send-tx`."
+             correctly for the final intent. Rebuild with a current `ows` and retry \
+             `ows sign send-tx` with a fresh dapp tx."
         ));
     }
 }

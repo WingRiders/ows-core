@@ -174,6 +174,10 @@ unsealed ledger bytes, optionally loads shielded + dust seeds, then:
 Imbalanced `makeIntent` offers (atomic swap) must be **`balanceSealedTransaction`**’d by a
 counterparty before submit — see [swap-intent.md](./swap-intent.md).
 
+**Dapp withdraw balancing.** Dapp-proven contract withdraws with outputs-only guaranteed NIGHT
+credits must not be rebalanced onto the fallible segment; OWS preserves those offers and attaches
+DUST fees in a separate merged intent segment instead.
+
 ### 3. Fund balance
 
 `ows fund balance --chain midnight:*` bypasses MoonPay and prints unshielded + shielded + DUST

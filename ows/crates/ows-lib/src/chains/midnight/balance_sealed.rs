@@ -1122,6 +1122,31 @@ fn cover_dust_fees_sealed(
     Ok(merged)
 }
 
+/// Merge a dust-only fee intent into an already-signed sealed transaction.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attach_dust_fees_to_sealed(
+    chain_id: &str,
+    indexer_url: &str,
+    sender_private_key: &[u8; 32],
+    dust_seed: [u8; 32],
+    scope: &SyncCacheScope,
+    sealed_bytes: &[u8],
+) -> Result<Vec<u8>, PayError> {
+    let mut r: &[u8] = sealed_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut r)
+        .map_err(|e| err(format!("failed to parse sealed tx bytes: {e}")))?;
+    let merged = cover_dust_fees_sealed(
+        chain_id,
+        indexer_url,
+        sender_private_key,
+        dust_seed,
+        scope,
+        tx,
+        true,
+    )?;
+    serialize_sealed(merged)
+}
+
 fn serialize_sealed(tx: TxSealed) -> Result<Vec<u8>, PayError> {
     let mut out = Vec::new();
     tagged_serialize(&tx, &mut out).map_err(|e| err(format!("serialize sealed tx: {e}")))?;

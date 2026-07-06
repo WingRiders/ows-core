@@ -9,6 +9,7 @@
 //!   produced by [`super::balance::balance_unsealed_proven_standard_tx`]); the
 //!   ZK proofs are already in place so we only need to sign + seal.
 
+use super::cache_io::SyncCacheScope;
 use super::error::{PayError, PayErrorCode};
 use midnight_base_crypto::signatures::{Signature, SigningKey as MidnightSigningKey};
 use midnight_ledger::structure::{
@@ -189,6 +190,27 @@ pub(super) fn sign_and_seal(
     let mut out = Vec::new();
     tagged_serialize(&sealed, &mut out).map_err(|e| err(format!("serialize sealed tx: {e}")))?;
     Ok(out)
+}
+
+/// Sign + seal a balanced proven tx, then merge a dust-only fee intent when needed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sign_and_seal_with_separate_dust_fees(
+    chain_id: &str,
+    indexer_url: &str,
+    tx_bytes: &[u8],
+    sender_private_key: &[u8; 32],
+    dust_seed: [u8; 32],
+    scope: &SyncCacheScope,
+) -> Result<Vec<u8>, PayError> {
+    let sealed = sign_and_seal(chain_id, tx_bytes, sender_private_key)?;
+    super::balance_sealed::attach_dust_fees_to_sealed(
+        chain_id,
+        indexer_url,
+        sender_private_key,
+        dust_seed,
+        scope,
+        &sealed,
+    )
 }
 
 #[cfg(test)]
