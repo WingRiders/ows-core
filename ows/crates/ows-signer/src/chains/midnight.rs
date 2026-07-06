@@ -547,8 +547,9 @@ impl MidnightSigner {
     /// Parse a tagged `midnight:transaction` blob, sign **all** guaranteed unshielded inputs that
     /// match this key (same owner as `private_key`), and return re-serialized tagged bytes.
     ///
-    /// Unsupported today: contract actions, **dust spends** (ZK proofs), fallible unshielded spends, and
+    /// Unsupported today: contract actions, **dust spends** (ZK proofs), and
     /// partially-owned guaranteed inputs (every guaranteed input must be spendable by this key).
+    /// Fallible unshielded inputs owned by this key are supported.
     ///
     /// **Dust registrations** (fee allowance without spends) are supported: each registration must
     /// bind the same Night verifying key as this `private_key`.
@@ -653,14 +654,21 @@ impl MidnightSigner {
                     };
 
                 if !intent.fallible_inputs().is_empty() {
-                    return Err(SignerError::InvalidTransaction(
-                        "fallible unshielded inputs are not supported by sign_and_encode".into(),
-                    ));
+                    for inp in intent.fallible_inputs() {
+                        if inp.owner != vk {
+                            return Err(SignerError::InvalidTransaction(
+                                "all fallible unshielded inputs must be owned by the signing key"
+                                    .into(),
+                            ));
+                        }
+                    }
                 }
 
                 let guaranteed_inputs = intent.guaranteed_inputs();
+                let fallible_inputs = intent.fallible_inputs();
                 let n_g = guaranteed_inputs.len();
-                if n_g == 0 && dust_registration_keys.is_empty() {
+                let n_f = fallible_inputs.len();
+                if n_g == 0 && n_f == 0 && dust_registration_keys.is_empty() {
                     intents_out = intents_out.insert(seg_id, intent);
                     continue;
                 }
@@ -674,9 +682,16 @@ impl MidnightSigner {
                         }
                     }
                 }
-                let keys = vec![ledger_sk.clone(); n_g];
+                let g_keys = vec![ledger_sk.clone(); n_g];
+                let f_keys = vec![ledger_sk.clone(); n_f];
                 let signed = intent
-                    .sign(&mut OsRng, seg_id, &keys, &[], &dust_registration_keys)
+                    .sign(
+                        &mut OsRng,
+                        seg_id,
+                        &g_keys,
+                        &f_keys,
+                        &dust_registration_keys,
+                    )
                     .map_err(|e| {
                         SignerError::InvalidTransaction(format!("intent signing failed: {e:?}"))
                     })?;
@@ -1185,6 +1200,63 @@ mod tests {
             SignerError::InvalidTransaction(_) => {}
             other => panic!("expected InvalidTransaction, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sign_and_encode_accepts_fallible_unshielded_inputs() {
+        use midnight_base_crypto::hash::HashOutput;
+        use midnight_base_crypto::signatures::Signature as MnSig;
+        use midnight_base_crypto::signatures::SigningKey as LedgerSigningKey;
+        use midnight_base_crypto::time::Timestamp;
+        use midnight_coin_structure::coin::NIGHT;
+        use midnight_ledger::structure::{
+            Intent, IntentHash, ProofKind, ProofPreimageMarker, Transaction, UnshieldedOffer,
+            UtxoSpend, STARS_PER_NIGHT,
+        };
+        use midnight_serialize::tagged_serialize;
+        use midnight_storage::db::InMemoryDB;
+        use midnight_storage::storage::HashMap as MnHashMap;
+        use rand::rngs::OsRng;
+
+        let private_key = [9u8; 32];
+        let ledger_sk = LedgerSigningKey::from_bytes(&private_key).unwrap();
+        let vk = ledger_sk.verifying_key();
+
+        let spend = UtxoSpend {
+            value: STARS_PER_NIGHT,
+            owner: vk,
+            type_: NIGHT,
+            intent_hash: IntentHash(HashOutput([7u8; 32])),
+            output_no: 0,
+        };
+        let fallible = UnshieldedOffer::<MnSig, InMemoryDB> {
+            inputs: vec![spend].into(),
+            outputs: vec![].into(),
+            signatures: vec![].into(),
+        };
+        let mut rng = OsRng;
+        let intent = Intent::new(
+            &mut rng,
+            None,
+            Some(fallible),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Timestamp::from_secs(1_700_000_000),
+        );
+        let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(1, intent);
+        let tx: Transaction<
+            MnSig,
+            ProofPreimageMarker,
+            <ProofPreimageMarker as ProofKind<InMemoryDB>>::Pedersen,
+            InMemoryDB,
+        > = Transaction::from_intents("preview", intents);
+        let mut tx_bytes = Vec::new();
+        tagged_serialize(&tx, &mut tx_bytes).expect("serialize tx");
+
+        MidnightSigner::sign_and_encode(&MidnightSigner, &private_key, &tx_bytes)
+            .expect("fallible unshielded inputs should be signable");
     }
 
     #[test]

@@ -610,10 +610,18 @@ fn merge_taker_unshielded_complement_sealed(
     Ok(merged)
 }
 
+#[allow(clippy::type_complexity)]
 fn signing_key_vectors(
     intent: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     signing_key: &MidnightSigningKey,
-) -> Result<(Vec<MidnightSigningKey>, Vec<MidnightSigningKey>), PayError> {
+) -> Result<
+    (
+        Vec<MidnightSigningKey>,
+        Vec<MidnightSigningKey>,
+        Vec<MidnightSigningKey>,
+    ),
+    PayError,
+> {
     let vk = signing_key.verifying_key();
     for inp in &intent.guaranteed_inputs() {
         if inp.owner != vk {
@@ -622,14 +630,23 @@ fn signing_key_vectors(
             ));
         }
     }
+    for inp in &intent.fallible_inputs() {
+        if inp.owner != vk {
+            return Err(err(
+                "all fallible unshielded inputs must be owned by the signing key",
+            ));
+        }
+    }
     let n_g = intent.guaranteed_inputs().len();
+    let n_f = intent.fallible_inputs().len();
     let g_keys = vec![signing_key.clone(); n_g];
+    let f_keys = vec![signing_key.clone(); n_f];
     let n_regs = intent
         .dust_actions
         .as_ref()
         .map(|da| da.registrations.len())
         .unwrap_or(0);
-    Ok((g_keys, vec![signing_key.clone(); n_regs]))
+    Ok((g_keys, f_keys, vec![signing_key.clone(); n_regs]))
 }
 
 fn sign_proven_intent_segment(
@@ -641,10 +658,10 @@ fn sign_proven_intent_segment(
         return Ok(());
     };
     let intent = pair.deref().1.deref().clone();
-    let (g_keys, reg_keys) = signing_key_vectors(&intent, signing_key)?;
+    let (g_keys, f_keys, reg_keys) = signing_key_vectors(&intent, signing_key)?;
     let mut rng = OsRng;
     let signed = intent
-        .sign(&mut rng, seg_id, &g_keys, &[], &reg_keys)
+        .sign(&mut rng, seg_id, &g_keys, &f_keys, &reg_keys)
         .map_err(|e| err(format!("intent signing failed for segment {seg_id}: {e:?}")))?;
     stx.intents = stx.intents.insert(seg_id, signed);
     Ok(())

@@ -32,8 +32,8 @@ type TxProvenUnsealed = Transaction<Signature, ProofMarker, PedersenRandomness, 
 type TxSealed = Transaction<Signature, ProofMarker, PedSealed, InMemoryDB>;
 
 /// Inline helper for both flows: build the signing-key vectors that `Intent::sign(...)`
-/// expects (one entry per guaranteed unshielded input / per dust registration), and
-/// verify that every guaranteed input is owned by the signing key.
+/// expects (one entry per guaranteed/fallible unshielded input / per dust registration), and
+/// verify that every input is owned by the signing key.
 macro_rules! signing_key_vectors {
     ($intent:expr, $signing_key:expr) => {{
         let vk = $signing_key.verifying_key();
@@ -44,15 +44,24 @@ macro_rules! signing_key_vectors {
                 ));
             }
         }
+        for inp in &$intent.fallible_inputs() {
+            if inp.owner != vk {
+                return Err(err(
+                    "all fallible unshielded inputs must be owned by the signing key",
+                ));
+            }
+        }
         let n_g = $intent.guaranteed_inputs().len();
+        let n_f = $intent.fallible_inputs().len();
         let g_keys = vec![$signing_key.clone(); n_g];
+        let f_keys = vec![$signing_key.clone(); n_f];
         let n_regs = $intent
             .dust_actions
             .as_ref()
             .map(|da| da.registrations.len())
             .unwrap_or(0);
         let reg_keys = vec![$signing_key.clone(); n_regs];
-        (g_keys, reg_keys)
+        (g_keys, f_keys, reg_keys)
     }};
 }
 
@@ -79,11 +88,11 @@ pub(super) fn sign_prove_and_seal(
 
     let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
         .map_err(|e| err(format!("invalid midnight signing key: {e}")))?;
-    let (g_keys, reg_keys) = signing_key_vectors!(intent, signing_key);
+    let (g_keys, f_keys, reg_keys) = signing_key_vectors!(intent, signing_key);
 
     let mut rng = OsRng;
     let intent_signed = intent
-        .sign(&mut rng, seg_id, &g_keys, &[], &reg_keys)
+        .sign(&mut rng, seg_id, &g_keys, &f_keys, &reg_keys)
         .map_err(|e| err(format!("intent signing failed: {e:?}")))?;
 
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_signed);
@@ -144,11 +153,11 @@ pub(super) fn sign_and_seal(
 
     let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
         .map_err(|e| err(format!("invalid midnight signing key: {e}")))?;
-    let (g_keys, reg_keys) = signing_key_vectors!(intent, signing_key);
+    let (g_keys, f_keys, reg_keys) = signing_key_vectors!(intent, signing_key);
 
     let mut rng = OsRng;
     let intent_signed = intent
-        .sign(&mut rng, seg_id, &g_keys, &[], &reg_keys)
+        .sign(&mut rng, seg_id, &g_keys, &f_keys, &reg_keys)
         .map_err(|e| err(format!("intent signing failed: {e:?}")))?;
 
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_signed);
