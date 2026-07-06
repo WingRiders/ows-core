@@ -122,30 +122,18 @@ fn post_submit_timeout_error(
     )
 }
 
-/// Wait for the indexer to index `ledger_tx_hash`, refresh local snapshots, then return.
-///
-/// Post-submit indexer sync must finish before `sign send-tx` returns; timeout is an error so
-/// the next sign does not build DUST spends from stale ledger state (tx may already be on-chain).
-/// Session cache is always cleared; disk snapshots are updated when sync succeeds.
-#[allow(clippy::too_many_arguments)]
-pub async fn refresh_after_submit(
+/// Poll until the indexer and on-disk snapshots reflect `ledger_tx_hash`.
+pub(super) async fn ensure_submitted_tx_reflected(
     indexer_url: &str,
     scope: &SyncCacheScope,
     ledger_tx_hash: &str,
-    sealed_bytes: &[u8],
+    plan: PostSubmitSyncPlan,
     unshielded_address: Option<&str>,
     shielded_seed: Option<&[u8; 32]>,
     dust_seed: Option<&[u8; 32]>,
+    wait_timeout: Duration,
 ) -> Result<(), PayError> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
-    session_cache::invalidate_site(scope, &fp);
-
-    let wait_timeout = post_submit_indexer_wait_timeout();
-    if wait_timeout.as_secs() == 0 {
-        return Ok(());
-    }
-
-    let plan = plan_from_sealed_tx(sealed_bytes);
     let sync_dust_after_submit = dust_seed.is_some() || plan.needs_dust;
     let target = normalize_ledger_tx_hash(ledger_tx_hash);
     let log = midnight_sync_log_enabled();
@@ -349,10 +337,13 @@ pub async fn refresh_after_submit(
                     }
                 }
                 Some(seed) => {
-                    if plan.needs_dust_spends_in_tx && tx_summary.dust_ledger_event_count == 0 {
+                    let waiting_for_indexed_dust = (plan.needs_dust
+                        || tx_summary.dust_ledger_event_count > 0)
+                        && tx_summary.dust_ledger_event_count == 0;
+                    if waiting_for_indexed_dust {
                         ready = false;
                         last_blocker = Some(format!(
-                            "tx {target} indexed but dustLedgerEvents empty (tx included DUST spends)"
+                            "tx {target} indexed but dustLedgerEvents empty (expected dust ledger events)"
                         ));
                         if log {
                             eprintln!(
@@ -362,8 +353,15 @@ pub async fn refresh_after_submit(
                         }
                     } else {
                         let dsk = midnight_ledger::dust::DustSecretKey::derive_secret_key(seed);
-                        match dust_sync::sync_dust_local_state_scoped(indexer_url, &dsk, &scope)
-                            .await
+                        let mut dust_opts = dust_sync::DustSyncOptions::default();
+                        dust_opts.min_required_event_id = tx_summary.max_dust_ledger_event_id;
+                        match dust_sync::sync_dust_local_state_scoped_with_options(
+                            indexer_url,
+                            &dsk,
+                            &scope,
+                            dust_opts,
+                        )
+                        .await
                         {
                             Ok(_) => {
                                 let cursor = dust_sync::snapshot_last_seen_dust_event_id_for_key(
@@ -384,6 +382,17 @@ pub async fn refresh_after_submit(
                                                 last_blocker.as_deref().unwrap_or("")
                                             );
                                         }
+                                    }
+                                } else if plan.needs_dust {
+                                    ready = false;
+                                    last_blocker = Some(format!(
+                                        "tx {target} has dust actions but no max dust event id"
+                                    ));
+                                    if log {
+                                        eprintln!(
+                                            "[ows-midnight] post-submit: {}; retrying…",
+                                            last_blocker.as_deref().unwrap_or("")
+                                        );
                                     }
                                 }
                                 if ready && log {
@@ -421,20 +430,48 @@ pub async fn refresh_after_submit(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    if log {
-        eprintln!(
-            "[ows-midnight] post-submit: timed out after {}s waiting for indexer tx {target} \
-({})",
-            wait_timeout.as_secs(),
-            last_blocker.as_deref().unwrap_or("not ready")
-        );
-    }
-
     Err(post_submit_timeout_error(
         wait_timeout,
-        &target,
+        &normalize_ledger_tx_hash(ledger_tx_hash),
         last_blocker,
     ))
+}
+
+/// Wait for the indexer to index `ledger_tx_hash`, refresh local snapshots, then return.
+///
+/// Post-submit indexer sync must finish before `sign send-tx` returns; timeout is an error so
+/// the next sign does not build DUST spends from stale ledger state (tx may already be on-chain).
+/// Session cache is always cleared; disk snapshots are updated when sync succeeds.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_after_submit(
+    indexer_url: &str,
+    scope: &SyncCacheScope,
+    ledger_tx_hash: &str,
+    sealed_bytes: &[u8],
+    unshielded_address: Option<&str>,
+    shielded_seed: Option<&[u8; 32]>,
+    dust_seed: Option<&[u8; 32]>,
+) -> Result<(), PayError> {
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    session_cache::invalidate_site(scope, &fp);
+
+    let wait_timeout = post_submit_indexer_wait_timeout();
+    if wait_timeout.as_secs() == 0 {
+        return Ok(());
+    }
+
+    let plan = plan_from_sealed_tx(sealed_bytes);
+    ensure_submitted_tx_reflected(
+        indexer_url,
+        scope,
+        ledger_tx_hash,
+        plan,
+        unshielded_address,
+        shielded_seed,
+        dust_seed,
+        wait_timeout,
+    )
+    .await
 }
 
 #[cfg(test)]

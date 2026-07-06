@@ -30,6 +30,9 @@ pub struct DustSyncOptions {
     /// Reconnect when the indexer WebSocket sends no frames for this long.
     pub ws_idle_timeout: Duration,
     pub purpose: SyncPurpose,
+    /// When set, tip-verify early exit is disabled until `last_seen_event_id` reaches this id
+    /// (post-submit catch-up).
+    pub min_required_event_id: Option<i64>,
 }
 
 impl Default for DustSyncOptions {
@@ -39,6 +42,7 @@ impl Default for DustSyncOptions {
             log_progress: midnight_env::midnight_sync_log_enabled(),
             ws_idle_timeout: midnight_env::ws_idle_timeout(SyncStream::Dust),
             purpose: SyncPurpose::Signing,
+            min_required_event_id: None,
         }
     }
 }
@@ -122,6 +126,55 @@ fn dust_merge_max_id(current: Option<i64>, event_max_id: i64) -> Option<i64> {
 
 fn dust_at_chain_tip(last_seen_id: i64, max_id: Option<i64>) -> bool {
     max_id.is_some_and(|m| m > 0 && last_seen_id >= m)
+}
+
+fn dust_sync_caught_up(
+    min_required_event_id: Option<i64>,
+    last_seen_id: i64,
+    max_id: Option<i64>,
+) -> bool {
+    if !dust_at_chain_tip(last_seen_id, max_id) {
+        return false;
+    }
+    min_required_event_id.is_none_or(|min| last_seen_id >= min)
+}
+
+/// Whether dust sync may return. Signing requires live indexer contact in this run — not
+/// returning on the on-disk snapshot alone before opening the WebSocket. An idle timeout
+/// at chain tip counts as contact (indexer had nothing new to send).
+fn dust_ready_to_return(
+    purpose: SyncPurpose,
+    min_required_event_id: Option<i64>,
+    sync_baseline_last_seen: i64,
+    last_seen_id: i64,
+    max_id: Option<i64>,
+    ws_tip_confirmed: bool,
+    events_applied_this_run: u64,
+) -> bool {
+    if !dust_sync_caught_up(min_required_event_id, last_seen_id, max_id) {
+        return false;
+    }
+    if !purpose.must_catch_up_to_indexer_tip() {
+        return true;
+    }
+    // Snapshot cursor can lag ledger state: do not accept "at tip" without applying events
+    // that the caller explicitly needs (post-submit catch-up for the tx we just submitted).
+    if let Some(min) = min_required_event_id {
+        if sync_baseline_last_seen < min && events_applied_this_run == 0 {
+            return false;
+        }
+    }
+    ws_tip_confirmed || events_applied_this_run > 0
+}
+
+fn mark_ws_tip_confirmed_at_chain_tip(
+    ws_tip_confirmed: &mut bool,
+    last_seen_id: i64,
+    max_id: Option<i64>,
+) {
+    if dust_at_chain_tip(last_seen_id, max_id) {
+        *ws_tip_confirmed = true;
+    }
 }
 
 fn dust_ws_read_timeout(
@@ -344,6 +397,7 @@ async fn sync_dust_local_state_inner(
         None
     };
     let mut last_seen_id: i64 = start_id.saturating_sub(1);
+    let sync_baseline_last_seen = last_seen_id;
 
     // Snapshot already at the saved chain tip — still reconnect so we learn the
     // current max event id; otherwise proofs can be built against stale roots.
@@ -356,6 +410,7 @@ async fn sync_dust_local_state_inner(
     let verifying_at_tip = saved_max_id > 0 && last_seen_id >= saved_max_id;
     let max_attempts = dust_verify_attempt_limit(verifying_at_tip, options.purpose);
     let verify_idle = midnight_env::dust_verify_idle_timeout_for(options.purpose);
+    let mut ws_tip_confirmed = false;
 
     for attempt in 0..max_attempts {
         let mut ws = indexer_ws::connect_and_init(indexer_url, ws_idle, None).await?;
@@ -380,7 +435,16 @@ async fn sync_dust_local_state_inner(
                 stall_timeout
             };
             if stall_elapsed(last_applied_at, sync_started) > effective_stall {
-                if dust_at_chain_tip(last_seen_id, max_id) {
+                mark_ws_tip_confirmed_at_chain_tip(&mut ws_tip_confirmed, last_seen_id, max_id);
+                if dust_ready_to_return(
+                    options.purpose,
+                    options.min_required_event_id,
+                    sync_baseline_last_seen,
+                    last_seen_id,
+                    max_id,
+                    ws_tip_confirmed,
+                    n_events,
+                ) {
                     if let Some(ref path) = cache_path {
                         save_dust_progress_snapshot(
                             path,
@@ -409,7 +473,16 @@ async fn sync_dust_local_state_inner(
             }
 
             if verifying_at_tip && attempt_events == 0 && attempt_started.elapsed() > verify_idle {
-                if dust_at_chain_tip(last_seen_id, max_id) {
+                mark_ws_tip_confirmed_at_chain_tip(&mut ws_tip_confirmed, last_seen_id, max_id);
+                if dust_ready_to_return(
+                    options.purpose,
+                    options.min_required_event_id,
+                    sync_baseline_last_seen,
+                    last_seen_id,
+                    max_id,
+                    ws_tip_confirmed,
+                    n_events,
+                ) {
                     if log_progress {
                         eprintln!(
                             "[ows-midnight] dust sync: verify idle {}s, accepting saved tip \
@@ -439,7 +512,18 @@ async fn sync_dust_local_state_inner(
                     break;
                 }
                 indexer_ws::SubscriptionTextRead::IdleTimeout => {
-                    if attempt_events == 0 && dust_at_chain_tip(last_seen_id, max_id) {
+                    mark_ws_tip_confirmed_at_chain_tip(&mut ws_tip_confirmed, last_seen_id, max_id);
+                    if attempt_events == 0
+                        && dust_ready_to_return(
+                            options.purpose,
+                            options.min_required_event_id,
+                            sync_baseline_last_seen,
+                            last_seen_id,
+                            max_id,
+                            ws_tip_confirmed,
+                            n_events,
+                        )
+                    {
                         if log_progress {
                             eprintln!(
                                 "[ows-midnight] dust sync: no new events (already at tip last_seen_id={last_seen_id} max_id={max_id:?})"
@@ -470,6 +554,7 @@ async fn sync_dust_local_state_inner(
                 .map_err(|e| PayError::new(PayErrorCode::ProtocolMalformed, e.to_string()))?;
             match frame.r#type.as_str() {
                 "next" => {
+                    ws_tip_confirmed = true;
                     let Some(payload) = frame.payload else {
                         continue;
                     };
@@ -536,7 +621,15 @@ async fn sync_dust_local_state_inner(
                             );
                         }
                     }
-                    if max_id.is_some_and(|m| last_seen_id >= m) {
+                    if dust_ready_to_return(
+                        options.purpose,
+                        options.min_required_event_id,
+                        sync_baseline_last_seen,
+                        last_seen_id,
+                        max_id,
+                        ws_tip_confirmed,
+                        n_events,
+                    ) {
                         dropped = false;
                         break;
                     }
@@ -545,7 +638,16 @@ async fn sync_dust_local_state_inner(
                     if max_id.is_none() && last_seen_id >= 0 {
                         max_id = Some(last_seen_id);
                     }
-                    dropped = !dust_at_chain_tip(last_seen_id, max_id);
+                    mark_ws_tip_confirmed_at_chain_tip(&mut ws_tip_confirmed, last_seen_id, max_id);
+                    dropped = !dust_ready_to_return(
+                        options.purpose,
+                        options.min_required_event_id,
+                        sync_baseline_last_seen,
+                        last_seen_id,
+                        max_id,
+                        ws_tip_confirmed,
+                        n_events,
+                    );
                     break;
                 }
                 _ => {}
@@ -568,7 +670,17 @@ async fn sync_dust_local_state_inner(
             }
         }
 
-        if !dropped && max_id.is_some_and(|m| last_seen_id >= m) {
+        if !dropped
+            && dust_ready_to_return(
+                options.purpose,
+                options.min_required_event_id,
+                sync_baseline_last_seen,
+                last_seen_id,
+                max_id,
+                ws_tip_confirmed,
+                n_events,
+            )
+        {
             break;
         }
         if attempt + 1 < max_attempts {
@@ -733,4 +845,58 @@ pub fn format_dust_specks(specks: u128) -> String {
         return whole.to_string();
     }
     format!("{whole}.{frac:0width$}", width = decimals as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chains::midnight::cache_io::SyncPurpose;
+
+    #[test]
+    fn signing_accepts_chain_tip_after_ws_idle_without_new_events() {
+        assert!(dust_ready_to_return(
+            SyncPurpose::Signing,
+            None,
+            100,
+            100,
+            Some(100),
+            true,
+            0,
+        ));
+    }
+
+    #[test]
+    fn signing_requires_apply_when_catching_up_to_min_required_event() {
+        assert!(!dust_ready_to_return(
+            SyncPurpose::Signing,
+            Some(101),
+            100,
+            101,
+            Some(101),
+            true,
+            0,
+        ));
+        assert!(dust_ready_to_return(
+            SyncPurpose::Signing,
+            Some(101),
+            100,
+            101,
+            Some(101),
+            true,
+            1,
+        ));
+    }
+
+    #[test]
+    fn display_may_use_snapshot_tip_without_ws_ack() {
+        assert!(dust_ready_to_return(
+            SyncPurpose::Display,
+            None,
+            100,
+            100,
+            Some(100),
+            false,
+            0,
+        ));
+    }
 }
