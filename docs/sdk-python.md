@@ -292,7 +292,7 @@ result = sign_transaction("agent-treasury", "evm", "02f8...")
 print(result["signature"])
 ```
 
-For **Midnight**, use `result["signature"]` for broadcast (full wire hex) or verification (message: split pubkey + sig). Preview/Preprod unsealed flows need a **mnemonic** wallet (DUST at `m/44'/2400'/0'/2/<index>`). API-key mode supports this when the wallet is mnemonic-based.
+For **Midnight**, use `result["signature"]` for broadcast (full wire hex) or verification (message: split pubkey + sig). Unsealed fee-paying flows need a **mnemonic** wallet (DUST at `m/44'/2400'/0'/2/<index>`). API-key mode supports this when the wallet is mnemonic-based.
 
 #### `sign_and_send(wallet, chain, tx_hex, passphrase=None, index=None, rpc_url=None, vault_path=None)`
 

@@ -92,7 +92,7 @@ WalletEngine role segments under `m/44'/2400'/0'/{role}/{index}`.
 | Role | Path segment | Used for |
 |------|--------------|----------|
 | 0 | `.../0/{index}` | Unshielded Night signing key (default OWS account) |
-| 2 | `.../2/{index}` | DUST secret seed (Preview / Preprod fee registration) |
+| 2 | `.../2/{index}` | DUST secret seed (fee registration) |
 | 3 | `.../3/{index}` | Shielded Zswap seed |
 
 This is **not** SLIP-10 Ed25519 (Solana/TON/NEAR) and **not** a separate curve enum; it reuses the

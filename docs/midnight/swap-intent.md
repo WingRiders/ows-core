@@ -89,7 +89,7 @@ payload with a `transaction` field) as `--tx` when running `sign send-tx` or `si
 Requirements for the taker wallet:
 
 - **Shielded seed** (mnemonic wallet) when the offer moves shielded tokens
-- **Dust seed** on Preview/Preprod when `payFees` is true (default)
+- **Dust seed** when `payFees` is true (default) on any Midnight network
 
 In a browser wallet (Lace, etc.) connected to the same network:
 

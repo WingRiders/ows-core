@@ -355,7 +355,7 @@ const result = signTransaction("agent-treasury", "evm", "02f8...");
 console.log(result.signature);
 ```
 
-For **Midnight**, `signature` is the full sealed wire hex for transactions. Message signatures prefix the BIP-340 verifying key. Unsealed dapp payloads run the wallet pipeline (balance → prove → seal); Preview/Preprod require a **mnemonic** wallet (DUST seed at `m/44'/2400'/0'/2/<index>`). Agent/API-key mode supports the same when the wallet is mnemonic-based.
+For **Midnight**, `signature` is the full sealed wire hex for transactions. Message signatures prefix the BIP-340 verifying key. Unsealed dapp payloads run the wallet pipeline (balance → prove → seal); fee-paying flows require a **mnemonic** wallet (DUST seed at `m/44'/2400'/0'/2/<index>`). Agent/API-key mode supports the same when the wallet is mnemonic-based.
 
 **Returns:** `SignResult`
 

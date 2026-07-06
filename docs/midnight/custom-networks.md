@@ -95,8 +95,8 @@ node URLs:
 | `ows sign tx` with DApp Connector JSON (`makeTransfer`, …) | Indexer (materialization / balancing) |
 | `ows sign send-tx` | Node RPC (`:node` key or `--rpc-url`) |
 
-Non-mainnet networks (including all custom ids) use **DUST fee registration** on unsealed intents,
-same as preview/preprod. That path requires a mnemonic wallet with DUST role seed
+All Midnight networks (mainnet, preview, preprod, and custom ids) use **DUST fee registration**
+on unsealed intents when balancing. That path requires a mnemonic wallet with DUST role seed
 (`m/44'/2400'/0'/2/{index}`), not a bare imported private key.
 
 ## CLI examples

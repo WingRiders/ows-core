@@ -146,11 +146,11 @@ fn append_invalid_dust_spend_hint(msg: &mut String) {
     {
         msg.push_str(&format!(
             "\n\nLedger error {LEDGER_INVALID_DUST_SPEND_PROOF} (InvalidDustSpendProof): DUST \
-             spend ZK proof verification failed. On Preview/Preprod this usually means stale dust \
-             sync (re-run send so dust ledger catches up), insufficient synced DUST balance, or \
-             using dust spends when unregistered NIGHT inputs could fund a generationless \
-             registration instead. Ensure the indexer returns block timestamps for UTXOs and pass \
-             the wallet dust seed."
+             spend ZK proof verification failed. This usually means stale dust sync (re-run send \
+             so the dust ledger catches up), insufficient synced DUST balance, or using dust \
+             spends when unregistered NIGHT inputs could fund a generationless registration \
+             instead. Ensure the indexer returns block timestamps for UTXOs and pass the wallet \
+             dust seed."
         ));
     }
 }
@@ -451,7 +451,7 @@ pub async fn submit_unshielded_tx(
             Ok(dry_val) => {
                 msg.push_str(&format!("\nMidnight system_dryRun: {dry_val}"));
                 msg.push_str(
-                    "\nIf this is a DUST fee / validity issue on Preview, ensure the indexer returns \
+                    "\nIf this is a DUST fee / validity issue, ensure the indexer returns \
 `transaction.block.timestamp` for UTXOs, pass the wallet dust seed (`UnshieldedTransfer.dust_seed` / \
 `ows_lib::decrypt_midnight_dust_seed`), and use a fresh node RPC time for building.",
                 );

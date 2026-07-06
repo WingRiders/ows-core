@@ -542,7 +542,8 @@ pub async fn sync_shielded_wallet_state_scoped(
         } else {
             return Err(PayError::new(
                 PayErrorCode::InvalidInput,
-                "shielded spend sync requires zswapLedgerEvents replay (default on preview/preprod) \
+                "shielded spend sync requires zswapLedgerEvents replay \
+                 (OWS_MIDNIGHT_SHIELDED_ZSWAP_FALLBACK=1 by default) \
                  or OWS_MIDNIGHT_SHIELDED_SESSION_SYNC=1",
             ));
         };

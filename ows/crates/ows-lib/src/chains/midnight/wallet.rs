@@ -11,9 +11,9 @@ use ows_signer::{
 };
 
 use super::{
-    block_on, build_make_transfer_unsealed_tx, chain_needs_dust_fee_registration,
-    is_balance_sealed_maker_payload, is_balance_unsealed_payload, materialize_connector_request,
-    parse_connector_tx_json, parse_maker_swap_input, post_submit_sync::refresh_after_submit,
+    block_on, build_make_transfer_unsealed_tx, is_balance_sealed_maker_payload,
+    is_balance_unsealed_payload, materialize_connector_request, parse_connector_tx_json,
+    parse_maker_swap_input, post_submit_sync::refresh_after_submit,
     prepare_balanced_sealed_from_maker_offer, prepare_sealed_from_unsealed,
     seal_imbalanced_unsealed, submit_unshielded_tx, ConnectorTxRequest, PayError, SyncCacheScope,
 };
@@ -73,7 +73,7 @@ impl WalletRole {
             Self::Dust => {
                 "Midnight DUST fee registration requires a mnemonic wallet (derive dust at \
                  m/44'/2400'/0'/2/<index>). Imported private-key wallets only expose the unshielded \
-                 Night key — use a mnemonic wallet for Preview / Preprod unsealed transactions."
+                 Night key — use a mnemonic wallet for unsealed transactions that pay fees."
             }
             Self::Shielded => {
                 "Midnight shielded balances require a mnemonic wallet (derive shielded at \
@@ -170,7 +170,7 @@ fn dust_seed_from_wallet_secret(
     role_seed_from_wallet_secret(secret, key_type, WalletRole::Dust, index)
 }
 
-/// Derive the Midnight **dust** seed (32 bytes) used for DUST fee registration on Preview / Preprod.
+/// Derive the Midnight **dust** seed (32 bytes) used for DUST fee registration and spends.
 pub fn decrypt_dust_seed(
     wallet_name_or_id: &str,
     passphrase: &str,
@@ -295,8 +295,7 @@ pub(crate) fn maybe_load_dust_seed_with_credential(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<Option<SecretBytes>, OwsLibError> {
-    if chain.chain_type != ChainType::Midnight || !chain_needs_dust_fee_registration(chain.chain_id)
-    {
+    if chain.chain_type != ChainType::Midnight {
         return Ok(None);
     }
 
@@ -650,11 +649,6 @@ pub fn prepare_midnight_owner_tx_context(
         vault_path,
         &mut prompt_passphrase,
     )?;
-    let dust_seed = if chain_needs_dust_fee_registration(chain.chain_id) {
-        dust_seed
-    } else {
-        None
-    };
     let decoded = decode_midnight_transaction_input(
         chain,
         tx_hex,

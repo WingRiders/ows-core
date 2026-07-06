@@ -18,7 +18,7 @@
 //! - [`urls`] — URL-scheme helpers shared between sync modules and `submit`.
 //!
 //! The handful of pure chain-identity helpers (`TokenType`, `parse_token_type`,
-//! `chain_needs_dust_fee_registration`, `ledger_network_id`) live in this file.
+//! `ledger_network_id`, …) live in this file.
 
 /// Shielded balances keyed by the hex-encoded `ShieldedTokenType`.
 pub type ShieldedBalances = std::collections::BTreeMap<String, u128>;
@@ -139,15 +139,6 @@ pub fn parse_token_type(token: Option<&str>) -> Result<TokenType, PayError> {
     } else {
         Ok(TokenType::Custom(arr))
     }
-}
-
-/// Preview / Preprod (and other non-mainnet) unshielded transactions require a DUST fee registration on the intent.
-pub fn chain_needs_dust_fee_registration(chain_id: &str) -> bool {
-    MidnightNetwork::from_chain_id(chain_id)
-        .unwrap_or_else(|e| {
-            panic!("Midnight dust fee check requires chain id midnight:<network>: {e}")
-        })
-        .needs_dust_fee_registration()
 }
 
 /// CAIP-2 chain id → `StandardTransaction.network_id` string used by the ledger.
@@ -276,8 +267,8 @@ pub fn is_balance_unsealed_payload(tx_bytes: &[u8]) -> bool {
 /// - `proof-preimage,embedded-fr` → balance → sign → prove → seal.
 /// - `proof,embedded-fr` (dapp pre-proved) → balance → sign → seal.
 ///
-/// `dust_seed` is required for chains that need DUST fee registration (Preview /
-/// Preprod) and must be `Some(32 bytes)`. For Mainnet it is ignored.
+/// `dust_seed` must be `Some(32 bytes)` when `pay_fees` is true (mnemonic wallet, role
+/// `m/44'/2400'/0'/2/<index>`).
 ///
 /// Returns fully-tagged sealed v9 transaction bytes ready to submit via
 /// [`submit_unshielded_tx`].
@@ -485,13 +476,6 @@ mod tests {
             ledger_network_id("midnight:custom-net").unwrap(),
             "custom-net"
         );
-    }
-
-    #[test]
-    fn chain_needs_dust_fee_registration_follows_mainnet_rule() {
-        assert!(!chain_needs_dust_fee_registration("midnight:mainnet"));
-        assert!(chain_needs_dust_fee_registration("midnight:preview"));
-        assert!(chain_needs_dust_fee_registration("midnight:custom-net"));
     }
 
     #[test]

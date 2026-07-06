@@ -11,10 +11,10 @@ use super::wallet::{
     decrypt_auxiliary_seeds_with_fallback, resolve_indexer_url, sync_scope_for_wallet,
 };
 use super::{
-    block_on, chain_needs_dust_fee_registration, format_dust_specks, fund_balance_skip_dust_sync,
-    get_dust_balance_for_display_scoped, get_shielded_balances_for_display_scoped,
-    get_unshielded_utxos_for_display_scoped, midnight_sync_log_enabled, parse_token_type,
-    shielded_sync::ShieldedDisplayBalances, UnshieldedUtxo,
+    block_on, format_dust_specks, fund_balance_skip_dust_sync, get_dust_balance_for_display_scoped,
+    get_shielded_balances_for_display_scoped, get_unshielded_utxos_for_display_scoped,
+    midnight_sync_log_enabled, parse_token_type, shielded_sync::ShieldedDisplayBalances,
+    UnshieldedUtxo,
 };
 use crate::error::OwsLibError;
 
@@ -268,9 +268,7 @@ pub fn print_fund_balance(
         eprintln!();
     }
 
-    if chain_needs_dust_fee_registration(chain_id) {
-        print_dust_status(&unshielded_utxos, dust_seed.as_ref(), dust_balance)?;
-    }
+    print_dust_status(&unshielded_utxos, dust_seed.as_ref(), dust_balance)?;
 
     Ok(())
 }

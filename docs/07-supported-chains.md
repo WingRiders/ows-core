@@ -83,11 +83,11 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 
 ### Midnight indexer sync (OWS)
 
-`ows fund balance --chain midnight:*` and unsealed transaction signing replay indexer state (unshielded UTXOs, shielded balances, DUST ledger on Preview/Preprod). OWS caches snapshots under `{vault}/sync/midnight/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
+`ows fund balance --chain midnight:*` and unsealed transaction signing replay indexer state (unshielded UTXOs, shielded balances, DUST ledger). OWS caches snapshots under `{vault}/sync/midnight/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
 
 Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`, etc.) and node RPC (`rpc["midnight:preview:node"]`, etc.). Useful environment variables are documented on [`cache_io`](../../ows/crates/ows-lib/src/chains/midnight/cache_io.rs) in `ows-lib` (`OWS_MIDNIGHT_SYNC_CACHE`, `OWS_MIDNIGHT_SNAPSHOT_MAX_AGE_SECS`, `OWS_MIDNIGHT_SYNC_LOG`, …).
 
-Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
+Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and unsealed signing require a mnemonic wallet.
 
 Midnight-specific documentation lives under [`docs/midnight/`](./midnight/) ([chain plugin interface](./midnight/chain-plugin-interface.md), [architecture](./midnight/architecture.md), [addressing](./midnight/addressing.md), [custom networks](./midnight/custom-networks.md), [swap intents](./midnight/swap-intent.md)). The `midnight` CAIP-2 namespace is **provisional** until a profile is registered in the [Chain Agnostic Namespaces registry](https://github.com/ChainAgnostic/namespaces).
 

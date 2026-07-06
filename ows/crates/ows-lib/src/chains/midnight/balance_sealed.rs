@@ -691,7 +691,7 @@ fn cover_dust_fees_sealed(
     mut merged: TxSealed,
     pay_fees: bool,
 ) -> Result<TxSealed, PayError> {
-    if !super::chain_needs_dust_fee_registration(chain_id) || !pay_fees {
+    if !pay_fees {
         return Ok(merged);
     }
 
@@ -880,10 +880,9 @@ pub fn balance_sealed_transaction(
                 merged,
             )?;
 
-            if super::chain_needs_dust_fee_registration(chain_id) && pay_fees {
-                let seed = dust_seed.ok_or_else(|| {
-                    err("Midnight Preview/Preprod requires a dust seed to pay transaction fees")
-                })?;
+            if pay_fees {
+                let seed = dust_seed
+                    .ok_or_else(|| err("Midnight requires a dust seed to pay transaction fees"))?;
                 merged = cover_dust_fees_sealed(
                     chain_id,
                     indexer_url,

@@ -105,7 +105,7 @@ network-specific HRPs:
 | Preview | `mn_dust_preview` |
 | Preprod | `mn_dust_preprod` |
 
-DUST credentials are used for Preview / Preprod fee registration and related ledger flows.
+DUST credentials are used for fee registration and related ledger flows on all Midnight networks.
 
 ### 4. HD derivation paths and “roles” (WalletEngine)
 
@@ -134,7 +134,7 @@ the **unshielded Night** secret for Midnight.
 
 - **Mnemonic wallets**: can derive unshielded + shielded + DUST roles.
 - **Imported private-key wallets**: can derive **only** the unshielded Night address; shielded balances
-  and Preview/Preprod DUST-fee registration require a mnemonic wallet.
+  and DUST-fee unsealed signing require a mnemonic wallet.
 
 ## References
 

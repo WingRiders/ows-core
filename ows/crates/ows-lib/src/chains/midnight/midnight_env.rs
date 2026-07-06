@@ -1,8 +1,6 @@
 //! Midnight network identity and environment-variable helpers for sync modules.
 
-use ows_signer::chains::{
-    hrp_for_network, is_mainnet_network_reference, network_reference_from_chain_id,
-};
+use ows_signer::chains::{hrp_for_network, network_reference_from_chain_id};
 use std::time::Duration;
 
 /// Midnight network identity (`preview`, `mainnet`, or any ad-hoc testnet name).
@@ -29,21 +27,8 @@ impl MidnightNetwork {
         Self::from_chain_id(cid)
     }
 
-    pub fn is_mainnet(&self) -> bool {
-        is_mainnet_network_reference(&self.reference)
-    }
-
     pub fn ledger_network_id(&self) -> &str {
         &self.reference
-    }
-
-    pub fn needs_dust_fee_registration(&self) -> bool {
-        !self.is_mainnet()
-    }
-
-    /// Default for the zswap-ledger fallback on non-mainnet indexers.
-    pub fn shielded_zswap_fallback_default(&self) -> bool {
-        !self.is_mainnet()
     }
 
     pub fn viewing_key_hrp(&self) -> String {
@@ -171,19 +156,22 @@ pub fn shielded_vk_free_sync_enabled() -> bool {
 }
 
 /// Primary shielded sync uses `zswapLedgerEvents` + `ZswapLocalState::replay_events`, matching
-/// `@midnight-ntwrk/wallet-sdk-shielded` (Lace). Enabled by default on preview/preprod.
+/// `@midnight-ntwrk/wallet-sdk-shielded` (Lace).
 pub fn shielded_zswap_ledger_sync_enabled(network: &MidnightNetwork) -> bool {
     shielded_vk_free_sync_enabled() || shielded_zswap_fallback_enabled(network)
 }
 
-pub fn shielded_zswap_fallback_enabled(network: &MidnightNetwork) -> bool {
+/// When `zswapLedgerEvents` replay yields no balances, optionally fall back to indexer
+/// `shieldedTransactions` session sync. On by default on all networks; override with
+/// `OWS_MIDNIGHT_SHIELDED_ZSWAP_FALLBACK`.
+pub fn shielded_zswap_fallback_enabled(_network: &MidnightNetwork) -> bool {
     if shielded_vk_free_sync_enabled() {
         return true;
     }
     match std::env::var("OWS_MIDNIGHT_SHIELDED_ZSWAP_FALLBACK") {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => network.shielded_zswap_fallback_default(),
+        _ => true,
     }
 }
 
@@ -273,6 +261,7 @@ pub fn ws_connect_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ows_signer::chains::is_mainnet_network_reference;
 
     #[test]
     fn network_from_chain_id() {
@@ -282,13 +271,12 @@ mod tests {
 
         let mainnet = MidnightNetwork::from_chain_id("midnight:mainnet").unwrap();
         assert_eq!(mainnet.reference, "mainnet");
-        assert!(mainnet.is_mainnet());
+        assert!(is_mainnet_network_reference(&mainnet.reference));
 
         let custom = MidnightNetwork::from_chain_id("midnight:my-feature-testnet").unwrap();
         assert_eq!(custom.reference, "my-feature-testnet");
         assert_eq!(custom.ledger_network_id(), "my-feature-testnet");
-        assert!(!custom.is_mainnet());
-        assert!(custom.needs_dust_fee_registration());
+        assert!(!is_mainnet_network_reference(&custom.reference));
     }
 
     #[test]
@@ -334,10 +322,16 @@ mod tests {
     }
 
     #[test]
-    fn custom_network_hrp_and_non_mainnet_defaults() {
+    fn custom_network_hrp() {
         let custom = MidnightNetwork::from_chain_id("midnight:custom-net").expect("custom network");
         assert_eq!(custom.viewing_key_hrp(), "mn_shield-esk_custom-net");
-        assert!(custom.needs_dust_fee_registration());
-        assert!(custom.shielded_zswap_fallback_default());
+    }
+
+    #[test]
+    fn shielded_zswap_fallback_enabled_by_default_on_all_networks() {
+        let mainnet = MidnightNetwork::from_chain_id("midnight:mainnet").unwrap();
+        let preview = MidnightNetwork::from_chain_id("midnight:preview").unwrap();
+        assert!(shielded_zswap_fallback_enabled(&mainnet));
+        assert!(shielded_zswap_fallback_enabled(&preview));
     }
 }

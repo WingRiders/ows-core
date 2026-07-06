@@ -30,7 +30,7 @@
 //! | `OWS_MIDNIGHT_SKIP_DUST_BALANCE=1` | Skip DUST ledger sync in `fund balance` |
 //! | `OWS_MIDNIGHT_SYNC_LOG=1` | Progress lines during Midnight indexer sync (stderr) |
 //! | `OWS_MIDNIGHT_SHIELDED_VK_FREE` | `1`/`true`: shielded **balance** sync uses only `zswapLedgerEvents` (never `connect(viewingKey)`); shielded **spends** fail until a VK-free spend path exists |
-//! | `OWS_MIDNIGHT_SHIELDED_ZSWAP_FALLBACK` | `1`/`true` force on; `0`/`false` force off; default **on** for preview/preprod indexers when `shieldedTransactions` is empty; implied **on** when `SHIELDED_VK_FREE` is set |
+//! | `OWS_MIDNIGHT_SHIELDED_ZSWAP_FALLBACK` | `1`/`true` force on; `0`/`false` force off; default **on** when `zswapLedgerEvents` replay is empty; implied **on** when `SHIELDED_VK_FREE` is set |
 //! | `OWS_MIDNIGHT_POST_SUBMIT_INDEXER_WAIT_SECS` | After node submit, wait up to this many seconds for the indexer to index the tx and refresh unshielded / shielded / dust snapshots (default **120**; `0` skips wait but still clears session cache) |
 //!
 //! Legacy aliases for sync log and stall timeouts are documented in [`super::midnight_env`].

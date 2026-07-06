@@ -179,25 +179,6 @@ pub(super) fn select_utxos_for_token(
     Ok(out)
 }
 
-/// Pick just enough sender-owned NIGHT UTXOs (in preference order) to cover `need`.
-fn select_utxos_for_night(
-    utxos: &[UnshieldedUtxo],
-    sender_bech32: &str,
-    sender_sk: &[u8; 32],
-    need: u128,
-    prefer_unregistered_for_dust: bool,
-) -> Result<Vec<UnshieldedUtxo>, PayError> {
-    let night_wire = super::parse_token_type(Some("night"))?.to_wire_token_type();
-    select_utxos_for_token(
-        utxos,
-        sender_bech32,
-        sender_sk,
-        &night_wire,
-        need,
-        prefer_unregistered_for_dust,
-    )
-}
-
 fn dust_allowance_from_night_inputs(
     selected: &[UnshieldedUtxo],
     dust_ctime: Timestamp,
@@ -357,17 +338,14 @@ pub(super) fn select_dust_spends_preimage(
         need = need.saturating_sub(v_fee);
     }
     if need > 0 {
-        return Err(err(
-            "insufficient DUST balance to pay fees on Midnight Preview/Preprod",
-        ));
+        return Err(err("insufficient DUST balance to pay transaction fees"));
     }
     Ok(spends)
 }
 
 /// Result of resolving sender UTXOs + building rebalanced unshielded offers.
 ///
-/// Preview/Preprod splits NIGHT across guaranteed (minimal registration cell) and
-/// fallible (bulk payment / consolidation). Mainnet uses guaranteed only.
+/// NIGHT is split across guaranteed (minimal registration cell) and fallible when dust fees apply.
 #[derive(Clone)]
 struct BalancedUnshielded {
     guaranteed: Option<UnshieldedOffer<MnSig, InMemoryDB>>,
@@ -675,11 +653,11 @@ fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
 
 /// Plan guaranteed / fallible unshielded offers from a known UTXO set (unit-testable).
 ///
-/// On Preview/Preprod, NIGHT payments and multi-UTXO consolidation use the fallible
+/// On dust-fee chains, NIGHT payments and multi-UTXO consolidation use the fallible
 /// segment; the guaranteed segment holds at most one NIGHT input for dust registration
 /// (attached later when dust spends are insufficient).
 fn plan_balanced_unshielded_offers(
-    chain_id: &str,
+    _chain_id: &str,
     sender_addr: &str,
     sender_private_key: &[u8; 32],
     utxos: &[UnshieldedUtxo],
@@ -687,7 +665,6 @@ fn plan_balanced_unshielded_offers(
     fallible_outputs_in: Vec<UtxoOutput>,
     dust_ctime: Option<Timestamp>,
 ) -> Result<BalancedUnshielded, PayError> {
-    let needs_dust = super::chain_needs_dust_fee_registration(chain_id);
     let night_wire = super::parse_token_type(Some("night"))?.to_wire_token_type();
     let night_utxos =
         sender_utxos_sorted(utxos, sender_addr, sender_private_key, &night_wire, true)?;
@@ -695,86 +672,57 @@ fn plan_balanced_unshielded_offers(
     let mut guaranteed_outputs = guaranteed_outputs_in;
     let mut fallible_outputs = fallible_outputs_in;
 
-    // Dust-fee chains: route NIGHT payments through fallible (guaranteed budget is tight).
-    if needs_dust && night_output_total(&guaranteed_outputs) > 0 {
+    // Route NIGHT payments through fallible (guaranteed budget is tight for dust registration).
+    if night_output_total(&guaranteed_outputs) > 0 {
         fallible_outputs.append(&mut guaranteed_outputs);
     }
 
     let need_f = night_output_total(&fallible_outputs);
 
-    if needs_dust {
-        let mut fallible: Option<UnshieldedOffer<MnSig, InMemoryDB>> = None;
-        let mut used: HashSet<(String, i64)> = HashSet::new();
+    let mut fallible: Option<UnshieldedOffer<MnSig, InMemoryDB>> = None;
+    let mut used: HashSet<(String, i64)> = HashSet::new();
 
-        if need_f > 0 {
-            let (offer, selected) = build_fallible_night_balanced(
-                &night_utxos,
-                &fallible_outputs,
-                sender_addr,
-                sender_private_key,
-            )?;
-            for u in &selected {
-                used.insert(utxo_key(u));
-            }
-            fallible = Some(offer);
+    if need_f > 0 {
+        let (offer, selected) = build_fallible_night_balanced(
+            &night_utxos,
+            &fallible_outputs,
+            sender_addr,
+            sender_private_key,
+        )?;
+        for u in &selected {
+            used.insert(utxo_key(u));
         }
-
-        let registration_candidate = dust_ctime
-            .map(|ts| pick_best_unregistered_for_dust(&night_utxos, ts))
-            .transpose()?
-            .flatten();
-
-        let consolidate: Vec<UnshieldedUtxo> = night_utxos
-            .iter()
-            .filter(|u| {
-                !used.contains(&utxo_key(u))
-                    && registration_candidate
-                        .as_ref()
-                        .is_none_or(|c| utxo_key(u) != utxo_key(c))
-            })
-            .cloned()
-            .collect();
-
-        if need_f == 0 && consolidate.len() > 1 {
-            fallible = Some(build_fallible_consolidation_offer(
-                &consolidate,
-                sender_addr,
-                sender_private_key,
-            )?);
-        }
-
-        return Ok(BalancedUnshielded {
-            guaranteed: None,
-            fallible,
-            registration_candidate,
-        });
+        fallible = Some(offer);
     }
 
-    // Mainnet: single guaranteed offer (no dust registration split).
-    let need = night_output_total(&guaranteed_outputs).saturating_add(need_f);
-    let mut all_outputs: Vec<UtxoOutput> = guaranteed_outputs;
-    all_outputs.extend(fallible_outputs);
+    let registration_candidate = dust_ctime
+        .map(|ts| pick_best_unregistered_for_dust(&night_utxos, ts))
+        .transpose()?
+        .flatten();
 
-    if need == 0 && all_outputs.is_empty() {
-        return Ok(BalancedUnshielded {
-            guaranteed: None,
-            fallible: None,
-            registration_candidate: None,
-        });
+    let consolidate: Vec<UnshieldedUtxo> = night_utxos
+        .iter()
+        .filter(|u| {
+            !used.contains(&utxo_key(u))
+                && registration_candidate
+                    .as_ref()
+                    .is_none_or(|c| utxo_key(u) != utxo_key(c))
+        })
+        .cloned()
+        .collect();
+
+    if need_f == 0 && consolidate.len() > 1 {
+        fallible = Some(build_fallible_consolidation_offer(
+            &consolidate,
+            sender_addr,
+            sender_private_key,
+        )?);
     }
-
-    let selected = select_utxos_for_night(utxos, sender_addr, sender_private_key, need, false)?;
-    let guaranteed = Some(build_night_offer(
-        &selected,
-        &all_outputs,
-        sender_addr,
-        sender_private_key,
-    )?);
 
     Ok(BalancedUnshielded {
-        guaranteed,
-        fallible: None,
-        registration_candidate: None,
+        guaranteed: None,
+        fallible,
+        registration_candidate,
     })
 }
 
@@ -857,12 +805,8 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
         .unwrap_or_default();
     let fallible_outputs_in = outputs_from_offer(intent_in.fallible_unshielded_offer.as_ref());
     let rt = super::async_runtime::runtime();
-    let needs_dust = super::chain_needs_dust_fee_registration(chain_id);
-    let dust_ctime = if needs_dust {
-        Some(fetch_indexer_tip_blocking(rt, indexer_url).map(|(_, ts)| Timestamp::from_secs(ts))?)
-    } else {
-        None
-    };
+    let dust_ctime =
+        Some(fetch_indexer_tip_blocking(rt, indexer_url).map(|(_, ts)| Timestamp::from_secs(ts))?);
     let mut bal = build_balanced_unshielded_offers(
         rt,
         chain_id,
@@ -874,11 +818,11 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
         dust_ctime,
     )?;
 
-    let dust_actions = if needs_dust && pay_fees {
+    let dust_actions = if pay_fees {
         if intent_in.dust_actions.is_some() {
             return Err(err("existing dust actions are not supported yet"));
         }
-        let seed = dust_seed.ok_or_else(|| err("Midnight Preview/Preprod requires dust seed"))?;
+        let seed = dust_seed.ok_or_else(|| err("Midnight requires dust seed"))?;
         let (ledger_params, tip_secs) = fetch_indexer_tip_blocking(rt, indexer_url)?;
         let dust_ctx = DustActionBuildContext {
             rt,
@@ -929,7 +873,7 @@ pub(super) fn balance_unsealed_preimage_standard_tx(
 /// Same plan as [`balance_unsealed_preimage_standard_tx`], but for already-proven
 /// (`proof,embedded-fr`) payloads. Existing ZK proofs in `actions`, `guaranteed_coins`,
 /// and `fallible_coins` are preserved verbatim; we only inject unshielded inputs/outputs
-/// and (for Preview/Preprod) a fresh DUST registration.
+/// and (when needed) a fresh DUST registration.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn balance_unsealed_proven_standard_tx(
     chain_id: &str,
@@ -1000,12 +944,7 @@ pub(super) fn balance_unsealed_proven_standard_tx(
         .unwrap_or_default();
     let fallible_outputs_in = outputs_from_offer(intent_in.fallible_unshielded_offer.as_ref());
     let rt = super::async_runtime::runtime();
-    let needs_dust = super::chain_needs_dust_fee_registration(chain_id);
-    let indexer_tip = if needs_dust {
-        Some(fetch_indexer_tip_blocking(rt, indexer_url)?)
-    } else {
-        None
-    };
+    let indexer_tip = Some(fetch_indexer_tip_blocking(rt, indexer_url)?);
     let dust_ctime = indexer_tip
         .as_ref()
         .map(|(_, ts)| Timestamp::from_secs(*ts));
@@ -1028,7 +967,7 @@ pub(super) fn balance_unsealed_proven_standard_tx(
         &bal,
         dust_seed,
         sender_private_key,
-        needs_dust && pay_fees,
+        pay_fees,
         dust_ctime,
     )?;
     let tx_first: TxProven = wrap_proven_standard(chain_id, &stx, seg_id, intent_out_first)?;
@@ -1037,15 +976,15 @@ pub(super) fn balance_unsealed_proven_standard_tx(
         .map(chain_aligned_intent_ttl)
         .unwrap_or(intent_in.ttl);
 
-    let dust_actions = if needs_dust && pay_fees {
+    let dust_actions = if pay_fees {
         if intent_in.dust_actions.is_some() {
             return Err(err("existing dust actions are not supported yet"));
         }
-        let seed = dust_seed.ok_or_else(|| err("Midnight Preview/Preprod requires dust seed"))?;
+        let seed = dust_seed.ok_or_else(|| err("Midnight requires dust seed"))?;
         let (ledger_params, tip_secs) = indexer_tip
             .as_ref()
             .map(|(lp, ts)| (lp, *ts))
-            .ok_or_else(|| err("Midnight Preview/Preprod requires chain timestamp for dust"))?;
+            .ok_or_else(|| err("Midnight requires chain timestamp for dust"))?;
         let dust_ctx = DustActionBuildContext {
             rt,
             indexer_url,
@@ -1114,7 +1053,7 @@ fn mock_prove_fee_dust(
         .map_err(|e| err(format!("fee estimate failed: {e:?}")))
 }
 
-/// Build a preview/preprod dust registration / spend section for the preimage flow.
+/// Build a dust registration / spend section for the preimage flow.
 ///
 /// Prefers existing DUST balance (dust spends). Falls back to generationless registration
 /// using a single guaranteed-segment NIGHT input when needed.
@@ -1174,40 +1113,39 @@ fn assemble_proven_intent(
     bal: &BalancedUnshielded,
     dust_seed: Option<[u8; 32]>,
     sender_private_key: &[u8; 32],
-    needs_dust: bool,
+    pay_fees: bool,
     dust_ctime: Option<Timestamp>,
 ) -> Result<Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, PayError> {
     let intent_ttl = dust_ctime
         .map(chain_aligned_intent_ttl)
         .unwrap_or(intent_in.ttl);
 
-    let dust_actions_placeholder: Option<DustActions<MnSig, ProofMarker, InMemoryDB>> =
-        if needs_dust {
-            let seed =
-                dust_seed.ok_or_else(|| err("Midnight Preview/Preprod requires dust seed"))?;
-            let _dsk = DustSecretKey::derive_secret_key(&seed);
-            let dust_pk = DustPublicKey::from(_dsk);
-            let night_vk = MidnightSigningKey::from_bytes(sender_private_key)
-                .map_err(|e| err(e.to_string()))?
-                .verifying_key();
+    let dust_actions_placeholder: Option<DustActions<MnSig, ProofMarker, InMemoryDB>> = if pay_fees
+    {
+        let seed = dust_seed.ok_or_else(|| err("Midnight requires dust seed"))?;
+        let _dsk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(_dsk);
+        let night_vk = MidnightSigningKey::from_bytes(sender_private_key)
+            .map_err(|e| err(e.to_string()))?
+            .verifying_key();
 
-            let dust_ctime = dust_ctime
-                .ok_or_else(|| err("Midnight Preview/Preprod requires chain timestamp for dust"))?;
+        let dust_ctime =
+            dust_ctime.ok_or_else(|| err("Midnight requires chain timestamp for dust"))?;
 
-            Some(DustActions {
-                spends: vec![].into(),
-                registrations: vec![DustRegistration {
-                    allow_fee_payment: 0,
-                    dust_address: Some(Sp::new(dust_pk)),
-                    night_key: night_vk,
-                    signature: None,
-                }]
-                .into(),
-                ctime: dust_ctime,
-            })
-        } else {
-            None
-        };
+        Some(DustActions {
+            spends: vec![].into(),
+            registrations: vec![DustRegistration {
+                allow_fee_payment: 0,
+                dust_address: Some(Sp::new(dust_pk)),
+                night_key: night_vk,
+                signature: None,
+            }]
+            .into(),
+            ctime: dust_ctime,
+        })
+    } else {
+        None
+    };
 
     Ok(Intent {
         guaranteed_unshielded_offer: bal.guaranteed.clone().map(Sp::new),
@@ -1219,7 +1157,7 @@ fn assemble_proven_intent(
     })
 }
 
-/// Cover Preview/Preprod dust fees on a proven dapp tx, iterating until the ledger
+/// Cover dust fees on a proven dapp tx, iterating until the ledger
 /// reports a balanced transaction. Dust spend proofs add cost beyond the first-pass
 /// estimate (placeholder registration on `tx_first`), so a single estimate is not
 /// always enough.
@@ -1968,25 +1906,34 @@ mod tests {
         assert!(bal.registration_candidate.is_some());
     }
 
-    #[test]
-    fn plan_mainnet_uses_single_guaranteed_offer_without_fallible() {
-        let utxos = night_utxos(3, STARS_PER_NIGHT, false);
-        let sender = sender_bech32();
-        let bal = plan_balanced_unshielded_offers(
+    fn plan_mainnet(
+        utxos: &[UnshieldedUtxo],
+        guaranteed_outputs: Vec<UtxoOutput>,
+        fallible_outputs: Vec<UtxoOutput>,
+    ) -> BalancedUnshielded {
+        plan_balanced_unshielded_offers(
             "midnight:mainnet",
-            &sender,
+            &sender_bech32(),
             &SENDER_KEY,
-            &utxos,
-            vec![night_payment(STARS_PER_NIGHT)],
-            vec![],
-            None,
+            utxos,
+            guaranteed_outputs,
+            fallible_outputs,
+            Some(dust_ctime()),
         )
-        .unwrap();
-        assert!(bal.fallible.is_none());
-        assert!(bal.registration_candidate.is_none());
-        let guaranteed = bal.guaranteed.as_ref().expect("mainnet guaranteed offer");
-        assert_eq!(count_night_inputs(guaranteed), 1);
-        assert_eq!(offer_night_balance(guaranteed), 0);
+        .unwrap()
+    }
+
+    #[test]
+    fn plan_mainnet_routes_night_payments_through_fallible() {
+        let utxos = night_utxos(3, STARS_PER_NIGHT, false);
+        let bal = plan_mainnet(&utxos, vec![night_payment(STARS_PER_NIGHT)], vec![]);
+        assert!(bal.guaranteed.is_none());
+        let fallible = bal
+            .fallible
+            .as_ref()
+            .expect("mainnet fallible payment offer");
+        assert_eq!(count_night_inputs(fallible), 1);
+        assert_eq!(offer_night_balance(fallible), 0);
     }
 
     mod network_id_tests {
