@@ -9,16 +9,23 @@ use super::error::{PayError, PayErrorCode};
 
 use super::urls::http_url_to_ws_url;
 
+/// Node ledger check failure (`InvalidTransaction::Custom(192)`). Observed on the Preview
+/// node when an unshielded UTXO input was already spent (replay / stale indexer state).
+const LEDGER_BALANCE_CHECK_OUT_OF_BOUNDS: u16 = 192;
 /// Node ledger code for per-segment overspend (`InvalidTransaction::Custom(138)`).
 const LEDGER_BALANCE_CHECK_OVERSPEND: u16 = 138;
 /// Node ledger code for DUST spend proof verification failed (`InvalidTransaction::Custom(170)`).
 const LEDGER_INVALID_DUST_SPEND_PROOF: u16 = 170;
+/// DUST registration Schnorr signature failed (`InvalidTransaction::Custom(186)`).
+const LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE: u16 = 186;
 /// Pedersen binding commitment mismatch (`InvalidTransaction::Custom(185)`).
 const LEDGER_PEDERSEN_CHECK_FAILURE: u16 = 185;
 /// Zswap apply failure: unknown Merkle root, double-spend, etc. (`InvalidTransaction::Custom(103)`).
 const LEDGER_ZSWAP_INVALID: u16 = 103;
 /// Input references a UTXO absent from ledger state (`InvalidTransaction::Custom(195)`).
 const LEDGER_INPUT_NOT_IN_UTXOS: u16 = 195;
+/// Unshielded offer input count ≠ signature count (`InvalidTransaction::Custom(191)`).
+const LEDGER_INPUTS_SIGNATURES_LENGTH_MISMATCH: u16 = 191;
 
 type SealedTx = midnight_ledger::structure::Transaction<
     midnight_base_crypto::signatures::Signature,
@@ -126,6 +133,40 @@ fn preflight_sealed_tx_submit(tx: &SealedTx) -> Result<(), PayError> {
     ))
 }
 
+fn append_inputs_signatures_length_mismatch_hint(msg: &mut String) {
+    if msg.contains(&format!(
+        "Custom error: {LEDGER_INPUTS_SIGNATURES_LENGTH_MISMATCH}"
+    )) || msg.contains(&format!(
+        "Custom({LEDGER_INPUTS_SIGNATURES_LENGTH_MISMATCH})"
+    )) || msg.contains("InputsSignaturesLengthMismatch")
+    {
+        msg.push_str(&format!(
+            "\n\nLedger error {LEDGER_INPUTS_SIGNATURES_LENGTH_MISMATCH} \
+             (InputsSignaturesLengthMismatch): an unshielded offer has UTXO inputs without a \
+             matching Schnorr signature per input. This often happens when the dapp pre-filled \
+             deposit spends on a sealed tx or when balancing merged new inputs without re-signing. \
+             Rebuild with a current `ows` and retry `ows sign send-tx` with a fresh dapp tx."
+        ));
+    }
+}
+
+fn append_balance_out_of_bounds_hint(msg: &mut String) {
+    if msg.contains(&format!(
+        "Custom error: {LEDGER_BALANCE_CHECK_OUT_OF_BOUNDS}"
+    )) || msg.contains(&format!("Custom({LEDGER_BALANCE_CHECK_OUT_OF_BOUNDS})"))
+        || msg.contains("BalanceCheckOutOfBounds")
+    {
+        msg.push_str(&format!(
+            "\n\nLedger error {LEDGER_BALANCE_CHECK_OUT_OF_BOUNDS}: the node rejected the \
+             transaction during its ledger check. Empirically the Preview node also returns this \
+             code when an unshielded UTXO input was already spent (e.g. the same tx was submitted \
+             twice, or the dapp built the tx from stale indexer state). Re-create the transaction \
+             in the dapp against fresh wallet state and retry `ows sign send-tx`; if it persists, \
+             check that the input UTXOs still exist via `ows fund balance`."
+        ));
+    }
+}
+
 fn append_balance_overspend_hint(msg: &mut String) {
     if msg.contains("Custom error: 138")
         || msg.contains(&format!("Custom({LEDGER_BALANCE_CHECK_OVERSPEND})"))
@@ -151,6 +192,22 @@ fn append_invalid_dust_spend_hint(msg: &mut String) {
              spends when unregistered NIGHT inputs could fund a generationless registration \
              instead. Ensure the indexer returns block timestamps for UTXOs and pass the wallet \
              dust seed."
+        ));
+    }
+}
+
+fn append_invalid_dust_registration_hint(msg: &mut String) {
+    if msg.contains(&format!(
+        "Custom error: {LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE}"
+    )) || msg.contains(&format!(
+        "Custom({LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE})"
+    )) || msg.contains("InvalidDustRegistrationSignature")
+    {
+        msg.push_str(&format!(
+            "\n\nLedger error {LEDGER_INVALID_DUST_REGISTRATION_SIGNATURE} \
+             (InvalidDustRegistrationSignature): generationless DUST registration was not signed \
+             correctly for the final intent (often after balancing dropped contract claim outputs \
+             from the guaranteed segment). Rebuild with a current `ows` and retry `ows sign send-tx`."
         ));
     }
 }
@@ -469,8 +526,11 @@ pub async fn submit_unshielded_tx(
                 "\nMidnight payment_queryInfo unavailable: {info_err}"
             )),
         }
+        append_balance_out_of_bounds_hint(&mut msg);
+        append_inputs_signatures_length_mismatch_hint(&mut msg);
         append_balance_overspend_hint(&mut msg);
         append_invalid_dust_spend_hint(&mut msg);
+        append_invalid_dust_registration_hint(&mut msg);
         append_zswap_invalid_hint(&mut msg);
         append_pedersen_check_failure_hint(&mut msg);
         append_input_not_in_utxos_hint(&mut msg);

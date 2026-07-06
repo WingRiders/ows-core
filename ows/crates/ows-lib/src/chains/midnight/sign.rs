@@ -60,6 +60,15 @@ macro_rules! signing_key_vectors {
             .as_ref()
             .map(|da| da.registrations.len())
             .unwrap_or(0);
+        if let Some(da) = &$intent.dust_actions {
+            for reg in da.registrations.iter() {
+                if reg.night_key != vk {
+                    return Err(err(
+                        "dust registration night key must match the signing key",
+                    ));
+                }
+            }
+        }
         let reg_keys = vec![$signing_key.clone(); n_regs];
         (g_keys, f_keys, reg_keys)
     }};
@@ -84,7 +93,8 @@ pub(super) fn sign_prove_and_seal(
     let pair_sp = stx.intents.iter().next().expect("count == 1");
     let (seg_id_sp, intent_sp) = pair_sp.deref();
     let seg_id: u16 = *seg_id_sp.deref();
-    let intent = intent_sp.deref().clone();
+    let mut intent = intent_sp.deref().clone();
+    super::balance_sealed::clear_intent_unshielded_signatures(&mut intent);
 
     let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
         .map_err(|e| err(format!("invalid midnight signing key: {e}")))?;
@@ -149,7 +159,8 @@ pub(super) fn sign_and_seal(
     let pair_sp = stx.intents.iter().next().expect("count == 1");
     let (seg_id_sp, intent_sp) = pair_sp.deref();
     let seg_id: u16 = *seg_id_sp.deref();
-    let intent = intent_sp.deref().clone();
+    let mut intent = intent_sp.deref().clone();
+    super::balance_sealed::clear_intent_unshielded_signatures(&mut intent);
 
     let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
         .map_err(|e| err(format!("invalid midnight signing key: {e}")))?;

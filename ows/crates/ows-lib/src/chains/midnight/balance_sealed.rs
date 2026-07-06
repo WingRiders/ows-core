@@ -17,12 +17,13 @@ use midnight_coin_structure::coin::{
     Info as CoinInfo, ShieldedTokenType, TokenType as LedgerTokenType, UnshieldedTokenType,
     UserAddress, NIGHT,
 };
-use midnight_ledger::dust::{DustActions, DustLocalState, DustSecretKey};
+use midnight_ledger::dust::{DustLocalState, DustSecretKey};
 use midnight_ledger::structure::{
-    Intent, ProofKind, ProofMarker, ProofPreimageMarker, StandardTransaction, Transaction,
-    UnshieldedOffer, UtxoOutput, UtxoSpend,
+    Intent, PedersenDowngradeable, ProofKind, ProofMarker, ProofPreimageMarker,
+    StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
 };
 use midnight_serialize::{tagged_deserialize, tagged_serialize, Serializable};
+use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::{Offer as ZswapOffer, Output as ZswapOutput};
@@ -479,6 +480,20 @@ fn merge_taker_unshielded_complement_sealed(
         return Ok(merged);
     }
 
+    let Transaction::Standard(stx_ref) = &merged else {
+        return Err(err("expected Standard transaction"));
+    };
+    let deposit_tokens = super::balance::contract_deposit_tokens_in_tx(stx_ref);
+    for im in &imbalances {
+        if im.balance < 0 && deposit_tokens.contains(&im.token) {
+            return Err(err(format!(
+                "contract deposit token {} is still imbalanced after attach_contract; \
+                 wallet UTXO spends must stay on the contract intent segment (ledger error 192)",
+                hex::encode(im.token.0 .0)
+            )));
+        }
+    }
+
     let rt = super::async_runtime::runtime();
     let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
         .map_err(|e| err(format!("invalid signing key: {e}")))?;
@@ -611,8 +626,8 @@ fn merge_taker_unshielded_complement_sealed(
 }
 
 #[allow(clippy::type_complexity)]
-fn signing_key_vectors(
-    intent: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+fn signing_key_vectors<B>(
+    intent: &Intent<MnSig, ProofMarker, B, InMemoryDB>,
     signing_key: &MidnightSigningKey,
 ) -> Result<
     (
@@ -621,7 +636,12 @@ fn signing_key_vectors(
         Vec<MidnightSigningKey>,
     ),
     PayError,
-> {
+>
+where
+    B: midnight_storage::Storable<InMemoryDB>
+        + midnight_serialize::Serializable
+        + PedersenDowngradeable<InMemoryDB>,
+{
     let vk = signing_key.verifying_key();
     for inp in &intent.guaranteed_inputs() {
         if inp.owner != vk {
@@ -654,16 +674,116 @@ fn sign_proven_intent_segment(
     seg_id: u16,
     signing_key: &MidnightSigningKey,
 ) -> Result<(), PayError> {
+    sign_intent_segment(stx, seg_id, signing_key)
+}
+
+fn intent_unshielded_signatures_mismatch<B: midnight_storage::Storable<InMemoryDB>>(
+    intent: &Intent<MnSig, ProofMarker, B, InMemoryDB>,
+) -> bool {
+    for offer in [
+        intent.guaranteed_unshielded_offer.as_ref(),
+        intent.fallible_unshielded_offer.as_ref(),
+    ] {
+        let Some(sp) = offer else { continue };
+        let o = sp.deref();
+        let n_in = o.inputs.iter().count();
+        let n_sig = o.signatures.iter().count();
+        if n_in != n_sig {
+            return true;
+        }
+    }
+    false
+}
+
+/// `Intent::sign` appends signatures instead of replacing them, so re-signing an
+/// already-signed offer yields more signatures than inputs (ledger error 191).
+/// Always erase existing unshielded signatures before a re-sign pass.
+pub(super) fn clear_intent_unshielded_signatures<P, B>(intent: &mut Intent<MnSig, P, B, InMemoryDB>)
+where
+    P: ProofKind<InMemoryDB>,
+    B: midnight_storage::Storable<InMemoryDB>,
+{
+    for offer in [
+        &mut intent.guaranteed_unshielded_offer,
+        &mut intent.fallible_unshielded_offer,
+    ] {
+        if let Some(sp) = offer {
+            let mut o: UnshieldedOffer<MnSig, InMemoryDB> = (**sp).clone();
+            o.signatures = vec![].into();
+            *offer = Some(Sp::new(o));
+        }
+    }
+}
+
+fn sign_intent_segment<B>(
+    stx: &mut StandardTransaction<MnSig, ProofMarker, B, InMemoryDB>,
+    seg_id: u16,
+    signing_key: &MidnightSigningKey,
+) -> Result<(), PayError>
+where
+    B: midnight_storage::Storable<InMemoryDB>
+        + midnight_serialize::Serializable
+        + PedersenDowngradeable<InMemoryDB>,
+{
     let Some(pair) = stx.intents.iter().find(|p| *p.deref().0.deref() == seg_id) else {
         return Ok(());
     };
-    let intent = pair.deref().1.deref().clone();
+    let mut intent = pair.deref().1.deref().clone();
+    clear_intent_unshielded_signatures(&mut intent);
     let (g_keys, f_keys, reg_keys) = signing_key_vectors(&intent, signing_key)?;
     let mut rng = OsRng;
     let signed = intent
         .sign(&mut rng, seg_id, &g_keys, &f_keys, &reg_keys)
         .map_err(|e| err(format!("intent signing failed for segment {seg_id}: {e:?}")))?;
     stx.intents = stx.intents.insert(seg_id, signed);
+    Ok(())
+}
+
+/// Re-sign intent segments whose unshielded offers have inputs but mismatched signature counts
+/// (ledger error 191 / `InputsSignaturesLengthMismatch`).
+fn resign_unshielded_signature_mismatches(
+    merged: &mut TxSealed,
+    signing_key: &MidnightSigningKey,
+) -> Result<(), PayError> {
+    let Transaction::Standard(stx) = merged else {
+        return Err(err("expected Standard transaction"));
+    };
+    let segments: Vec<u16> = stx.intents.iter().map(|p| *p.deref().0.deref()).collect();
+    let mut intents = stx.intents.clone();
+    let mut changed = false;
+    for seg in segments {
+        let intent = intents
+            .iter()
+            .find(|p| *p.deref().0.deref() == seg)
+            .map(|p| p.deref().1.deref().clone());
+        let Some(mut intent) = intent else {
+            continue;
+        };
+        if !intent_unshielded_signatures_mismatch(&intent) {
+            continue;
+        }
+        clear_intent_unshielded_signatures(&mut intent);
+        let (g_keys, f_keys, reg_keys) = signing_key_vectors(&intent, signing_key)?;
+        let mut rng = OsRng;
+        let signed = intent
+            .sign(&mut rng, seg, &g_keys, &f_keys, &reg_keys)
+            .map_err(|e| {
+                err(format!(
+                    "re-sign unshielded offer failed (segment {seg}, error 191): {e:?}"
+                ))
+            })?;
+        intents = intents.insert(seg, signed);
+        changed = true;
+    }
+    if changed {
+        *merged = Transaction::Standard(StandardTransaction {
+            network_id: stx.network_id.clone(),
+            intents,
+            guaranteed_coins: stx.guaranteed_coins.clone(),
+            fallible_coins: stx.fallible_coins.clone(),
+            binding_randomness: stx.binding_randomness,
+        });
+    }
     Ok(())
 }
 
@@ -682,6 +802,174 @@ fn sync_dust_state(
     .map_err(|e| err(format!("dust sync failed: {e}")))
 }
 
+/// Dapp `sendToUser` / claim txs often ship placeholder dust spends without registration
+/// or guaranteed NIGHT inputs, which fails at submit with error 170.
+fn guaranteed_has_night_input<B: midnight_storage::Storable<InMemoryDB>>(
+    intent: &Intent<MnSig, ProofMarker, B, InMemoryDB>,
+) -> bool {
+    intent
+        .guaranteed_unshielded_offer
+        .as_ref()
+        .is_some_and(|offer| offer.inputs.iter_deref().any(|inp| inp.type_ == NIGHT))
+}
+
+/// Whether dust spend ZK proofs on this intent satisfy ledger rules (error 170 otherwise).
+fn intent_dust_spends_ledger_valid<B: midnight_storage::Storable<InMemoryDB>>(
+    intent: &Intent<MnSig, ProofMarker, B, InMemoryDB>,
+) -> bool {
+    let Some(da) = intent.dust_actions.as_ref() else {
+        return true;
+    };
+    if da.spends.iter().next().is_none() {
+        return true;
+    }
+    if da.registrations.iter().next().is_some() {
+        return true;
+    }
+    guaranteed_has_night_input(intent)
+}
+
+fn intent_has_invalid_dust_spends<B: midnight_storage::Storable<InMemoryDB>>(
+    intent: &Intent<MnSig, ProofMarker, B, InMemoryDB>,
+) -> bool {
+    intent
+        .dust_actions
+        .as_ref()
+        .is_some_and(|da| da.spends.iter().next().is_some())
+        && !intent_dust_spends_ledger_valid(intent)
+}
+
+fn sealed_dust_fees_already_valid(merged: &TxSealed) -> bool {
+    let Transaction::Standard(stx) = merged else {
+        return false;
+    };
+    let mut has_fee_dust = false;
+    for p in stx.intents.iter() {
+        let intent = p.deref().1.deref();
+        if !intent_dust_spends_ledger_valid(intent) {
+            return false;
+        }
+        if intent.dust_actions.as_ref().is_some_and(|da| {
+            da.spends.iter().next().is_some() || da.registrations.iter().next().is_some()
+        }) {
+            has_fee_dust = true;
+        }
+    }
+    has_fee_dust
+}
+
+fn strip_unregistered_dust_spends_from_sealed(
+    merged: &mut TxSealed,
+    signing_key: &MidnightSigningKey,
+) -> Result<bool, PayError> {
+    let Transaction::Standard(stx) = merged else {
+        return Err(err("expected Standard transaction"));
+    };
+    let segments: Vec<u16> = stx.intents.iter().map(|p| *p.deref().0.deref()).collect();
+    let mut intents = stx.intents.clone();
+    let mut changed = false;
+    for seg in segments {
+        let intent = intents
+            .iter()
+            .find(|p| *p.deref().0.deref() == seg)
+            .map(|p| p.deref().1.deref().clone());
+        let Some(intent) = intent else {
+            continue;
+        };
+        if !intent_has_invalid_dust_spends(&intent) {
+            continue;
+        }
+        let mut cleared = intent;
+        cleared.dust_actions = None;
+        clear_intent_unshielded_signatures(&mut cleared);
+        let (g_keys, f_keys, reg_keys) = signing_key_vectors(&cleared, signing_key)?;
+        let mut rng = OsRng;
+        let signed = cleared
+            .sign(&mut rng, seg, &g_keys, &f_keys, &reg_keys)
+            .map_err(|e| err(format!("re-sign after stripping dust spends failed: {e:?}")))?;
+        intents = intents.insert(seg, signed);
+        changed = true;
+    }
+    if changed {
+        *merged = Transaction::Standard(StandardTransaction {
+            network_id: stx.network_id.clone(),
+            intents,
+            guaranteed_coins: stx.guaranteed_coins.clone(),
+            fallible_coins: stx.fallible_coins.clone(),
+            binding_randomness: stx.binding_randomness,
+        });
+    }
+    Ok(changed)
+}
+
+/// Attach wallet UTXO spends for contract `receiveTokens` deposits on the contract
+/// intent segment. Without this, [`merge_taker_unshielded_complement_sealed`] would
+/// place inputs on a new segment and the ledger rejects with error 192
+/// (`BalanceCheckOutOfBounds`).
+fn attach_contract_deposits_sealed(
+    chain_id: &str,
+    indexer_url: &str,
+    sender_private_key: &[u8; 32],
+    scope: &SyncCacheScope,
+    merged: &mut TxSealed,
+) -> Result<(), PayError> {
+    let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
+        .map_err(|e| err(format!("invalid signing key: {e}")))?;
+    let Transaction::Standard(stx) = merged else {
+        return Err(err("expected Standard transaction"));
+    };
+    let segments: Vec<u16> = stx.intents.iter().map(|p| *p.deref().0.deref()).collect();
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let rt = super::async_runtime::runtime();
+    let mut intents = stx.intents.clone();
+    let mut changed = false;
+    for seg in segments {
+        let intent = intents
+            .iter()
+            .find(|p| *p.deref().0.deref() == seg)
+            .map(|p| p.deref().1.deref().clone());
+        let Some(intent) = intent else {
+            continue;
+        };
+        let Some(mut patched) = super::balance::patch_intent_contract_deposit_offers(
+            rt,
+            chain_id,
+            indexer_url,
+            sender_private_key,
+            scope,
+            seg,
+            &intent,
+        )?
+        else {
+            continue;
+        };
+        clear_intent_unshielded_signatures(&mut patched);
+        let (g_keys, f_keys, reg_keys) = signing_key_vectors(&patched, &signing_key)?;
+        let mut rng = OsRng;
+        let signed = patched
+            .sign(&mut rng, seg, &g_keys, &f_keys, &reg_keys)
+            .map_err(|e| {
+                err(format!(
+                    "re-sign after contract deposit patch failed (segment {seg}): {e:?}"
+                ))
+            })?;
+        intents = intents.insert(seg, signed);
+        changed = true;
+    }
+    if changed {
+        *merged = Transaction::Standard(StandardTransaction {
+            network_id: stx.network_id.clone(),
+            intents,
+            guaranteed_coins: stx.guaranteed_coins.clone(),
+            fallible_coins: stx.fallible_coins.clone(),
+            binding_randomness: stx.binding_randomness,
+        });
+    }
+    Ok(())
+}
+
 fn cover_dust_fees_sealed(
     chain_id: &str,
     indexer_url: &str,
@@ -695,17 +983,10 @@ fn cover_dust_fees_sealed(
         return Ok(merged);
     }
 
-    let Transaction::Standard(stx) = &merged else {
-        return Err(err("expected Standard transaction"));
-    };
-    if stx.intents.iter().any(|p| {
-        p.deref()
-            .1
-            .deref()
-            .dust_actions
-            .as_ref()
-            .is_some_and(|da| !da.spends.is_empty())
-    }) {
+    let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
+        .map_err(|e| err(format!("invalid signing key: {e}")))?;
+    strip_unregistered_dust_spends_from_sealed(&mut merged, &signing_key)?;
+    if sealed_dust_fees_already_valid(&merged) {
         return Ok(merged);
     }
 
@@ -734,30 +1015,35 @@ fn cover_dust_fees_sealed(
         .map_err(|e| err(format!("fee estimate failed: {e:?}")))?;
 
     let dsk = DustSecretKey::derive_secret_key(&dust_seed);
-    let dust_state = sync_dust_state(rt, indexer_url, &dust_seed, scope)?;
-    let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
-        .map_err(|e| err(format!("invalid signing key: {e}")))?;
+    let sender_addr = MidnightSigner
+        .derive_address_for_chain_id(chain_id, sender_private_key)
+        .map_err(|e| err(e.to_string()))?;
+    let utxos = rt.block_on(super::unshielded_sync::get_unshielded_utxos_scoped(
+        indexer_url,
+        &sender_addr,
+        scope,
+    ))?;
 
     const MAX_ITERS: usize = 8;
     for attempt in 0..MAX_ITERS {
+        let dust_state = sync_dust_state(rt, indexer_url, &dust_seed, scope)?;
         let seg = fee_segment.saturating_add(attempt as u16);
-        let spends = super::balance::select_dust_spends_preimage(
+        let (guaranteed, fallible, dust_preimage) = super::balance::build_fee_dust_intent_parts(
+            chain_id,
+            &sender_addr,
+            sender_private_key,
+            &utxos,
             dust_state.clone(),
             &dsk,
             fee_target,
             dust_ctime,
         )?;
-        let dust_preimage = DustActions {
-            spends: spends.into_iter().collect(),
-            registrations: vec![].into(),
-            ctime: dust_ctime,
-        };
         let mut rng = OsRng;
         let intent_preimage: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
             Intent::new(
                 &mut rng,
-                None,
-                None,
+                guaranteed,
+                fallible,
                 vec![],
                 vec![],
                 vec![],
@@ -872,13 +1158,28 @@ pub fn balance_sealed_transaction(
                 maker
             };
 
-            merged = merge_taker_unshielded_complement_sealed(
+            attach_contract_deposits_sealed(
                 chain_id,
                 indexer_url,
                 sender_private_key,
                 scope,
-                merged,
+                &mut merged,
             )?;
+
+            let Transaction::Standard(stx_after_attach) = &merged else {
+                return Err(err("expected Standard transaction"));
+            };
+            let is_contract_deposit =
+                !super::balance::contract_deposit_tokens_in_tx(stx_after_attach).is_empty();
+            if !is_contract_deposit {
+                merged = merge_taker_unshielded_complement_sealed(
+                    chain_id,
+                    indexer_url,
+                    sender_private_key,
+                    scope,
+                    merged,
+                )?;
+            }
 
             if pay_fees {
                 let seed = dust_seed
@@ -893,6 +1194,9 @@ pub fn balance_sealed_transaction(
                     pay_fees,
                 )?;
             }
+            let signing_key = MidnightSigningKey::from_bytes(sender_private_key)
+                .map_err(|e| err(format!("invalid signing key: {e}")))?;
+            resign_unshielded_signature_mismatches(&mut merged, &signing_key)?;
             serialize_sealed(merged)
         }
         ParsedMaker::Proven(maker) => {
@@ -930,6 +1234,124 @@ pub fn balance_sealed_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deposit_tx_fixture_is_receive_tokens_sealed() {
+        let hex_s = include_str!("../../../tests/deposit_tx.hex");
+        let bytes = hex::decode(hex_s.trim()).expect("hex");
+        assert!(is_sealed_midnight_payload(&bytes));
+        assert!(
+            bytes.windows(13).any(|w| w == b"receiveTokens"),
+            "fixture must be a receiveTokens deposit"
+        );
+        let mut r: &[u8] = &bytes;
+        let _: TxSealed = tagged_deserialize(&mut r).expect("deserialize deposit tx");
+    }
+
+    /// A sealed tx must carry exactly one Schnorr signature per unshielded input,
+    /// or the node rejects it with `InputsSignaturesLengthMismatch` (191).
+    #[test]
+    fn deposit_tx_fixture_has_one_signature_per_unshielded_input() {
+        use midnight_ledger::structure::Transaction;
+        let hex_s = include_str!("../../../tests/deposit_tx.hex");
+        let bytes = hex::decode(hex_s.trim()).expect("hex");
+        let mut r: &[u8] = &bytes;
+        let tx: TxSealed = tagged_deserialize(&mut r).expect("deserialize");
+        let Transaction::Standard(stx) = tx else {
+            panic!("expected standard");
+        };
+        for pair in stx.intents.iter() {
+            let seg = *pair.deref().0.deref();
+            let intent = pair.deref().1.deref();
+            for (label, offer) in [
+                ("guaranteed", intent.guaranteed_unshielded_offer.as_ref()),
+                ("fallible", intent.fallible_unshielded_offer.as_ref()),
+            ] {
+                let Some(sp) = offer else { continue };
+                let o = sp.deref();
+                assert_eq!(
+                    o.inputs.iter().count(),
+                    o.signatures.iter().count(),
+                    "seg {seg} {label}: InputsSignaturesLengthMismatch (191)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resigning_intent_clears_stale_signatures_first() {
+        let mut rng = OsRng;
+        let sk = MidnightSigningKey::sample(rng);
+        let offer: UnshieldedOffer<MnSig, InMemoryDB> = UnshieldedOffer {
+            inputs: vec![UtxoSpend {
+                value: 100,
+                owner: sk.verifying_key(),
+                type_: NIGHT,
+                intent_hash: super::super::balance::parse_intent_hash_hex(&"00".repeat(32))
+                    .expect("intent hash"),
+                output_no: 0,
+            }]
+            .into(),
+            outputs: vec![].into(),
+            signatures: vec![].into(),
+        };
+        let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            Intent::new(
+                &mut rng,
+                Some(offer),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                Timestamp::from_secs(0),
+            );
+
+        let sig_count = |i: &Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB>| {
+            i.guaranteed_unshielded_offer
+                .as_ref()
+                .map(|o| o.signatures.iter().count())
+                .unwrap_or(0)
+        };
+
+        let keys = vec![sk.clone()];
+        let signed = intent
+            .sign(&mut rng, 1, &keys, &[], &[])
+            .expect("first sign");
+        assert_eq!(sig_count(&signed), 1);
+
+        // Ledger's `Intent::sign` appends: signing again without clearing doubles the count.
+        let double_signed = signed
+            .clone()
+            .sign(&mut rng, 1, &keys, &[], &[])
+            .expect("second sign");
+        assert_eq!(sig_count(&double_signed), 2, "sign() appends signatures");
+
+        // Clearing first keeps the count at one signature per input.
+        let mut cleared = signed;
+        clear_intent_unshielded_signatures(&mut cleared);
+        assert_eq!(sig_count(&cleared), 0);
+        let resigned = cleared.sign(&mut rng, 1, &keys, &[], &[]).expect("re-sign");
+        assert_eq!(sig_count(&resigned), 1);
+    }
+
+    #[test]
+    fn claim_tx_dapp_dust_spends_are_not_fee_complete() {
+        let hex_s = include_str!("../../../tests/claim_tx.hex");
+        let bytes = hex::decode(hex_s.trim()).expect("hex");
+        let mut r: &[u8] = &bytes;
+        let tx: TxSealed = tagged_deserialize(&mut r).expect("deserialize claim tx");
+        assert!(
+            !sealed_dust_fees_already_valid(&tx),
+            "dapp dust spends without registration must not skip fee cover"
+        );
+        let Transaction::Standard(stx) = &tx else {
+            panic!("expected standard tx");
+        };
+        let intent_sp = stx.intents.iter().next().unwrap();
+        let intent = intent_sp.deref().1.deref();
+        assert!(intent_has_invalid_dust_spends(intent));
+    }
 
     #[test]
     fn parse_maker_swap_json_tx_field() {
