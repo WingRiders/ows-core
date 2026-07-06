@@ -383,7 +383,7 @@ pub fn seal_imbalanced_unsealed(
             "makeIntent output must be a proof-preimage,embedded-fr transaction",
         ));
     }
-    sign::sign_prove_and_seal(chain_id, indexer_url, tx_bytes, &key32)
+    sign::seal_imbalanced_preimage(chain_id, indexer_url, tx_bytes, &key32)
 }
 
 /// Run [`balance_sealed::balance_sealed_transaction`] on a maker swap offer.
@@ -441,7 +441,8 @@ pub use balance_sealed::{
     parse_maker_swap_input,
 };
 pub use mip6::{
-    encode_zswap_offer_bech32, export_mip6_offer_json_from_maker_bytes, is_mip6_offer_payload,
+    decode_zswap_offer_bech32, encode_zswap_offer_bech32, export_mip6_offer_json_from_maker_bytes,
+    is_mip6_offer_payload,
 };
 
 #[cfg(test)]

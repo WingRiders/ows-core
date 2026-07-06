@@ -123,6 +123,7 @@ fn post_submit_timeout_error(
 }
 
 /// Poll until the indexer and on-disk snapshots reflect `ledger_tx_hash`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn ensure_submitted_tx_reflected(
     indexer_url: &str,
     scope: &SyncCacheScope,
@@ -353,8 +354,10 @@ pub(super) async fn ensure_submitted_tx_reflected(
                         }
                     } else {
                         let dsk = midnight_ledger::dust::DustSecretKey::derive_secret_key(seed);
-                        let mut dust_opts = dust_sync::DustSyncOptions::default();
-                        dust_opts.min_required_event_id = tx_summary.max_dust_ledger_event_id;
+                        let dust_opts = dust_sync::DustSyncOptions {
+                            min_required_event_id: tx_summary.max_dust_ledger_event_id,
+                            ..Default::default()
+                        };
                         match dust_sync::sync_dust_local_state_scoped_with_options(
                             indexer_url,
                             &dsk,

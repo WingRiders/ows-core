@@ -137,6 +137,65 @@ pub(super) fn sign_prove_and_seal(
     Ok(out)
 }
 
+/// Seal an imbalanced `proof-preimage,embedded-fr` payload from [`makeIntent`].
+pub(super) fn seal_imbalanced_preimage(
+    chain_id: &str,
+    indexer_url: &str,
+    tx_bytes: &[u8],
+    sender_private_key: &[u8; 32],
+) -> Result<Vec<u8>, PayError> {
+    if preimage_has_no_intents(tx_bytes)? {
+        prove_and_seal_zswap_only(chain_id, indexer_url, tx_bytes)
+    } else {
+        sign_prove_and_seal(chain_id, indexer_url, tx_bytes, sender_private_key)
+    }
+}
+
+fn preimage_has_no_intents(tx_bytes: &[u8]) -> Result<bool, PayError> {
+    let mut r: &[u8] = tx_bytes;
+    let tx: TxPreimage = tagged_deserialize(&mut r)
+        .map_err(|e| err(format!("failed to parse makeIntent tx: {e}")))?;
+    let Transaction::Standard(stx) = tx else {
+        return Err(err("expected Standard transaction"));
+    };
+    Ok(stx.intents.iter().count() == 0)
+}
+
+/// Prove and seal an imbalanced zswap-only transaction with no intent segments
+/// (shielded-only [`makeIntent`] swap offers in `guaranteed_coins` / `fallible_coins`).
+pub(super) fn prove_and_seal_zswap_only(
+    chain_id: &str,
+    indexer_url: &str,
+    tx_bytes: &[u8],
+) -> Result<Vec<u8>, PayError> {
+    let mut r: &[u8] = tx_bytes;
+    let tx: TxPreimage = tagged_deserialize(&mut r)
+        .map_err(|e| err(format!("failed to parse balanced tx bytes: {e}")))?;
+    let Transaction::Standard(ref stx) = tx else {
+        return Err(err("expected Standard transaction"));
+    };
+    super::ensure_tx_network_id_matches_chain(chain_id, &stx.network_id)?;
+    if stx.intents.iter().count() != 0 {
+        return Err(err("expected no intent segments for zswap-only sealing"));
+    }
+    if stx.guaranteed_coins.is_none() && stx.fallible_coins.iter().next().is_none() {
+        return Err(err("zswap-only transaction has no shielded offers"));
+    }
+
+    let ledger_params = super::block_on(super::fetch_indexer_ledger_parameters(indexer_url))
+        .map_err(|e| err(format!("ledger params: {e}")))?;
+    let prover = super::OwsProver::from_env().map_err(|e| err(format!("prover: {e}")))?;
+    let proven = super::block_on(tx.prove(prover, &ledger_params.cost_model.runtime_cost_model))
+        .map_err(|e| err(format!("prove tx failed: {e:?}")))?;
+    let sealed: TxSealed = {
+        use rand::{rngs::StdRng, SeedableRng as _};
+        proven.seal(StdRng::from_entropy())
+    };
+    let mut out = Vec::new();
+    tagged_serialize(&sealed, &mut out).map_err(|e| err(format!("serialize sealed tx: {e}")))?;
+    Ok(out)
+}
+
 /// Sign + seal a balanced proven transaction (`proof,embedded-fr`).
 ///
 /// The dapp has already proven the contract calls / zswap offers, so this skips

@@ -2230,6 +2230,7 @@ fn attach_shielded_proven_inputs_if_needed(
             &mut wallet,
             segment,
             &seg_deficits,
+            false,
         )?;
         if selection.inputs.is_empty() {
             continue;
@@ -2242,6 +2243,7 @@ fn attach_shielded_proven_inputs_if_needed(
             segment,
             &selection.spent_by_token,
             &seg_deficits,
+            &std::collections::HashSet::new(),
         )?;
         for out in &change_outputs {
             binding_delta = binding_delta + out.binding_randomness();

@@ -83,64 +83,34 @@ pub fn parse_maker_swap_input(chain_id: &str, raw: &str) -> Result<Vec<u8>, PayE
     decode_maker_tx_hex_or_offer(chain_id, trimmed)
 }
 
-/// Public entry for MIP-0006 validation (hex or `zswapoffer` in the `transaction` field).
-pub fn decode_maker_tx_hex_or_offer_public(chain_id: &str, s: &str) -> Result<Vec<u8>, PayError> {
-    decode_maker_tx_hex_or_offer(chain_id, s)
-}
-
 fn decode_maker_tx_hex_or_offer(chain_id: &str, s: &str) -> Result<Vec<u8>, PayError> {
     let t = s.trim();
     if t.starts_with("zswapoffer") {
-        let segment = mip6::DEFAULT_ZSWAP_OFFER_SEGMENT;
-        return wrap_zswap_offer_as_proven_tx(chain_id, t, segment);
+        return wrap_zswap_offer_as_proven_tx(chain_id, t);
     }
     let hex_s = t.strip_prefix("0x").unwrap_or(t);
     hex::decode(hex_s).map_err(|e| err(format!("invalid hex transaction: {e}")))
 }
 
-/// Decode a MIP-0005 `zswapoffer…` bech32 string into a Zswap offer.
-pub fn decode_zswap_offer_bech32_public(
-    s: &str,
-) -> Result<ZswapOffer<ZswapProof, InMemoryDB>, PayError> {
-    decode_zswap_offer_bech32(s)
-}
-
-/// Wrap a bare `zswapoffer…` bech32 offer in a minimal proven Midnight transaction.
-pub fn wrap_zswap_offer_as_proven_tx_public(
+pub(super) fn wrap_zswap_offer_as_proven_tx(
     chain_id: &str,
     bech32_offer: &str,
-    segment: u16,
 ) -> Result<Vec<u8>, PayError> {
-    wrap_zswap_offer_as_proven_tx(chain_id, bech32_offer, segment)
-}
-
-fn decode_zswap_offer_bech32(s: &str) -> Result<ZswapOffer<ZswapProof, InMemoryDB>, PayError> {
-    let (hrp, data) =
-        bech32::decode(s.trim()).map_err(|e| err(format!("invalid zswap offer bech32: {e}")))?;
-    if !hrp.as_str().starts_with("zswapoffer") {
-        return Err(err(format!(
-            "expected zswapoffer bech32 HRP, got {}",
-            hrp.as_str()
-        )));
-    }
-    let mut r: &[u8] = &data;
-    tagged_deserialize(&mut r).map_err(|e| err(format!("failed to parse zswap offer: {e}")))
-}
-
-fn wrap_zswap_offer_as_proven_tx(
-    chain_id: &str,
-    bech32_offer: &str,
-    segment: u16,
-) -> Result<Vec<u8>, PayError> {
-    let offer = decode_zswap_offer_bech32(bech32_offer)?;
-    let mut fallible: MnHashMap<u16, ZswapOffer<ZswapProof, InMemoryDB>, InMemoryDB> =
-        MnHashMap::new();
-    fallible = fallible.insert(segment, offer);
+    let offer = mip6::decode_zswap_offer_bech32(bech32_offer)?;
+    let in_guaranteed = mip6::zswap_offer_belongs_in_guaranteed(&offer);
+    let (guaranteed_coins, fallible_coins) = if in_guaranteed {
+        (Some(Sp::new(offer)), MnHashMap::new())
+    } else {
+        let mut fallible: MnHashMap<u16, ZswapOffer<ZswapProof, InMemoryDB>, InMemoryDB> =
+            MnHashMap::new();
+        fallible = fallible.insert(mip6::DEFAULT_ZSWAP_OFFER_SEGMENT, offer);
+        (None, fallible)
+    };
     let stx = StandardTransaction {
         network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents: MnHashMap::new(),
-        guaranteed_coins: None,
-        fallible_coins: fallible,
+        guaranteed_coins,
+        fallible_coins,
         binding_randomness: Default::default(),
     };
     let tx: TxProven = Transaction::Standard(stx);
@@ -237,7 +207,7 @@ fn build_taker_zswap_preimage(
             spent_by_token: vec![],
         }
     } else {
-        collect_shielded_preimage_inputs(wallet, segment, deficits)?
+        collect_shielded_preimage_inputs(wallet, segment, deficits, false)?
     };
 
     let mut outputs = Vec::new();
@@ -255,8 +225,13 @@ fn build_taker_zswap_preimage(
         outputs.push(out);
     }
 
-    let change_outputs =
-        build_shielded_change_outputs(wallet, segment, &selection.spent_by_token, deficits)?;
+    let change_outputs = build_shielded_change_outputs(
+        wallet,
+        segment,
+        &selection.spent_by_token,
+        deficits,
+        &std::collections::HashSet::new(),
+    )?;
     outputs.extend(change_outputs);
 
     if selection.inputs.is_empty() && outputs.is_empty() {

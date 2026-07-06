@@ -27,7 +27,7 @@ Save the `signature` hex from the output (full sealed wire). That is the imbalan
 ## MIP-0006 offer payloads
 
 [MIP-0006](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0006-p2p-atomic-swaps.md)
-defines a portable swap offer JSON shape (often with a bare [`zswapoffer1…`](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0005-zswap-offer-encoding.md)
+defines a portable swap offer JSON shape (often with a bare [`zswapoffer1…`](https://github.com/midnightntwrk/midnight-improvement-proposals/blob/main/mips/mip-0005-offer-files.md)
 bech32 in the `transaction` field). OWS validates this before balancing:
 
 | Check | Behavior |
@@ -35,7 +35,7 @@ bech32 in the `transaction` field). OWS validates this before balancing:
 | `version` | Must be `1` |
 | `gives` / `wants` | Compared to Zswap offer deltas (positive = maker gives, negative = maker wants) |
 | `auth` (optional) | `schnorr-bip340` over RFC 8785 canonical JSON (SHA-256 digest) |
-| `transaction` | `zswapoffer…` bech32, or sealed/proven Midnight hex |
+| `transaction` | `zswapoffer…` bech32 per MIP-0005 (required for MIP-0006 JSON; use sealed hex with `balanceSealedTransaction` for the OWS swap path) |
 
 Pass the full JSON as `--tx` (or inside `balanceSealedTransaction` via the dapp connector parser):
 
@@ -59,9 +59,8 @@ ows sign export-mip6-offer \
   --json
 ```
 
-This extracts the Zswap offer, encodes it as `zswapoffer1…` bech32 (MIP-0005) when the offer is
-compact enough for bech32, otherwise embeds the full maker sealed/proven hex in `transaction`
-(still valid MIP-0006). `gives` / `wants` are always derived from offer deltas.
+This extracts the Zswap offer and encodes it as `zswapoffer1…` bech32 (MIP-0005 raw ledger serialization, no tag prefix).
+`gives` / `wants` are derived from offer deltas. Export fails if the maker offer sends given tokens to the counterparty (empty `gives`).
 
 Shielded-only maker example (party #1 gives custom token A, wants custom token B):
 

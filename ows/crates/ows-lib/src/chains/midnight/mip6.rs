@@ -5,7 +5,7 @@ use super::error::{PayError, PayErrorCode};
 use super::parse_token_type;
 use k256::schnorr::{signature::Verifier, Signature as SchnorrSignature, VerifyingKey};
 use midnight_coin_structure::coin::ShieldedTokenType;
-use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use midnight_serialize::{tagged_deserialize, Deserializable, Serializable};
 use midnight_storage::db::InMemoryDB;
 use midnight_zswap::Offer as ZswapOffer;
 use serde::Deserialize;
@@ -21,8 +21,8 @@ fn err(msg: impl Into<String>) -> PayError {
 /// Default fallible segment when wrapping a bare [`zswapoffer`] bech32 (MIP-0005) into a proven tx.
 pub const DEFAULT_ZSWAP_OFFER_SEGMENT: u16 = 1;
 
-/// MIP-0005 bech32 human-readable part for a bare Zswap offer.
-pub const ZSWAP_OFFER_BECH32_HRP: &str = "zswapoffer1";
+/// MIP-0005 bech32 human-readable part for a bare Zswap offer (`zswapoffer1…` on the wire).
+pub const ZSWAP_OFFER_BECH32_HRP: &str = "zswapoffer";
 
 #[derive(Debug, Clone, Deserialize)]
 struct Mip6TokenAmountJson {
@@ -201,37 +201,60 @@ fn aggregate_gives_wants(
     (gives, wants)
 }
 
-/// Infer fallible segment when wrapping bare `zswapoffer` into a proven tx.
+/// True when a bare Zswap offer should be placed in `guaranteed_coins` (segment 0), matching
+/// [`super::dapp_connector::build_make_intent_unsealed_tx`] maker placement for relay solvers.
+pub fn zswap_offer_belongs_in_guaranteed(offer: &ZswapOffer<ZswapProof, InMemoryDB>) -> bool {
+    let has_inputs = offer.inputs.iter_deref().next().is_some();
+    let has_outputs = offer.outputs.iter_deref().next().is_some();
+    let shielded_swap = has_inputs && has_outputs;
+    has_outputs && (shielded_swap || !has_inputs)
+}
+
+/// Infer Zswap segment when wrapping bare `zswapoffer` into a proven tx.
 pub fn infer_zswap_segment_from_maker_bytes(maker_bytes: &[u8]) -> u16 {
     const TAG_PROVEN: &[u8] = b"midnight:transaction[v9](signature[v1],proof,embedded-fr[v1]):";
-    if !maker_bytes.starts_with(TAG_PROVEN) {
-        return DEFAULT_ZSWAP_OFFER_SEGMENT;
-    }
+    const TAG_SEALED: &[u8] =
+        b"midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):";
+
     use midnight_base_crypto::signatures::Signature as MnSig;
     use midnight_ledger::structure::{ProofMarker, Transaction};
     use transient_crypto::commitment::PedersenRandomness;
 
-    let mut r: &[u8] = maker_bytes;
-    let Ok(tx): Result<Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, _> =
-        tagged_deserialize(&mut r)
-    else {
-        return DEFAULT_ZSWAP_OFFER_SEGMENT;
+    let parse_stx = |bytes: &[u8]| -> Option<
+        midnight_ledger::structure::StandardTransaction<
+            MnSig,
+            ProofMarker,
+            PedersenRandomness,
+            InMemoryDB,
+        >,
+    > {
+        let mut r: &[u8] = bytes;
+        let tx: Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> =
+            tagged_deserialize(&mut r).ok()?;
+        let Transaction::Standard(stx) = tx else {
+            return None;
+        };
+        Some(stx)
     };
-    let Transaction::Standard(stx) = tx else {
-        return DEFAULT_ZSWAP_OFFER_SEGMENT;
-    };
-    let mut segments: Vec<u16> = stx
-        .fallible_coins
-        .iter()
-        .map(|p| *p.deref().0.deref())
-        .collect();
-    segments.sort_unstable();
-    segments.dedup();
-    if segments.len() == 1 {
-        segments[0]
-    } else {
-        DEFAULT_ZSWAP_OFFER_SEGMENT
+
+    if maker_bytes.starts_with(TAG_PROVEN) || maker_bytes.starts_with(TAG_SEALED) {
+        if let Some(stx) = parse_stx(maker_bytes) {
+            if stx.guaranteed_coins.is_some() {
+                return super::dapp_connector::GUARANTEED_ZSWAP_SEGMENT;
+            }
+            let mut segments: Vec<u16> = stx
+                .fallible_coins
+                .iter()
+                .map(|p| *p.deref().0.deref())
+                .collect();
+            segments.sort_unstable();
+            segments.dedup();
+            if segments.len() == 1 {
+                return segments[0];
+            }
+        }
     }
+    DEFAULT_ZSWAP_OFFER_SEGMENT
 }
 
 fn verify_auth(payload: &serde_json::Value, auth: &Mip6AuthJson) -> Result<(), PayError> {
@@ -304,26 +327,26 @@ pub fn materialize_validated_offer(
     }
 
     let transaction = payload.transaction.trim();
-    let (maker_bytes, offers) = if transaction.starts_with("zswapoffer") {
-        let offer = super::balance_sealed::decode_zswap_offer_bech32_public(transaction)?;
-        let segment = DEFAULT_ZSWAP_OFFER_SEGMENT;
-        let bytes = super::balance_sealed::wrap_zswap_offer_as_proven_tx_public(
-            chain_id,
-            transaction,
-            segment,
-        )?;
-        if infer_zswap_segment_from_maker_bytes(&bytes) != segment {
-            return Err(err(
-                "internal error: wrapped zswap offer segment does not match fallible segment",
-            ));
-        }
-        (bytes, vec![offer])
+    if !transaction.starts_with("zswapoffer") {
+        return Err(err(
+            "MIP-0006 transaction field must be a zswapoffer… bech32 string per MIP-0005; \
+             use balanceSealedTransaction with sealed/proven hex for the OWS swap path",
+        ));
+    }
+    let offer = decode_zswap_offer_bech32(transaction)?;
+    let expected_segment = if zswap_offer_belongs_in_guaranteed(&offer) {
+        super::dapp_connector::GUARANTEED_ZSWAP_SEGMENT
     } else {
-        let maker_bytes =
-            super::balance_sealed::decode_maker_tx_hex_or_offer_public(chain_id, transaction)?;
-        let offers = offers_from_maker_bytes(&maker_bytes)?;
-        (maker_bytes, offers)
+        DEFAULT_ZSWAP_OFFER_SEGMENT
     };
+    let bytes = super::balance_sealed::wrap_zswap_offer_as_proven_tx(chain_id, transaction)?;
+    if infer_zswap_segment_from_maker_bytes(&bytes) != expected_segment {
+        return Err(err(
+            "internal error: wrapped zswap offer segment does not match expected zswap segment",
+        ));
+    }
+    let maker_bytes = bytes;
+    let offers = vec![offer];
     let (actual_gives, actual_wants) = aggregate_gives_wants(&offers);
     let advertised_gives = advertised_token_map(&payload.gives, "gives")?;
     let advertised_wants = advertised_token_map(&payload.wants, "wants")?;
@@ -337,32 +360,78 @@ pub fn materialize_validated_offer(
     Ok(maker_bytes)
 }
 
+/// Serialize a proven Zswap offer per MIP-0005 (raw ledger bytes, no tag prefix).
+pub fn serialize_zswap_offer_raw(
+    offer: &ZswapOffer<ZswapProof, InMemoryDB>,
+) -> Result<Vec<u8>, PayError> {
+    let mut buf = Vec::new();
+    offer
+        .serialize(&mut buf)
+        .map_err(|e| err(format!("failed to serialize zswap offer: {e}")))?;
+    Ok(buf)
+}
+
+/// Deserialize a proven Zswap offer from MIP-0005 raw ledger bytes (no tag prefix).
+pub fn deserialize_zswap_offer_raw(
+    bytes: &[u8],
+) -> Result<ZswapOffer<ZswapProof, InMemoryDB>, PayError> {
+    let mut r: &[u8] = bytes;
+    ZswapOffer::<ZswapProof, InMemoryDB>::deserialize(&mut r, 0)
+        .map_err(|e| err(format!("failed to parse zswap offer: {e}")))
+}
+
 /// Encode a proven Zswap offer as MIP-0005 `zswapoffer…` bech32.
 ///
-/// Fails with [`PayError`] when the serialized offer exceeds bech32 capacity (common for proven
-/// offers with full spend proofs). Use [`export_mip6_offer_json_from_maker_bytes`] for automatic
-/// hex fallback.
+/// Uses the primitives encoder without the crate-level [`bech32::encode`] length cap so proven
+/// offers (~10k+ raw bytes) fit per MIP-0005 ("MUST NOT enforce bech32's 90-character limit").
 pub fn encode_zswap_offer_bech32(
     offer: &ZswapOffer<ZswapProof, InMemoryDB>,
 ) -> Result<String, PayError> {
-    use bech32::Bech32m;
-    let mut buf = Vec::new();
-    tagged_serialize(offer, &mut buf)
-        .map_err(|e| err(format!("failed to serialize zswap offer: {e}")))?;
-    let hrp = bech32::Hrp::parse(ZSWAP_OFFER_BECH32_HRP)
+    use bech32::{Bech32m, ByteIterExt, Fe32IterExt, Hrp};
+    let buf = serialize_zswap_offer_raw(offer)?;
+    let hrp = Hrp::parse(ZSWAP_OFFER_BECH32_HRP)
         .map_err(|e| err(format!("invalid zswap offer HRP: {e}")))?;
-    bech32::encode::<Bech32m>(hrp, &buf).map_err(|e| {
-        err(format!(
-            "zswap offer bech32 encode failed ({e}); offer may be too large — use sealed/proven hex in MIP-0006 transaction field"
-        ))
-    })
+    Ok(buf
+        .iter()
+        .copied()
+        .bytes_to_fes()
+        .with_checksum::<Bech32m>(&hrp)
+        .chars()
+        .collect())
 }
 
-fn mip6_transaction_field(
-    maker_bytes: &[u8],
-    offer: &ZswapOffer<ZswapProof, InMemoryDB>,
-) -> String {
-    encode_zswap_offer_bech32(offer).unwrap_or_else(|_| format!("0x{}", hex::encode(maker_bytes)))
+/// Decode a MIP-0005 `zswapoffer…` bech32 string into a proven Zswap offer.
+pub fn decode_zswap_offer_bech32(s: &str) -> Result<ZswapOffer<ZswapProof, InMemoryDB>, PayError> {
+    use bech32::primitives::checksum;
+    use bech32::primitives::decode::UncheckedHrpstring;
+    use bech32::{Bech32m, Checksum, Fe32};
+
+    let unchecked = UncheckedHrpstring::new(s.trim())
+        .map_err(|e| err(format!("invalid zswap offer bech32: {e}")))?;
+    if unchecked.hrp().as_str() != ZSWAP_OFFER_BECH32_HRP {
+        return Err(err(format!(
+            "expected zswapoffer bech32 HRP, got {}",
+            unchecked.hrp().as_str()
+        )));
+    }
+    if Bech32m::CHECKSUM_LENGTH > 0 {
+        if unchecked.data_part_ascii().len() < Bech32m::CHECKSUM_LENGTH {
+            return Err(err(
+                "invalid zswap offer bech32: data too short for checksum",
+            ));
+        }
+        let mut eng = checksum::Engine::<Bech32m>::new();
+        eng.input_hrp(unchecked.hrp());
+        for &b in unchecked.data_part_ascii() {
+            eng.input_fe(Fe32::from_char_unchecked(b));
+        }
+        if eng.residue() != &Bech32m::TARGET_RESIDUE {
+            return Err(err("invalid zswap offer bech32 checksum"));
+        }
+    }
+    let checked = unchecked.remove_checksum::<Bech32m>();
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    deserialize_zswap_offer_raw(&bytes)
 }
 
 fn token_map_to_mip6_entries(map: &BTreeMap<String, u128>) -> Vec<serde_json::Value> {
@@ -390,8 +459,19 @@ pub fn export_mip6_offer_json_from_maker_bytes(
         )));
     }
     let offer = &offers[0];
-    let transaction = mip6_transaction_field(maker_bytes, offer);
+    let transaction = encode_zswap_offer_bech32(offer)?;
     let (gives_map, wants_map) = deltas_to_gives_wants(offer);
+    if gives_map.is_empty()
+        && offer.inputs.iter_deref().next().is_some()
+        && offer.outputs.iter_deref().next().is_some()
+    {
+        return Err(err(
+            "MIP-0006 export: maker offer has shielded inputs and outputs but empty gives — \
+             do not send tokens you are giving to the counterparty in the maker transaction; \
+             include only your spend inputs plus outputs for tokens you want back to your \
+             shielded address (see MIP-0006 and docs/midnight/swap-intent.md)",
+        ));
+    }
     Ok(serde_json::json!({
         "version": 1,
         "transaction": transaction,
@@ -434,6 +514,12 @@ mod tests {
     }
 
     #[test]
+    fn zswap_offer_belongs_in_guaranteed_matches_io_shape() {
+        let deltas_only = sample_offer(100, 50);
+        assert!(!zswap_offer_belongs_in_guaranteed(&deltas_only));
+    }
+
+    #[test]
     fn gives_wants_match_deltas() {
         let offer = sample_offer(100, 50);
         let (gives, wants) = deltas_to_gives_wants(&offer);
@@ -452,10 +538,27 @@ mod tests {
     }
 
     #[test]
-    fn mip6_transaction_field_prefers_bech32_for_compact_offers() {
+    fn encode_decode_zswapoffer_bech32_round_trip() {
         let offer = sample_offer(100, 50);
-        let tx = mip6_transaction_field(b"sealed-bytes", &offer);
-        assert!(tx.starts_with("zswapoffer"));
+        let bech32 = encode_zswap_offer_bech32(&offer).expect("encode");
+        assert!(bech32.starts_with("zswapoffer1"));
+        let decoded = decode_zswap_offer_bech32(&bech32).expect("decode");
+        assert_eq!(
+            decoded.deltas.iter_deref().count(),
+            offer.deltas.iter_deref().count()
+        );
+    }
+
+    #[test]
+    fn materialize_rejects_full_tx_hex_in_transaction_field() {
+        let json = serde_json::json!({
+            "version": 1,
+            "transaction": "0x010203",
+            "gives": [],
+            "wants": [],
+        });
+        let err = materialize_validated_offer("midnight:preview", &json).unwrap_err();
+        assert!(err.message.contains("zswapoffer"));
     }
 
     #[test]
@@ -479,14 +582,8 @@ mod tests {
 
     #[test]
     fn materialize_validated_zswapoffer_bech32() {
-        use bech32::Bech32m;
-        use midnight_serialize::tagged_serialize;
-
         let offer = sample_offer(100, 50);
-        let mut buf = Vec::new();
-        tagged_serialize(&offer, &mut buf).expect("serialize offer");
-        let hrp = bech32::Hrp::parse(ZSWAP_OFFER_BECH32_HRP).expect("hrp");
-        let bech32_str = bech32::encode::<Bech32m>(hrp, &buf).expect("bech32 encode");
+        let bech32_str = encode_zswap_offer_bech32(&offer).expect("bech32 encode");
 
         let token_give = hex::encode([1u8; 32]);
         let token_want = hex::encode([2u8; 32]);

@@ -174,6 +174,11 @@ unsealed ledger bytes, optionally loads shielded + dust seeds, then:
 Imbalanced `makeIntent` offers (atomic swap) must be **`balanceSealedTransaction`**’d by a
 counterparty before submit — see [swap-intent.md](./swap-intent.md).
 
+**Shielded swap placement.** Maker offers that advertise shielded outputs (cross-domain
+unshielded→shielded or shielded-input swaps) are stored in `guaranteed_coins` (Zswap segment 0),
+not `fallible_coins`, so external solvers and Lace read the same segment as OWS `makeIntent`.
+Re-importing a MIP-0005 `zswapoffer…` bech32 uses the same rule when wrapping into a proven tx.
+
 **Dapp withdraw balancing.** Dapp-proven contract withdraws with outputs-only guaranteed NIGHT
 credits must not be rebalanced onto the fallible segment; OWS preserves those offers and attaches
 DUST fees in a separate merged intent segment instead.

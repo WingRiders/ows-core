@@ -16,6 +16,7 @@ use midnight_ledger::structure::{
     UtxoSpend,
 };
 use midnight_serialize::tagged_serialize;
+use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::{Input as ZswapInput, Offer as ZswapOffer, Output as ZswapOutput};
@@ -23,6 +24,7 @@ use ows_signer::chains::MidnightSigner;
 use ows_signer::ChainSigner as _;
 use rand::{rngs::OsRng, Rng as _};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::Cursor;
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::encryption;
@@ -39,6 +41,9 @@ fn err(msg: impl Into<String>) -> PayError {
 
 /// Default intent segment for [`makeTransfer`] (connector convention).
 pub const MAKE_TRANSFER_SEGMENT: u16 = 1;
+
+/// Shielded Zswap segment for guaranteed (always-executes) coin offers.
+pub const GUARANTEED_ZSWAP_SEGMENT: u16 = 0;
 
 /// Parsed DApp Connector `--tx` JSON.
 #[derive(Debug, Clone)]
@@ -355,6 +360,39 @@ fn shielded_inputs_covering_outputs(outputs: &[DesiredOutput]) -> Vec<DesiredInp
         .collect()
 }
 
+/// MIP-0006 maker offers spend inputs and commit wanted-token outputs to the maker's shielded
+/// address; counterparty receipts are added during `balanceSealedTransaction`.
+fn validate_mip6_shielded_swap_outputs(
+    chain_id: &str,
+    shielded_seed: &[u8; 32],
+    shielded_in: &[DesiredInput],
+    shielded_out: &[DesiredOutput],
+) -> Result<(), PayError> {
+    let maker_shielded = MidnightSigner
+        .derive_shielded_address_from_seed_for_chain_id(chain_id, shielded_seed)
+        .map_err(|e| err(e.to_string()))?;
+    let input_tokens: std::collections::HashSet<String> =
+        shielded_in.iter().map(|d| d.token_type.clone()).collect();
+    for out in shielded_out {
+        if out.recipient == maker_shielded {
+            continue;
+        }
+        if input_tokens.contains(&out.token_type) {
+            return Err(err(format!(
+                "MIP-0006 swap: shielded output for token {} must not go to counterparty {:?}; \
+                 only include spend inputs for tokens you give — the taker receives them when \
+                 balancing the offer",
+                out.token_type, out.recipient
+            )));
+        }
+        return Err(err(format!(
+            "MIP-0006 swap: wanted token {} output must go to maker shielded address {}, not {:?}",
+            out.token_type, maker_shielded, out.recipient
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_intent_segment(intent_id: &IntentIdJson) -> Result<u16, PayError> {
     match intent_id {
         IntentIdJson::Number(0) => Err(err("intentId 0 is not allowed")),
@@ -422,6 +460,8 @@ pub fn build_make_transfer_unsealed_tx(
             Some(&mut wallet),
             &shielded_in,
             &shielded_out,
+            false,
+            false,
         )?)
     };
 
@@ -430,6 +470,7 @@ pub fn build_make_transfer_unsealed_tx(
         MAKE_TRANSFER_SEGMENT,
         unshielded_offer,
         zswap_offer,
+        false,
     )
 }
 
@@ -467,6 +508,11 @@ pub fn build_make_intent_unsealed_tx(
         ));
     }
 
+    if !shielded_in.is_empty() && !shielded_out.is_empty() {
+        let seed = shielded_seed.expect("checked above");
+        validate_mip6_shielded_swap_outputs(chain_id, &seed, &shielded_in, &shielded_out)?;
+    }
+
     let rt = super::async_runtime::runtime();
     let unshielded_offer = if unshielded_in.is_empty() && unshielded_out.is_empty() {
         None
@@ -495,30 +541,55 @@ pub fn build_make_intent_unsealed_tx(
         })
     };
 
+    let shielded_swap = !shielded_in.is_empty() && !shielded_out.is_empty();
+    // Relay / MIP-6 solvers read `guaranteed_coins` (segment 0). Any maker offer that only
+    // advertises shielded outputs (cross-domain unshielded→shielded or shielded-output-only)
+    // must place the Zswap offer there, not in `fallible_coins`.
+    let zswap_in_guaranteed = !shielded_out.is_empty() && (shielded_swap || shielded_in.is_empty());
     let zswap_offer = if shielded_in.is_empty() && shielded_out.is_empty() {
         None
     } else if shielded_in.is_empty() {
+        let zswap_segment = if zswap_in_guaranteed {
+            GUARANTEED_ZSWAP_SEGMENT
+        } else {
+            req.intent_segment
+        };
         Some(build_zswap_offer(
             chain_id,
-            req.intent_segment,
+            zswap_segment,
             None,
             &[],
             &shielded_out,
+            false,
+            false,
         )?)
     } else {
         let seed = shielded_seed.expect("checked above");
         let mut wallet =
             rt.block_on(sync_shielded_wallet_state_scoped(indexer_url, &seed, scope))?;
+        let zswap_segment = if zswap_in_guaranteed {
+            GUARANTEED_ZSWAP_SEGMENT
+        } else {
+            req.intent_segment
+        };
         Some(build_zswap_offer(
             chain_id,
-            req.intent_segment,
+            zswap_segment,
             Some(&mut wallet),
             &shielded_in,
             &shielded_out,
+            shielded_swap,
+            shielded_swap,
         )?)
     };
 
-    build_make_intent_standard_tx(chain_id, req.intent_segment, unshielded_offer, zswap_offer)
+    build_make_intent_standard_tx(
+        chain_id,
+        req.intent_segment,
+        unshielded_offer,
+        zswap_offer,
+        zswap_in_guaranteed,
+    )
 }
 
 fn build_make_intent_standard_tx(
@@ -526,6 +597,7 @@ fn build_make_intent_standard_tx(
     segment: u16,
     unshielded_offer: Option<UnshieldedOffer<MnSig, InMemoryDB>>,
     zswap_offer: Option<ZswapOffer<ProofPreimage, InMemoryDB>>,
+    zswap_in_guaranteed: bool,
 ) -> Result<Vec<u8>, PayError> {
     if unshielded_offer.is_none() && zswap_offer.is_none() {
         return Err(err("makeIntent produced no unshielded or shielded offer"));
@@ -536,6 +608,7 @@ fn build_make_intent_standard_tx(
         .as_secs();
     let ttl = Timestamp::from_secs(chain_time_unix_secs.saturating_add(3600));
     let mut rng = OsRng;
+    let has_unshielded_intent = unshielded_offer.is_some();
     let intent = Intent::new(
         &mut rng,
         unshielded_offer,
@@ -546,16 +619,29 @@ fn build_make_intent_standard_tx(
         None,
         ttl,
     );
-    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(segment, intent);
+    let intents: MnHashMap<u16, _, InMemoryDB> = if has_unshielded_intent || !zswap_in_guaranteed {
+        MnHashMap::new().insert(segment, intent)
+    } else {
+        // Shielded-only swap: offer is in `guaranteed_coins`; omit empty intent shell so
+        // solvers can merge balancing intents without segment-id collision.
+        MnHashMap::new()
+    };
     let mut fallible_coins: MnHashMap<u16, ZswapOffer<ProofPreimage, InMemoryDB>, InMemoryDB> =
         MnHashMap::new();
-    if let Some(offer) = zswap_offer {
-        fallible_coins = fallible_coins.insert(segment, offer);
-    }
+    let guaranteed_coins = if let Some(offer) = zswap_offer {
+        if zswap_in_guaranteed {
+            Some(Sp::new(offer))
+        } else {
+            fallible_coins = fallible_coins.insert(segment, offer);
+            None
+        }
+    } else {
+        None
+    };
     let mut stx = StandardTransaction {
         network_id: super::ledger_network_id(chain_id).map_err(err)?,
         intents,
-        guaranteed_coins: None,
+        guaranteed_coins,
         fallible_coins,
         binding_randomness: Default::default(),
     };
@@ -579,6 +665,7 @@ pub(super) fn collect_shielded_preimage_inputs(
     wallet: &mut ShieldedWalletState,
     segment: u16,
     deficits: &[(ShieldedTokenType, u128)],
+    prefer_smallest_coin: bool,
 ) -> Result<ShieldedZswapSelection, PayError> {
     super::shielded_session::ensure_shielded_merkle_ready(wallet)?;
     let mut rng = OsRng;
@@ -599,7 +686,11 @@ pub(super) fn collect_shielded_preimage_inputs(
             .filter(|(_, qci)| shielded_token_matches(qci, &wire))
             .map(|(_, qci)| *qci)
             .collect();
-        coins.sort_by(|a, b| b.value.cmp(&a.value));
+        if prefer_smallest_coin {
+            coins.sort_by(|a, b| a.value.cmp(&b.value));
+        } else {
+            coins.sort_by(|a, b| b.value.cmp(&a.value));
+        }
         for coin in coins {
             if need == 0 {
                 break;
@@ -644,12 +735,17 @@ state (have {have}). Run `ows fund balance` to confirm zswapLedgerEvents sync, t
     })
 }
 
-/// Return shielded change outputs to the wallet owner when whole-coin spends exceed what is owed.
+/// Return shielded change outputs to the wallet owner when whole-coin spends exceed outflow.
+///
+/// `outflow_due_by_token` is the total value leaving the offer per token: explicit shielded
+/// outputs plus, for MIP-0006 swaps, the requested [`DesiredInput`] give amount (so spending a
+/// larger whole coin still advertises `gives` as the intended input, not the full coin value).
 pub(super) fn build_shielded_change_outputs(
     wallet: &ShieldedWalletState,
     segment: u16,
     spent_by_token: &[(ShieldedTokenType, u128)],
-    output_due_by_token: &[(ShieldedTokenType, u128)],
+    outflow_due_by_token: &[(ShieldedTokenType, u128)],
+    skip_change_for_tokens: &HashSet<ShieldedTokenType>,
 ) -> Result<Vec<ZswapOutput<ProofPreimage, InMemoryDB>>, PayError> {
     let mut rng = OsRng;
     let cpk = wallet.keys.coin_public_key();
@@ -657,7 +753,10 @@ pub(super) fn build_shielded_change_outputs(
     let seg = Some(segment);
     let mut outputs = Vec::new();
     for (token, spent) in spent_by_token {
-        let due = output_due_by_token
+        if skip_change_for_tokens.contains(token) {
+            continue;
+        }
+        let due = outflow_due_by_token
             .iter()
             .find(|(t, _)| t == token)
             .map(|(_, v)| *v)
@@ -684,6 +783,8 @@ fn build_zswap_offer(
     wallet: Option<&mut ShieldedWalletState>,
     desired_inputs: &[DesiredInput],
     desired_outputs: &[DesiredOutput],
+    reserve_give_in_change_due: bool,
+    prefer_smallest_coin: bool,
 ) -> Result<ZswapOffer<ProofPreimage, InMemoryDB>, PayError> {
     let mut rng = OsRng;
     let mut zswap_inputs: Vec<ZswapInput<ProofPreimage, InMemoryDB>> = Vec::new();
@@ -701,24 +802,39 @@ fn build_zswap_offer(
                 Ok((wire_type_to_shielded(&d.token_type)?, d.value))
             })
             .collect::<Result<Vec<_>, PayError>>()?;
-        let selection = collect_shielded_preimage_inputs(wallet, segment, &deficits)?;
+        let selection =
+            collect_shielded_preimage_inputs(wallet, segment, &deficits, prefer_smallest_coin)?;
         zswap_inputs = selection.inputs;
-        let mut output_due: std::collections::BTreeMap<ShieldedTokenType, u128> =
+        let mut outflow_due: std::collections::BTreeMap<ShieldedTokenType, u128> =
             std::collections::BTreeMap::new();
+        if reserve_give_in_change_due {
+            for (tt, value) in &deficits {
+                *outflow_due.entry(*tt).or_insert(0) = outflow_due
+                    .get(tt)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*value);
+            }
+        }
         for d in desired_outputs {
             if d.kind != TransferKind::Shielded {
                 continue;
             }
             let tt = wire_type_to_shielded(&d.token_type)?;
-            *output_due.entry(tt).or_insert(0) = output_due
+            *outflow_due.entry(tt).or_insert(0) = outflow_due
                 .get(&tt)
                 .copied()
                 .unwrap_or(0)
                 .saturating_add(d.value);
         }
-        let output_due: Vec<_> = output_due.into_iter().collect();
-        let change_outputs =
-            build_shielded_change_outputs(wallet, segment, &selection.spent_by_token, &output_due)?;
+        let outflow_due: Vec<_> = outflow_due.into_iter().collect();
+        let change_outputs = build_shielded_change_outputs(
+            wallet,
+            segment,
+            &selection.spent_by_token,
+            &outflow_due,
+            &HashSet::new(),
+        )?;
         zswap_outputs.extend(change_outputs);
     }
 
@@ -946,6 +1062,50 @@ mod tests {
         MidnightSigner
             .derive_shielded_address_from_seed_for_chain_id("midnight:preview", &seed)
             .expect("preview shielded address")
+    }
+
+    #[test]
+    fn mip6_swap_rejects_counterparty_output_for_given_token() {
+        use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
+        let seed = [7u8; 32];
+        let keys = ZswapSecretKeys::from(ZswapSeed::from(seed));
+        let maker_addr = MidnightSigner
+            .derive_shielded_address_from_seed_for_chain_id("midnight:preview", &seed)
+            .expect("shielded address");
+        let shielded_in = vec![DesiredInput {
+            kind: TransferKind::Shielded,
+            token_type: "0x0101010101010101010101010101010101010101010101010101010101010101".into(),
+            value: 1000,
+        }];
+        let shielded_out = vec![DesiredOutput {
+            kind: TransferKind::Shielded,
+            token_type: "0x0101010101010101010101010101010101010101010101010101010101010101"
+                .into(),
+            value: 1000,
+            recipient: "mn_shield-addr_preview1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".into(),
+        }];
+        let _ = keys;
+        let err = validate_mip6_shielded_swap_outputs(
+            "midnight:preview",
+            &seed,
+            &shielded_in,
+            &shielded_out,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("counterparty"));
+        assert!(validate_mip6_shielded_swap_outputs(
+            "midnight:preview",
+            &seed,
+            &shielded_in,
+            &[DesiredOutput {
+                kind: TransferKind::Shielded,
+                token_type: "0x0202020202020202020202020202020202020202020202020202020202020202"
+                    .into(),
+                value: 500,
+                recipient: maker_addr,
+            }],
+        )
+        .is_ok());
     }
 
     #[test]
