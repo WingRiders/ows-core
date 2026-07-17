@@ -34,9 +34,10 @@ use ows_core::{default_chain_for_type, Chain, ChainType};
 /// Resolve a signer from a parsed CAIP-2 chain. `parse_chain` accepts any reference
 /// within a known namespace, so an unsupported network reaches this point as a
 /// `Chain`: `CardanoSigner` reads `chain.chain_id` and rejects a reference it does not
-/// know rather than guessing a network — see [`CardanoSigner::from_chain_id`]. The
-/// other families whose address format depends on the network still resolve to one
-/// fixed network for every reference in their namespace.
+/// know rather than guessing a network — see [`CardanoSigner::from_chain_id`], and
+/// [`MidnightSigner::from_chain_id`] reads it the same way. The other families whose
+/// address format depends on the network still resolve to one fixed network for every
+/// reference in their namespace.
 pub fn signer_for_chain(chain: &Chain) -> Result<Box<dyn ChainSigner>, SignerError> {
     Ok(match chain.chain_type {
         ChainType::Evm => Box::new(EvmSigner),
@@ -52,7 +53,7 @@ pub fn signer_for_chain(chain: &Chain) -> Result<Box<dyn ChainSigner>, SignerErr
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
         ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)?),
-        ChainType::Midnight => Box::new(MidnightSigner),
+        ChainType::Midnight => Box::new(MidnightSigner::from_chain_id(chain.chain_id)),
     })
 }
 
