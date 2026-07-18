@@ -23,7 +23,7 @@ pub enum ChainType {
 }
 
 /// All supported chain families, used for universal wallet derivation.
-pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
+pub const ALL_CHAIN_TYPES: [ChainType; 14] = [
     ChainType::Evm,
     ChainType::Solana,
     ChainType::Bitcoin,
@@ -37,6 +37,7 @@ pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
     ChainType::Nano,
     ChainType::Near,
     ChainType::Cardano,
+    ChainType::Midnight,
 ];
 
 /// A specific chain (e.g. "ethereum", "arbitrum") with its family type and CAIP-2 ID.
@@ -766,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_all_chain_types() {
-        assert_eq!(ALL_CHAIN_TYPES.len(), 13);
+        assert_eq!(ALL_CHAIN_TYPES.len(), 14);
     }
 
     #[test]
@@ -807,7 +808,8 @@ mod tests {
         );
         assert_eq!(chains[12].chain_type, ChainType::Cardano);
         assert_eq!(chains[12].name, "cardano");
-        assert_eq!(chains[13].name, "cardano-preprod");
-        assert_eq!(chains[14].name, "cardano-preview");
+        assert_eq!(chains[13].chain_type, ChainType::Midnight);
+        assert_eq!(chains[14].name, "cardano-preprod");
+        assert_eq!(chains[15].name, "cardano-preview");
     }
 }
