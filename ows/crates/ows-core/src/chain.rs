@@ -23,7 +23,7 @@ pub enum ChainType {
 }
 
 /// All supported chain families, used for universal wallet derivation.
-pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
+pub const ALL_CHAIN_TYPES: [ChainType; 14] = [
     ChainType::Evm,
     ChainType::Solana,
     ChainType::Bitcoin,
@@ -37,6 +37,7 @@ pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
     ChainType::Nano,
     ChainType::Near,
     ChainType::Cardano,
+    ChainType::Midnight,
 ];
 
 /// A specific chain (e.g. "ethereum", "arbitrum") with its family type and CAIP-2 ID.
@@ -320,20 +321,26 @@ pub const UNIVERSAL_WALLET_ACCOUNT_COUNT: usize =
     ALL_CHAIN_TYPES.len() + UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES.len();
 
 /// Ordered [`Chain`] rows for universal-wallet derivation and multi-network CLI output.
+///
+/// Each chain type's default chain is followed by its own extra networks, so a chain type appended
+/// to [`ALL_CHAIN_TYPES`] adds rows after the existing ones instead of shifting their positions.
 pub fn universal_wallet_chains() -> Vec<Chain> {
+    let extras: Vec<Chain> = UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES
+        .iter()
+        .map(|name| {
+            KNOWN_CHAINS
+                .iter()
+                .copied()
+                .find(|c| c.name == *name)
+                .unwrap_or_else(|| {
+                    panic!("KNOWN_CHAINS must define `{name}` (universal wallet extras)")
+                })
+        })
+        .collect();
     let mut out = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
     for ct in &ALL_CHAIN_TYPES {
         out.push(default_chain_for_type(*ct));
-    }
-    for name in UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES {
-        let chain = KNOWN_CHAINS
-            .iter()
-            .copied()
-            .find(|c| c.name == *name)
-            .unwrap_or_else(|| {
-                panic!("KNOWN_CHAINS must define `{name}` (universal wallet extras)")
-            });
-        out.push(chain);
+        out.extend(extras.iter().copied().filter(|c| c.chain_type == *ct));
     }
     out
 }
@@ -766,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_all_chain_types() {
-        assert_eq!(ALL_CHAIN_TYPES.len(), 13);
+        assert_eq!(ALL_CHAIN_TYPES.len(), 14);
     }
 
     #[test]
@@ -809,5 +816,6 @@ mod tests {
         assert_eq!(chains[12].name, "cardano");
         assert_eq!(chains[13].name, "cardano-preprod");
         assert_eq!(chains[14].name, "cardano-preview");
+        assert_eq!(chains[15].chain_type, ChainType::Midnight);
     }
 }
