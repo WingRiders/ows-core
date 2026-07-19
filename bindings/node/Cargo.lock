@@ -2723,6 +2723,7 @@ dependencies = [
  "hmac",
  "k256",
  "libc",
+ "midnight-coin-structure",
  "midnight-ledger",
  "midnight-serialize",
  "midnight-storage",
