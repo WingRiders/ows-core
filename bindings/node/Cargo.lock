@@ -2725,6 +2725,7 @@ dependencies = [
  "libc",
  "midnight-ledger",
  "midnight-serialize",
+ "midnight-storage",
  "midnight-zswap",
  "num-bigint",
  "ows-core",
