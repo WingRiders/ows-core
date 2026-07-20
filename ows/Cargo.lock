@@ -3725,6 +3725,7 @@ dependencies = [
  "hmac 0.12.1",
  "k256",
  "libc",
+ "midnight-base-crypto",
  "midnight-coin-structure",
  "midnight-ledger",
  "midnight-serialize",
