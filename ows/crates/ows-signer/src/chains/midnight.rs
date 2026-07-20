@@ -683,9 +683,10 @@ impl MidnightCryptoProvider {
     }
 
     /// Build proof-preimage dust spends sufficient to cover `fee_dust`. Offline — no proving, no
-    /// network. The balancer uses this to size the fee; [`Self::authorize_dust`] uses it again to
-    /// produce the real, proved spends. The dust secret key stays inside the provider.
-    pub fn build_preimage_dust_spends(
+    /// network. Shared by [`Self::authorize_dust`] (which proves them) and [`Self::mock_dust_spends`]
+    /// (which mock-proves them). The preimages carry the dust secret key, so they never leave the
+    /// provider.
+    fn build_preimage_dust_spends(
         &self,
         st: DustLocalState<InMemoryDB>,
         fee_dust: u128,
@@ -707,29 +708,8 @@ impl MidnightCryptoProvider {
         ledger_params: &LedgerParameters,
         prover: P,
     ) -> Result<DustActions<MnSignature, ProofMarker, InMemoryDB>, SignerError> {
-        let spends = select_dust_spends_preimage(
-            dust_state.clone(),
-            &self.dust_sk,
-            plan.fee_dust,
-            plan.dust_ctime,
-        )?;
-
-        let dust_preimage: DustActions<MnSignature, ProofPreimageMarker, InMemoryDB> =
-            DustActions {
-                spends: spends.into_iter().collect(),
-                registrations: vec![].into(),
-                ctime: plan.dust_ctime,
-            };
-        let prove_intent: Intent<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
-            Intent {
-                guaranteed_unshielded_offer: None,
-                fallible_unshielded_offer: None,
-                actions: vec![].into(),
-                dust_actions: Some(Sp::new(dust_preimage)),
-                ttl: plan.intent_ttl,
-                binding_commitment: plan.binding_commitment,
-            };
-        let (_seg, proven_intent) = prove_intent
+        let (_seg, proven_intent) = self
+            .dust_preimage_intent(dust_state, plan)?
             .prove(
                 plan.seg_id,
                 prover,
@@ -744,6 +724,74 @@ impl MidnightCryptoProvider {
             .ok_or_else(|| {
                 SignerError::SigningFailed("proven dust intent has no dust actions".into())
             })
+    }
+
+    /// Fee-sizing twin of [`Self::authorize_dust`]: the same proof-preimage DUST section, mock-proved
+    /// instead of proved. `mock_prove` yields a correctly-sized (non-verifying, non-submittable)
+    /// section whose fee and serialized size match the real proof's **exactly** (proofs are
+    /// fixed-size), so the balancer's fee loop can size it offline, with no proving keys. Only the
+    /// mock-proven section leaves; the key-bearing preimage is dropped here.
+    pub fn mock_dust_spends(
+        &self,
+        dust_state: &DustLocalState<InMemoryDB>,
+        plan: &DustSpendPlan,
+        network_id: &str,
+    ) -> Result<DustActions<MnSignature, ProofMarker, InMemoryDB>, SignerError> {
+        let intents: MnHashMap<u16, _, InMemoryDB> =
+            MnHashMap::new().insert(plan.seg_id, self.dust_preimage_intent(dust_state, plan)?);
+        let tx: Transaction<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            Transaction::Standard(StandardTransaction {
+                network_id: network_id.to_string(),
+                intents,
+                guaranteed_coins: None,
+                fallible_coins: MnHashMap::new(),
+                binding_randomness: Default::default(),
+            });
+        let Transaction::Standard(mock) = tx.mock_prove().map_err(|e| {
+            SignerError::SigningFailed(format!("mock-prove dust spends failed: {e:?}"))
+        })?
+        else {
+            return Err(SignerError::SigningFailed(
+                "mock-proven dust transaction was not Standard".into(),
+            ));
+        };
+        let intent = mock.intents.get(&plan.seg_id).ok_or_else(|| {
+            SignerError::SigningFailed("mock-proven dust transaction has no intent".into())
+        })?;
+        intent
+            .deref()
+            .dust_actions
+            .as_ref()
+            .map(|sp| sp.deref().clone())
+            .ok_or_else(|| {
+                SignerError::SigningFailed("mock-proven dust intent has no dust actions".into())
+            })
+    }
+
+    /// The single-intent DUST section [`Self::authorize_dust`] proves and [`Self::mock_dust_spends`]
+    /// mock-proves: spends covering `plan.fee_dust`, at the plan's segment, ttl and binding.
+    fn dust_preimage_intent(
+        &self,
+        dust_state: &DustLocalState<InMemoryDB>,
+        plan: &DustSpendPlan,
+    ) -> Result<Intent<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>, SignerError>
+    {
+        let spends =
+            self.build_preimage_dust_spends(dust_state.clone(), plan.fee_dust, plan.dust_ctime)?;
+        let dust_preimage: DustActions<MnSignature, ProofPreimageMarker, InMemoryDB> =
+            DustActions {
+                spends: spends.into_iter().collect(),
+                registrations: vec![].into(),
+                ctime: plan.dust_ctime,
+            };
+        Ok(Intent {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: Some(Sp::new(dust_preimage)),
+            ttl: plan.intent_ttl,
+            binding_commitment: plan.binding_commitment,
+        })
     }
 }
 

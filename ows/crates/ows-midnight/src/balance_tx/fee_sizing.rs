@@ -234,8 +234,14 @@ pub(super) fn cover_dust_fees(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_base_crypto::hash::HashOutput;
     use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
+    use midnight_coin_structure::coin::Info as CoinInfo;
     use midnight_ledger::dust::DustSecretKey;
+    use midnight_ledger::structure::ProofPreimageMarker;
+    use midnight_storage::storage::HashMap as MnHashMap;
+    use midnight_zswap::keys::SecretKeys;
+    use midnight_zswap::Output as ZswapOutput;
 
     // Unshielded role-0 seed for the abandon-phrase wallet at index 0; matches the signer's
     // address vectors.
@@ -352,6 +358,88 @@ mod tests {
         assert!(
             some.is_some(),
             "unregistered NIGHT should fund a registration"
+        );
+    }
+
+    /// Verifies the fee-sizing assumption the deferred-dust path relies on: `mock_prove` (offline, no
+    /// real proving keys) yields a transaction whose ledger fee equals the real-proven transaction's
+    /// fee — because ZK proofs are fixed-size, so the fee depends only on tx structure. Ignored by
+    /// default because real proving uses the (cached) CDN proving keys; run with `--ignored`.
+    #[test]
+    #[ignore = "real-proves with the cached/CDN proving keys; run explicitly"]
+    fn mock_prove_fee_matches_real_prove_fee() {
+        use midnight_ledger::structure::INITIAL_PARAMETERS;
+        use rand::rngs::{OsRng, StdRng};
+        use rand::{Rng as _, SeedableRng as _};
+
+        // A preimage tx with a few shielded outputs to a throwaway recipient (outputs need only a
+        // public key, so no funded wallet is required).
+        let mut rng = OsRng;
+        let keys = SecretKeys::from_rng_seed(&mut rng);
+        let cpk = keys.coin_public_key();
+        let token = ShieldedTokenType(HashOutput([9u8; 32]));
+        let outputs: Vec<_> = (0..3u128)
+            .map(|i| {
+                let coin = CoinInfo {
+                    nonce: rng.r#gen(),
+                    type_: token,
+                    value: 1_000 + i,
+                };
+                ZswapOutput::new(&mut rng, &coin, Some(1), &cpk, Some(keys.enc_public_key()))
+                    .expect("build output")
+            })
+            .collect();
+        let offer = ZswapOffer::new(vec![], outputs, vec![]).expect("build offer");
+        let binding_randomness = offer.binding_randomness();
+
+        let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> = Intent {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: Default::default(),
+        };
+        let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(1, intent);
+        let stx: StandardTransaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            StandardTransaction {
+                network_id: "preview".to_string(),
+                intents,
+                guaranteed_coins: Some(Sp::new(offer)),
+                fallible_coins: MnHashMap::new(),
+                binding_randomness,
+            };
+        let tx: Transaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            Transaction::Standard(stx);
+
+        // Mock prove — offline; fee-accurate by construction.
+        let tx_mock = tx.mock_prove().expect("mock_prove");
+        let fee_mock = tx_mock.fees(&INITIAL_PARAMETERS, false).expect("mock fees");
+
+        // Real prove with the local prover, then seal to the same binding form as mock_prove.
+        let scope = SyncCacheScope {
+            chain_id: Some("midnight:preview".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::cache_io::proving_keys_dir(&scope).expect("proving-key dir");
+        let prover = crate::Prover::new(dir);
+        let cost_model = &INITIAL_PARAMETERS.cost_model.runtime_cost_model;
+        let tx_real = crate::block_on(tx.prove(prover, cost_model)).expect("real prove");
+        let tx_real = tx_real.seal(StdRng::from_entropy());
+        let fee_real = tx_real.fees(&INITIAL_PARAMETERS, false).expect("real fees");
+
+        let mut mb = Vec::new();
+        tagged_serialize(&tx_mock, &mut mb).unwrap();
+        let mut rb = Vec::new();
+        tagged_serialize(&tx_real, &mut rb).unwrap();
+        eprintln!(
+            "mock: fee={fee_mock} size={} | real: fee={fee_real} size={}",
+            mb.len(),
+            rb.len()
+        );
+        assert_eq!(
+            fee_mock, fee_real,
+            "mock_prove fee must equal real-prove fee (fixed-size proofs)"
         );
     }
 }
