@@ -267,7 +267,10 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
 /// Splice a mock-proven shielded section into a copy of `base` for DUST fee sizing. The DUST fee
 /// covers the whole tx, shielded proofs included, but the real shielded proving is deferred past the
 /// seam — so size the fee against a `mock_prove`d stand-in of the shielded section (same fixed-size
-/// proofs → same fee) and discard it. Returns `base` untouched when there is no shielded funding.
+/// proofs → same fee) and discard it. Each fragment is routed to the offer bound to its segment
+/// (segment 0 → guaranteed, segment N>=1 → `fallible_coins[N]`), mirroring the real placement in
+/// [`authorize_proven_tx`] so the sized fee matches the real tx's serialized byte length. Returns
+/// `base` untouched when there is no shielded funding.
 pub(super) fn splice_mock_shielded_for_sizing(
     base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
@@ -280,18 +283,10 @@ pub(super) fn splice_mock_shielded_for_sizing(
     if mock.proven.is_empty() {
         return Err(err("no shielded segments to mock-prove"));
     }
-    let mut merged = base
-        .guaranteed_coins
-        .as_ref()
-        .map(|sp| sp.deref().clone())
-        .ok_or_else(|| err("shielded plan present but tx has no guaranteed coins offer"))?;
-    for (_segment, proven) in &mock.proven {
-        merged = merged
-            .merge(proven)
-            .map_err(|e| err(format!("merge mock shielded zswap offer: {e}")))?;
-    }
     let mut sized = base.clone();
-    sized.guaranteed_coins = Some(Sp::new(merged));
+    for (segment, proven) in &mock.proven {
+        place_shielded_fragment(&mut sized, *segment, proven)?;
+    }
     sized.binding_randomness = sized.binding_randomness + mock.binding_delta;
     Ok(sized)
 }
