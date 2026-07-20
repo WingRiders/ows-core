@@ -3560,6 +3560,7 @@ dependencies = [
  "k256",
  "libc",
  "midnight-base-crypto",
+ "midnight-coin-structure",
  "midnight-ledger",
  "midnight-serialize",
  "midnight-storage",
