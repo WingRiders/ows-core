@@ -13,6 +13,7 @@ mod ledger_params;
 mod midnight_env;
 #[cfg(test)]
 mod mock_indexer;
+mod submit;
 mod tip_verify;
 mod urls;
 mod wallet;
@@ -25,6 +26,7 @@ pub use dapp_connector::{
 };
 pub use fund_balance::print_fund_balance;
 pub use ledger_params::fetch_indexer_ledger_parameters;
+pub use submit::broadcast_sealed;
 pub use wallet_sync::dust::{format_dust_specks, get_dust_balance_for_display};
 pub use wallet_sync::shielded::get_shielded_balances_for_display;
 pub use wallet_sync::unshielded::{get_unshielded_utxos_for_display, UnshieldedUtxo};
