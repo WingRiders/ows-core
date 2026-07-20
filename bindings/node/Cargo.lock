@@ -3563,6 +3563,7 @@ dependencies = [
  "midnight-ledger",
  "midnight-serialize",
  "midnight-storage",
+ "midnight-transient-crypto",
  "midnight-zswap",
  "num-bigint",
  "ows-core",
