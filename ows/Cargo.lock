@@ -3730,6 +3730,7 @@ dependencies = [
  "midnight-ledger",
  "midnight-serialize",
  "midnight-storage",
+ "midnight-transient-crypto",
  "midnight-zswap",
  "mockito",
  "num-bigint",
