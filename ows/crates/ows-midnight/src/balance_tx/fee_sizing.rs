@@ -145,17 +145,36 @@ pub(super) struct DustFeeContext<'a> {
     pub(super) scope: &'a SyncCacheScope,
 }
 
-/// Size a DUST fee section that balances the transaction. The fee depends on the tx (dust-section
-/// bytes included), so estimate → build section → re-check, converging within a few iterations.
+/// The wallet's planned DUST fee section, in one of three shapes that mirror how it is realized
+/// post-seam. Sized offline during planning (via `mock_prove`), so no real proving happens here.
+pub(super) enum DustFeePlan {
+    /// No DUST fee section (fee payment off, or the chain does not require DUST fees).
+    None,
+    /// A signature-based generationless registration — final and submittable, carrying no ZK proof and
+    /// no bearer preimage, so it is built during planning and attached as-is.
+    Registration(DustActions<MnSig, ProofMarker, InMemoryDB>),
+    /// A proof-bearing DUST spend, deferred past the policy seam to the signer: the converged fee plus
+    /// the synced dust state and ledger parameters the signer needs to build and prove the section.
+    /// Boxed — the synced state dwarfs the other variants.
+    Spend {
+        plan: DustSpendPlan,
+        dust_state: Box<DustLocalState<InMemoryDB>>,
+        ledger_params: Box<LedgerParameters>,
+    },
+}
+
+/// Size the DUST fee section that balances the transaction, **without** real proving. The fee depends
+/// on the tx (dust-section bytes included), so estimate → build section → re-check, converging within
+/// a few iterations.
 ///
 /// Each iteration prefers a signature-based **generationless registration** funded by the wallet's
 /// unregistered NIGHT (no proving). When the wallet has no unregistered NIGHT capacity — a normal
-/// funded wallet registers all its NIGHT for dust generation — it falls back to a proof-bearing
-/// **DUST spend** of its generated dust, syncing the spendable dust state once and proving the
-/// spends via the crypto provider's local prover.
-pub(super) fn cover_dust_fees(
-    ctx: &DustFeeContext,
-) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
+/// funded wallet registers all its NIGHT for dust generation — it falls back to a **DUST spend** of
+/// its generated dust, syncing the spendable dust state once and sizing the spends with `mock_prove`
+/// (fixed-size proofs → the mock section's fee matches the real one exactly). The registration is
+/// finalized here; the proof-bearing spend is realized post-seam by
+/// [`MidnightCryptoProvider::authorize_dust`].
+pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io::Error> {
     const MAX_FEE_ITERS: usize = 8;
     let intent_ttl = chain_aligned_intent_ttl(ctx.dust_ctime);
 
@@ -187,7 +206,7 @@ pub(super) fn cover_dust_fees(
                 assemble_proven_intent(ctx.offer, ctx.intent_in, Some(reg.clone()), intent_ttl),
             );
             if tx_balance_imbalances(&tx_check)?.is_empty() {
-                return Ok(reg);
+                return Ok(DustFeePlan::Registration(reg));
             }
         }
 
@@ -199,7 +218,17 @@ pub(super) fn cover_dust_fees(
             )?);
         }
         let synced = dust_state.as_ref().expect("dust state synced above");
-        let dust_actions = build_proven_dust_spends(ctx, synced, fee_target, intent_ttl)?;
+        let plan = DustSpendPlan {
+            fee_dust: fee_target,
+            dust_ctime: ctx.dust_ctime,
+            intent_ttl,
+            seg_id: ctx.seg_id,
+            binding_commitment: ctx.intent_in.binding_commitment,
+        };
+        let dust_actions = ctx
+            .crypto_provider
+            .mock_dust_spends(synced, &plan, &ctx.stx.network_id)
+            .map_err(|e| err(e.to_string()))?;
         let tx_check = wrap_proven_standard(
             ctx.stx,
             ctx.seg_id,
@@ -211,7 +240,11 @@ pub(super) fn cover_dust_fees(
             ),
         );
         if tx_balance_imbalances(&tx_check)?.is_empty() {
-            return Ok(dust_actions);
+            return Ok(DustFeePlan::Spend {
+                plan,
+                dust_state: Box::new(synced.clone()),
+                ledger_params: Box::new(ctx.ledger_params.clone()),
+            });
         }
 
         let actual_fee = tx_check
@@ -229,6 +262,38 @@ pub(super) fn cover_dust_fees(
         }
     }
     Err(err("failed to cover the DUST fee"))
+}
+
+/// Splice a mock-proven shielded section into a copy of `base` for DUST fee sizing. The DUST fee
+/// covers the whole tx, shielded proofs included, but the real shielded proving is deferred past the
+/// seam — so size the fee against a `mock_prove`d stand-in of the shielded section (same fixed-size
+/// proofs → same fee) and discard it. Returns `base` untouched when there is no shielded funding.
+pub(super) fn splice_mock_shielded_for_sizing(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    crypto_provider: &MidnightCryptoProvider,
+    shielded: &ShieldedFundingPlan,
+) -> Result<StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, std::io::Error>
+{
+    let mock = crypto_provider
+        .mock_shielded_offers(&base.network_id, &shielded.plans, &shielded.tree)
+        .map_err(|e| err(e.to_string()))?;
+    if mock.proven.is_empty() {
+        return Err(err("no shielded segments to mock-prove"));
+    }
+    let mut merged = base
+        .guaranteed_coins
+        .as_ref()
+        .map(|sp| sp.deref().clone())
+        .ok_or_else(|| err("shielded plan present but tx has no guaranteed coins offer"))?;
+    for (_segment, proven) in &mock.proven {
+        merged = merged
+            .merge(proven)
+            .map_err(|e| err(format!("merge mock shielded zswap offer: {e}")))?;
+    }
+    let mut sized = base.clone();
+    sized.guaranteed_coins = Some(Sp::new(merged));
+    sized.binding_randomness = sized.binding_randomness + mock.binding_delta;
+    Ok(sized)
 }
 
 #[cfg(test)]

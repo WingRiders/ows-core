@@ -480,6 +480,7 @@ pub struct ShieldedSpendPlan {
 
 /// The proven shielded fragments the balancer merges into the transaction's guaranteed offer, plus the
 /// summed Pedersen binding randomness to add to the transaction (a proven tx can't recompute its own).
+/// [`MidnightCryptoProvider::mock_shielded_offers`] returns the same shape, mock-proven, for fee sizing.
 pub struct ShieldedAuthorized {
     pub proven: Vec<(u16, ZswapOffer<ZswapProof, InMemoryDB>)>,
     pub binding_delta: PedersenRandomness,
@@ -591,10 +592,10 @@ impl MidnightCryptoProvider {
     }
 
     /// Build the proof-preimage shielded input offers for each segment (the key-bearing spend-witness
-    /// construction) WITHOUT proving. Shared by `authorize_shielded` (which proves each) and the offline
-    /// fee-sizing path (which mock-proves + discards each). The preimage is for a throwaway sizing tx or
-    /// the real authorization; either way the spend witnesses are built here from `self.shielded_keys`.
-    pub fn build_preimage_shielded_offers(
+    /// construction) WITHOUT proving. Shared by `authorize_shielded` (which proves each) and
+    /// `mock_shielded_offers` (which mock-proves each). The preimages carry the spending key, so they
+    /// never leave the provider.
+    fn build_preimage_shielded_offers(
         &self,
         plans: &[ShieldedSpendPlan],
         tree: &ZswapLocalState<InMemoryDB>,
@@ -675,6 +676,28 @@ impl MidnightCryptoProvider {
                     SignerError::SigningFailed(format!("prove shielded inputs failed: {e:?}"))
                 })?;
             proven.push((segment, proven_offer));
+        }
+        Ok(ShieldedAuthorized {
+            proven,
+            binding_delta,
+        })
+    }
+
+    /// Fee-sizing twin of [`Self::authorize_shielded`]: the same proof-preimage offers, mock-proved
+    /// instead of proved. `mock_prove` yields correctly-sized (non-verifying, non-submittable)
+    /// `ProofMarker` offers whose serialized size, hence fee contribution, matches the real proofs'
+    /// exactly (ZK proofs are fixed-size), so the balancer can size the DUST fee offline. Only the
+    /// mock-proven offers leave; the key-bearing preimages are dropped here.
+    pub fn mock_shielded_offers(
+        &self,
+        network_id: &str,
+        segments: &[ShieldedSpendPlan],
+        tree: &ZswapLocalState<InMemoryDB>,
+    ) -> Result<ShieldedAuthorized, SignerError> {
+        let (preimages, binding_delta) = self.build_preimage_shielded_offers(segments, tree)?;
+        let mut proven = Vec::with_capacity(preimages.len());
+        for (segment, preimage) in preimages {
+            proven.push((segment, mock_prove_shielded_offer(network_id, preimage)?));
         }
         Ok(ShieldedAuthorized {
             proven,
@@ -793,6 +816,50 @@ impl MidnightCryptoProvider {
             binding_commitment: plan.binding_commitment,
         })
     }
+}
+
+/// Mock-prove a single proof-preimage Zswap offer into a fixed-size `ProofMarker` offer. `mock_prove`
+/// operates on a whole transaction, so the offer is wrapped as the guaranteed coins of a throwaway
+/// standard tx (one trivial intent — the shape `mock_prove` accepts) and the proven offer is lifted
+/// back out.
+fn mock_prove_shielded_offer(
+    network_id: &str,
+    preimage: ZswapOffer<ProofPreimage, InMemoryDB>,
+) -> Result<ZswapOffer<ZswapProof, InMemoryDB>, SignerError> {
+    let binding_randomness = preimage.binding_randomness();
+    let trivial_intent: Intent<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+        Intent {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: Default::default(),
+        };
+    let tx: Transaction<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+        Transaction::Standard(StandardTransaction {
+            network_id: network_id.to_string(),
+            intents: MnHashMap::new().insert(0, trivial_intent),
+            guaranteed_coins: Some(Sp::new(preimage)),
+            fallible_coins: MnHashMap::new(),
+            binding_randomness,
+        });
+    let Transaction::Standard(mock) = tx.mock_prove().map_err(|e| {
+        SignerError::SigningFailed(format!("mock-prove shielded inputs failed: {e:?}"))
+    })?
+    else {
+        return Err(SignerError::SigningFailed(
+            "mock-proven shielded transaction was not Standard".into(),
+        ));
+    };
+    mock.guaranteed_coins
+        .as_ref()
+        .map(|sp| sp.deref().clone())
+        .ok_or_else(|| {
+            SignerError::SigningFailed(
+                "mock-proven shielded transaction has no guaranteed coins".into(),
+            )
+        })
 }
 
 /// Select just enough of the wallet's generated dust notes to pay `fee_dust`, building each spend's
