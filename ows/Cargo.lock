@@ -2802,6 +2802,7 @@ dependencies = [
  "k256",
  "mockito",
  "ows-core",
+ "ows-midnight",
  "ows-signer",
  "prost",
  "rand 0.8.5",
