@@ -31,6 +31,10 @@ pub(super) struct DustSyncSnapshot {
     /// Indexer block height when the snapshot was written; gates the HTTP-tip fast path.
     #[serde(default)]
     pub block_height_when_saved: i64,
+    /// Genesis block hash of the chain the state was synced against (empty when unknown); guards
+    /// against resuming across a testnet reset, which keeps the network id.
+    #[serde(default)]
+    pub genesis_hash: String,
     /// Tagged-serialized `DustLocalState<InMemoryDB>`.
     pub state_hex: String,
 }

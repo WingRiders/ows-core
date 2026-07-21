@@ -29,6 +29,10 @@ pub(super) struct ShieldedSyncSnapshot {
     /// Indexer block height when the snapshot was written; gates the HTTP-tip fast path.
     #[serde(default)]
     pub block_height_when_saved: i64,
+    /// Genesis block hash of the chain the state was synced against (empty when unknown); guards
+    /// against resuming across a testnet reset, which keeps the network id.
+    #[serde(default)]
+    pub genesis_hash: String,
     /// Tagged-serialized full spendable `ZswapLocalState` (Merkle tree + qualified coins) after
     /// the replay — the resumable source state. Spending needs each coin's Merkle path, and the
     /// per-token balance is recomputed from this state on read (never persisted as a balance).

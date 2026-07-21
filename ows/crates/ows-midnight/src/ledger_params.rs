@@ -59,6 +59,16 @@ struct IndexerBlockHeightResp {
     block: Option<IndexerBlockHeightData>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IndexerBlockHashData {
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexerBlockHashResp {
+    block: Option<IndexerBlockHashData>,
+}
+
 static INDEXER_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Shared HTTP client for Midnight indexer GraphQL (bounded request timeout).
@@ -172,6 +182,46 @@ pub async fn fetch_indexer_block_height_with_client(
         .and_then(|d| d.block)
         .map(|b| b.height)
         .ok_or_else(|| std::io::Error::other("indexer did not return block"))
+}
+
+/// Hash of the indexer's genesis block (HTTP `block(offset: { height: 0 }) { hash }`). It names the
+/// chain instance behind a network id, which a testnet reset replaces while keeping the id.
+pub async fn fetch_indexer_genesis_hash(indexer_url: &str) -> Result<String, std::io::Error> {
+    let q = r#"query GenesisHash($offset: BlockOffset) { block(offset: $offset) { hash } }"#;
+    let resp = indexer_http_client()
+        .post(indexer_url)
+        .json(&serde_json::json!({
+            "query": q,
+            "variables": { "offset": { "height": 0 } }
+        }))
+        .send()
+        .await
+        .map_err(|e| std::io::Error::other(format!("indexer query failed: {e}")))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| std::io::Error::other(format!("indexer read body failed: {e}")))?;
+    if !status.is_success() {
+        return Err(std::io::Error::other(format!(
+            "indexer returned {status}: {body}"
+        )));
+    }
+
+    let parsed: IndexerGraphqlResp<IndexerBlockHashResp> = serde_json::from_str(&body)
+        .map_err(|e| std::io::Error::other(format!("invalid indexer json: {e}")))?;
+    if let Some(errs) = parsed.errors {
+        return Err(std::io::Error::other(format!(
+            "indexer GraphQL error: {errs:?}"
+        )));
+    }
+    parsed
+        .data
+        .and_then(|d| d.block)
+        .map(|b| b.hash)
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| std::io::Error::other("indexer did not return the genesis block"))
 }
 
 pub async fn fetch_indexer_ledger_parameters(

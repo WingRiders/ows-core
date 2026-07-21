@@ -48,6 +48,10 @@ struct UnshieldedSnapshot {
     /// Fingerprint of `(indexer_url, chain_id)`; guards against reusing a snapshot
     /// from a different indexer.
     site_fp: String,
+    /// Genesis block hash of the chain the state was synced against (empty when unknown); guards
+    /// against resuming across a testnet reset, which keeps the network id.
+    #[serde(default)]
+    genesis_hash: String,
     /// Highest indexer transaction id already folded into `utxos`.
     last_seen_tx_id: i64,
     /// Unspent UTXO set as of `last_seen_tx_id`.
@@ -187,8 +191,13 @@ async fn get_unshielded_utxos_inner(
 ) -> Result<Vec<UnshieldedUtxo>, std::io::Error> {
     let snapshot_path = cache_io::snapshot_path("unshielded", indexer_url, address, scope);
     let site_fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    let live_genesis = if snapshot_path.is_some() {
+        crate::tip_verify::fetch_genesis_hash(indexer_url).await
+    } else {
+        None
+    };
 
-    // Resume only from a snapshot that belongs to this same indexer site and network;
+    // Resume only from a snapshot that belongs to this same indexer site, network and chain;
     // an absent or mismatched snapshot syncs fresh from genesis.
     let resume = snapshot_path
         .as_ref()
@@ -197,9 +206,28 @@ async fn get_unshielded_utxos_inner(
         })
         .filter(|snap| {
             cache_io::snapshot_site_matches(scope, &snap.chain_id, &site_fp, &snap.site_fp)
+        })
+        .filter(|snap| {
+            let foreign = crate::tip_verify::snapshot_from_other_chain(
+                &snap.genesis_hash,
+                live_genesis.as_deref(),
+            );
+            if foreign {
+                eprintln!(
+                    "[ows-midnight] unshielded snapshot's genesis hash does not match the live chain; \
+re-syncing from genesis"
+                );
+            }
+            !foreign
         });
+    let mut genesis_hash = live_genesis.clone().unwrap_or_default();
     let (resume_last_seen, seed) = match resume {
-        Some(snap) => (snap.last_seen_tx_id, snap.utxos),
+        Some(snap) => {
+            if genesis_hash.is_empty() {
+                genesis_hash = snap.genesis_hash;
+            }
+            (snap.last_seen_tx_id, snap.utxos)
+        }
         None => (0, Vec::new()),
     };
 
@@ -218,6 +246,8 @@ async fn get_unshielded_utxos_inner(
             eprintln!(
                 "[ows-midnight] unshielded snapshot cursor is ahead of the indexer; re-syncing from genesis"
             );
+            // A hash carried forward from the discarded snapshot would name the old chain.
+            genesis_hash = live_genesis.unwrap_or_default();
             match replay_unshielded(indexer_url, address, 0, &[], wait_for_tx_hash, tx_seen).await?
             {
                 ReplayOutcome::Done(synced) => synced,
@@ -238,6 +268,7 @@ async fn get_unshielded_utxos_inner(
                 version: UNSHIELDED_SNAPSHOT_VERSION,
                 chain_id: cache_io::snapshot_chain_id(scope),
                 site_fp,
+                genesis_hash,
                 last_seen_tx_id: synced.last_seen,
                 utxos: list.clone(),
             },
