@@ -47,6 +47,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
+pub(crate) use fee_sizing::size_merge_dust_fee;
 use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
