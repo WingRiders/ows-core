@@ -6,7 +6,8 @@
 //! see `authorize_merge`. A proven, unsealed transaction is refused; balancing one in place is what
 //! `balanceUnsealed` does.
 //!
-//! Scope: a hex-encoded sealed maker offer that keeps all its value in the guaranteed section.
+//! Scope: a sealed maker offer that keeps all its value in the guaranteed section, given as hex or as a
+//! MIP-0005 `swapoffer` string.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref as _;
@@ -25,6 +26,7 @@ use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 
 use super::build::{DesiredOutput, TransferKind};
 use super::make_intent::{DesiredInput, MakeIntentRequest};
+use super::swap_offer;
 use super::{classify_unsealed_payload, ConnectorPlan, UnsealedKind};
 
 /// A fully sealed (`proof,pedersen-schnorr`) Midnight transaction — the form a maker offer arrives in.
@@ -55,7 +57,8 @@ struct OptionsJson {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BalanceSealedJson {
-    /// The maker offer, hex-encoded. Accepts `makerTx`, or `tx`/`transaction` as aliases.
+    /// The maker offer, hex or a `swapoffer` string. Accepts `makerTx`, or `tx`/`transaction` as
+    /// aliases.
     #[serde(alias = "tx", alias = "transaction")]
     maker_tx: String,
     #[serde(default)]
@@ -70,13 +73,21 @@ pub fn parse_balance_sealed_json(json: &str) -> Result<BalanceSealedRequest, std
             "invalid balanceSealedTransaction request JSON: {e}"
         ))
     })?;
-    let clean = req.maker_tx.strip_prefix("0x").unwrap_or(&req.maker_tx);
-    let maker_tx = hex::decode(clean)
-        .map_err(|e| std::io::Error::other(format!("invalid maker transaction hex: {e}")))?;
     Ok(BalanceSealedRequest {
-        maker_tx,
+        maker_tx: decode_maker_input(&req.maker_tx)?,
         pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
     })
+}
+
+/// Decode the maker input into tagged transaction bytes: a MIP-0005 `swapoffer` string, or hex.
+fn decode_maker_input(input: &str) -> Result<Vec<u8>, std::io::Error> {
+    let trimmed = input.trim();
+    if swap_offer::is_swap_offer(trimmed) {
+        return swap_offer::decode_swap_offer(trimmed);
+    }
+    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    hex::decode(clean)
+        .map_err(|e| std::io::Error::other(format!("invalid maker transaction hex: {e}")))
 }
 
 /// Plan a `balanceSealedTransaction`: decode the sealed maker offer and derive the taker's
@@ -550,6 +561,19 @@ mod tests {
     #[test]
     fn rejects_non_hex_maker_tx() {
         assert!(parse_balance_sealed_json(r#"{"makerTx":"zz"}"#).is_err());
+    }
+
+    #[test]
+    fn a_swapoffer_maker_decodes_to_the_sealed_offer() {
+        let hex_str = include_str!("testdata/sealed_maker_preprod.hex").trim();
+        let sealed = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+        let json = format!(
+            r#"{{"makerTx":"{}"}}"#,
+            swap_offer::encode_swap_offer(&sealed)
+        );
+        let req = parse_balance_sealed_json(&json).unwrap();
+        assert_eq!(req.maker_tx, sealed);
+        assert!(super::super::is_sealed_maker_payload(&req.maker_tx));
     }
 
     #[test]
