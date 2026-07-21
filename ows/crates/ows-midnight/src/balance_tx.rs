@@ -822,6 +822,24 @@ pub(crate) fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::
     Ok(crate::Prover::new(dir))
 }
 
+/// Reject a transaction whose ledger network id does not match the chain we're signing for, so a
+/// mainnet tx can never be balanced/signed while pointed at a testnet (or an ad-hoc feature testnet
+/// at another). Matched case-insensitively: a Midnight tx body may carry a capitalized network name.
+fn ensure_tx_network_id_matches_chain(
+    chain_id: &str,
+    tx_network_id: &str,
+) -> Result<(), std::io::Error> {
+    let expected = MidnightNetwork::from_chain_id(chain_id);
+    let expected = expected.ledger_network_id();
+    if !tx_network_id.eq_ignore_ascii_case(expected) {
+        return Err(err(format!(
+            "transaction network id {tx_network_id:?} does not match chain {chain_id} \
+             (expected {expected:?})"
+        )));
+    }
+    Ok(())
+}
+
 /// Plan (but do not authorize) the balancing of an already-proven (`proof,embedded-fr`) unsealed
 /// Standard transaction: parse it, plan the wallet's shielded funding, build the balanced unshielded
 /// offer, and size the DUST fee — all without real proving. The returned [`BalancedPlan`] carries no
@@ -847,6 +865,10 @@ fn plan_unsealed_proven_standard_tx(
              is not a balancing target",
         ));
     };
+
+    if let Some(chain_id) = scope.chain_id.as_deref() {
+        ensure_tx_network_id_matches_chain(chain_id, &base.network_id)?;
+    }
 
     // Plan a shielded deficit against the wallet's own shielded coins — a no-op when ledger `balance()`
     // has no negative shielded cell. Pure selection: no spend, no prove.
@@ -2343,6 +2365,21 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(g_sigs, 1, "guaranteed input must be signed");
         assert_eq!(f_sigs, 1, "fallible input must be signed");
+    }
+
+    #[test]
+    fn tx_network_id_must_match_chain() {
+        // Exact and case-insensitive matches pass; a custom feature testnet matches its reference.
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "preview").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "Preview").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:mainnet", "mainnet").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:feature-x", "feature-x").is_ok());
+
+        // Mismatches are rejected — never balance a mainnet tx while pointed at a testnet, or a
+        // tx built for one custom net while signing for another.
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "mainnet").is_err());
+        assert!(ensure_tx_network_id_matches_chain("midnight:mainnet", "preview").is_err());
+        assert!(ensure_tx_network_id_matches_chain("midnight:feature-x", "preview").is_err());
     }
 
     fn vk_of(seed_hex: &str) -> VerifyingKey {
