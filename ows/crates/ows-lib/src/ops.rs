@@ -551,6 +551,14 @@ fn sign_hash_with_credential(
             "raw hash signing is only supported for secp256k1-backed chains".into(),
         ));
     }
+    // Midnight's ledger signatures are made over a `data_to_sign` the wallet builds itself, so a
+    // raw digest signed with its unshielded key could authorize a spend.
+    if chain.chain_type == ChainType::Midnight {
+        return Err(OwsLibError::InvalidInput(
+            "raw hash signing is not supported for Midnight; sign a message or a transaction instead"
+                .into(),
+        ));
+    }
 
     if hash_bytes.len() != 32 {
         return Err(OwsLibError::InvalidInput(format!(
@@ -786,11 +794,7 @@ pub fn sign_message(
     let signer = signer_for_chain(&chain)?;
     let output = signer.sign_message(key.expose(), &msg_bytes, address)?;
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-        transaction: None,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign EIP-712 typed structured data. Returns hex-encoded signature.
@@ -3546,6 +3550,24 @@ mod tests {
     // ================================================================
     // RAW HASH + EIP-7702 AUTHORIZATION SIGNING
     // ================================================================
+
+    #[test]
+    fn sign_hash_refuses_midnight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = sign_hash(
+            "any",
+            "midnight:mainnet",
+            &"11".repeat(32),
+            None,
+            None,
+            Some(tmp.path()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OwsLibError::InvalidInput(m) if m.contains("Midnight")),
+            "{err}"
+        );
+    }
 
     #[test]
     fn sign_hash_owner_path_matches_direct_signer() {

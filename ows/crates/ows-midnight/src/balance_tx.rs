@@ -1381,6 +1381,38 @@ mod tests {
     }
 
     #[test]
+    fn a_message_signature_over_data_to_sign_does_not_authorize_the_intent() {
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let tx_bytes = build_proven_unshielded_tx(&vk, None);
+        let mut r: &[u8] = tx_bytes.as_slice();
+        let Transaction::Standard(stx) = tagged_deserialize::<TxProven>(&mut r).unwrap() else {
+            panic!("standard");
+        };
+        let pair = stx.intents.iter().next().unwrap();
+        let (seg_sp, intent_sp) = pair.deref();
+        let data = intent_sp
+            .deref()
+            .clone()
+            .erase_proofs()
+            .erase_signatures()
+            .data_to_sign(*seg_sp.deref());
+
+        let authorized = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
+        let authorized = MnSig::deserialize(&mut &authorized.signature[..], 0).unwrap();
+        assert!(vk.verify(&data, &authorized));
+
+        // The same key asked to sign those bytes as a message frames them first, so the result
+        // is not a signature over the intent.
+        let message = signer.sign_message(key.expose(), &data, None).unwrap();
+        let message = MnSig::deserialize(&mut &message.signature[..], 0).unwrap();
+        assert!(!vk.verify(&data, &message));
+    }
+
+    #[test]
     fn sign_then_encode_seals_a_tx_carrying_a_valid_signature() {
         let signer = MidnightSigner::mainnet();
         let key = packed_signing_key(UNSHIELDED_SEED_HEX);
