@@ -6,8 +6,8 @@
 //! see `authorize_merge`. A proven, unsealed transaction is refused; balancing one in place is what
 //! `balanceUnsealed` does.
 //!
-//! Scope: a sealed maker offer that keeps all its value in the guaranteed section, given as hex or as a
-//! MIP-0005 `swapoffer` string.
+//! Scope: a sealed maker offer that keeps all its value in the guaranteed section, given as hex, as a
+//! MIP-0005 `swapoffer` string, or as a stringified MIP-0006 offer payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref as _;
@@ -57,8 +57,8 @@ struct OptionsJson {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BalanceSealedJson {
-    /// The maker offer, hex or a `swapoffer` string. Accepts `makerTx`, or `tx`/`transaction` as
-    /// aliases.
+    /// The maker offer: hex, a `swapoffer` string, or a stringified MIP-0006 payload. Accepts
+    /// `makerTx`, or `tx`/`transaction` as aliases.
     #[serde(alias = "tx", alias = "transaction")]
     maker_tx: String,
     #[serde(default)]
@@ -79,11 +79,15 @@ pub fn parse_balance_sealed_json(json: &str) -> Result<BalanceSealedRequest, std
     })
 }
 
-/// Decode the maker input into tagged transaction bytes: a MIP-0005 `swapoffer` string, or hex.
+/// Decode the maker input into tagged transaction bytes: a MIP-0005 `swapoffer` string, a MIP-0006
+/// payload (validated against its offer), or hex.
 fn decode_maker_input(input: &str) -> Result<Vec<u8>, std::io::Error> {
     let trimmed = input.trim();
     if swap_offer::is_swap_offer(trimmed) {
         return swap_offer::decode_swap_offer(trimmed);
+    }
+    if trimmed.starts_with('{') {
+        return swap_offer::decode_offer_payload(trimmed);
     }
     let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     hex::decode(clean)
@@ -574,6 +578,24 @@ mod tests {
         let req = parse_balance_sealed_json(&json).unwrap();
         assert_eq!(req.maker_tx, sealed);
         assert!(super::super::is_sealed_maker_payload(&req.maker_tx));
+    }
+
+    #[test]
+    fn a_stringified_payload_maker_is_validated_against_its_offer() {
+        let hex_str = include_str!("testdata/sealed_maker_preprod.hex").trim();
+        let sealed = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+        // The fixture gives NIGHT and wants nothing, so its payload is refused as one-sided.
+        let payload = serde_json::json!({
+            "version": 1,
+            "offerBech32": swap_offer::encode_swap_offer(&sealed),
+            "computed": {
+                "gives": [{ "token": "00".repeat(32), "amount": "500000", "type": "UNSHIELDED" }],
+                "wants": [],
+            },
+        });
+        let json = serde_json::json!({ "makerTx": payload.to_string() }).to_string();
+        let e = parse_balance_sealed_json(&json).unwrap_err();
+        assert!(e.to_string().contains("one-sided"), "{e}");
     }
 
     #[test]
