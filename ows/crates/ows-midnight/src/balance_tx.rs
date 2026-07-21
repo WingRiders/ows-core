@@ -47,6 +47,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
+pub(crate) use fee_sizing::size_merge_dust_fee;
 use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
@@ -822,6 +823,25 @@ pub(crate) fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::
     Ok(crate::Prover::new(dir))
 }
 
+/// Whether the wallet adds a DUST fee section: only when fees are requested, and only on a live-DUST
+/// chain. When fees are requested but liveness can't be confirmed, fail loud rather than silently emit
+/// a fee-less tx the node would reject — the probe is fail-safe and cannot tell a genuinely fee-less
+/// network from a flaky probe, so on a fee-less network the caller opts out with `payFees: false`.
+pub(crate) fn adding_dust(pay_fees: bool, indexer_url: &str) -> Result<bool, std::io::Error> {
+    if !pay_fees {
+        return Ok(false);
+    }
+    if crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url)) {
+        Ok(true)
+    } else {
+        Err(err(
+            "could not confirm the network's DUST ledger is live; refusing to build a fee-less \
+             transaction the node may reject — retry, or pass payFees:false if this network has no \
+             DUST fees",
+        ))
+    }
+}
+
 /// Reject a transaction whose ledger network id does not match the chain we're signing for, so a
 /// mainnet tx can never be balanced/signed while pointed at a testnet (or an ad-hoc feature testnet
 /// at another). Matched case-insensitively: a Midnight tx body may carry a capitalized network name.
@@ -879,23 +899,7 @@ fn plan_unsealed_proven_standard_tx(
     // mints/withdrawals net positive and are skipped), reject shapes the wallet cannot authorize, and
     // fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
-    // Fees are paid from a DUST section, so one is added only on a live-DUST chain. When fees are
-    // requested but liveness can't be confirmed, fail loud rather than silently emit a fee-less tx the
-    // node would reject — the probe is fail-safe and cannot tell a genuinely fee-less network from a
-    // flaky probe, so on a fee-less network the caller opts out with `payFees: false`.
-    let adding_dust = if pay_fees {
-        if crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url)) {
-            true
-        } else {
-            return Err(err(
-                "could not confirm the network's DUST ledger is live; refusing to build a fee-less \
-                 transaction the node may reject — retry, or pass payFees:false if this network has no \
-                 DUST fees",
-            ));
-        }
-    } else {
-        false
-    };
+    let adding_dust = adding_dust(pay_fees, indexer_url)?;
     let wallet_dust_address = crypto_provider
         .dust_public_key()
         .map_err(|e| err(e.to_string()))?;
@@ -1378,6 +1382,14 @@ mod tests {
         let mut out = Vec::new();
         tagged_serialize(&tx, &mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn adding_dust_refuses_when_liveness_cannot_be_confirmed() {
+        let unreachable = "http://127.0.0.1:1/api/v3/graphql";
+        assert!(!adding_dust(false, unreachable).unwrap());
+        let e = adding_dust(true, unreachable).unwrap_err();
+        assert!(e.to_string().contains("DUST ledger is live"), "{e}");
     }
 
     #[test]

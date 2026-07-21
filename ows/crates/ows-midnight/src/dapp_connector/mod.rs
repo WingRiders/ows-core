@@ -11,13 +11,16 @@ use serde::Deserialize;
 
 use crate::BalancedPlan;
 
+mod balance_sealed;
 mod balance_unsealed;
 mod build;
 mod make_intent;
 mod make_transfer;
 
+pub use balance_sealed::{parse_balance_sealed_json, BalanceSealedRequest};
 pub use balance_unsealed::{
-    classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
+    classify_unsealed_payload, is_sealed_maker_payload, parse_balance_unsealed_json,
+    BalanceUnsealedRequest, UnsealedKind,
 };
 pub use build::{DesiredOutput, TransferKind};
 pub use make_intent::{parse_make_intent_json, DesiredInput, MakeIntentRequest};
@@ -32,6 +35,8 @@ pub enum ConnectorMethod {
     MakeTransfer,
     /// `makeIntent` — the wallet builds an imbalanced maker swap-offer intent.
     MakeIntent,
+    /// `balanceSealedTransaction` — the wallet (taker) completes a maker's swap offer.
+    BalanceSealed,
     /// A method name the wallet parses but does not yet handle (e.g. a sibling still to be built).
     Other(String),
 }
@@ -51,6 +56,7 @@ pub fn parse_connector_method(json: &str) -> Result<ConnectorMethod, std::io::Er
         None | Some("balanceUnsealedTransaction") => ConnectorMethod::BalanceUnsealed,
         Some("makeTransfer") => ConnectorMethod::MakeTransfer,
         Some("makeIntent") => ConnectorMethod::MakeIntent,
+        Some("balanceSealedTransaction") => ConnectorMethod::BalanceSealed,
         Some(other) => ConnectorMethod::Other(other.to_string()),
     })
 }
@@ -66,6 +72,18 @@ pub enum ConnectorPlan {
     MakeTransfer(MakeTransferRequest),
     /// A `makeIntent` request; the wallet builds an imbalanced maker offer, proved in `authorize`.
     MakeIntent(MakeIntentRequest),
+    /// A `balanceSealedTransaction`: the maker offer is SEALED (`proof,pedersen-schnorr`).
+    /// A sealed tx cannot be balanced in place (its binding fixes the value balance), so the taker
+    /// completes it by MERGING: it builds its own imbalanced half — the per-token complement of the
+    /// maker's imbalance — seals it, and `Transaction::merge`s the two. Carries the maker's sealed
+    /// bytes and that derived complement.
+    BalanceSealedMerge {
+        maker_tx: Vec<u8>,
+        complement: MakeIntentRequest,
+        /// Whether the taker funds the merged tx's DUST fee. Off (or a fee-less chain) → the merged tx
+        /// is value-balanced but carries no fee, so a live-DUST network rejects the submit.
+        pay_fees: bool,
+    },
 }
 
 impl ConnectorPlan {
@@ -86,6 +104,17 @@ impl ConnectorPlan {
             ConnectorPlan::MakeIntent(req) => {
                 make_intent::authorize(chain_id, crypto_provider, req)
             }
+            ConnectorPlan::BalanceSealedMerge {
+                maker_tx,
+                complement,
+                pay_fees,
+            } => balance_sealed::authorize_merge(
+                chain_id,
+                crypto_provider,
+                &maker_tx,
+                complement,
+                pay_fees,
+            ),
         }
     }
     // ── POLICY SEAM ── TODO(policy): `ConnectorPlan::effects()` belongs here — the wallet-relative
@@ -106,6 +135,7 @@ pub fn plan_connector_tx(
             Ok(ConnectorPlan::MakeTransfer(parse_make_transfer_json(json)?))
         }
         ConnectorMethod::MakeIntent => Ok(ConnectorPlan::MakeIntent(parse_make_intent_json(json)?)),
+        ConnectorMethod::BalanceSealed => balance_sealed::plan(chain_id, crypto_provider, json),
         ConnectorMethod::Other(method) => Err(std::io::Error::other(format!(
             "Midnight DApp Connector method '{method}' is not yet implemented"
         ))),
