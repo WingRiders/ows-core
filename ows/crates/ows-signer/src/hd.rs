@@ -149,31 +149,53 @@ impl HdDeriver {
             .collect()
     }
 
-    /// Validate a derivation path. Must start with "m/" and contain valid indices.
-    pub fn validate_path(path: &str) -> Result<(), HdError> {
-        if !path.starts_with("m/") && path != "m" {
+    /// Parse a derivation path into `(index, hardened)` pairs.
+    ///
+    /// The single parser behind [`Self::validate_path`] and the per-curve derivation
+    /// functions, so every curve agrees on what a path means. `"m"` yields no components.
+    fn parse_path_components(path: &str) -> Result<Vec<(u32, bool)>, HdError> {
+        if path == "m" {
+            return Ok(vec![]);
+        }
+        if !path.starts_with("m/") {
             return Err(HdError::InvalidPath(format!(
                 "path must start with 'm/', got '{}'",
                 path
             )));
         }
-        if path == "m" {
-            return Ok(());
-        }
-        let components = path[2..].split('/');
-        for component in components {
-            let index_str = component.trim_end_matches('\'');
-            if index_str.is_empty() {
-                return Err(HdError::InvalidPath(format!(
-                    "empty component in path '{}'",
-                    path
-                )));
-            }
-            index_str.parse::<u32>().map_err(|_| {
-                HdError::InvalidPath(format!("invalid index '{}' in path '{}'", component, path))
-            })?;
-        }
-        Ok(())
+        path[2..]
+            .split('/')
+            .map(|component| {
+                let (index_str, hardened) = match component.strip_suffix('\'') {
+                    Some(stripped) => (stripped, true),
+                    None => (component, false),
+                };
+                if index_str.is_empty() {
+                    return Err(HdError::InvalidPath(format!(
+                        "empty component in path '{}'",
+                        path
+                    )));
+                }
+                let index: u32 = index_str.parse().map_err(|_| {
+                    HdError::InvalidPath(format!(
+                        "invalid index '{}' in path '{}'",
+                        component, path
+                    ))
+                })?;
+                if index >= HARDENED_THRESHOLD {
+                    return Err(HdError::InvalidPath(format!(
+                        "index '{}' in path '{}' must be below {}",
+                        component, path, HARDENED_THRESHOLD
+                    )));
+                }
+                Ok((index, hardened))
+            })
+            .collect()
+    }
+
+    /// Validate a derivation path. Must start with "m/" and contain valid indices.
+    pub fn validate_path(path: &str) -> Result<(), HdError> {
+        Self::parse_path_components(path).map(|_| ())
     }
 
     /// BIP-32 derivation for secp256k1 using coins-bip32.
@@ -201,24 +223,11 @@ impl HdDeriver {
     fn derive_ed25519(seed: &[u8], path: &str) -> Result<SecretBytes, HdError> {
         use zeroize::Zeroize;
 
-        // Parse path components
-        let components = if path == "m" {
-            vec![]
-        } else {
-            path[2..]
-                .split('/')
-                .map(|c| {
-                    if !c.ends_with('\'') {
-                        return Err(HdError::Ed25519NonHardened);
-                    }
-                    let index_str = c.trim_end_matches('\'');
-                    let index: u32 = index_str
-                        .parse()
-                        .map_err(|_| HdError::InvalidPath(format!("invalid index: {}", c)))?;
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        // Parse path components (hardened only)
+        let components = Self::parse_path_components(path)?;
+        if components.iter().any(|(_, hardened)| !hardened) {
+            return Err(HdError::Ed25519NonHardened);
+        }
 
         // SLIP-10: Master key generation
         type HmacSha512 = Hmac<Sha512>;
@@ -232,12 +241,17 @@ impl HdDeriver {
 
         // Derive each component (hardened only)
         let mut data = Vec::new();
-        for index in components {
+        for (index, _) in components {
+            // `parse_path_components` bounds `index` below HARDENED_THRESHOLD, so this cannot overflow
+            let child_index = index.checked_add(HARDENED_THRESHOLD).ok_or_else(|| {
+                HdError::InvalidPath(format!("invalid hardened index: {}", index))
+            })?;
+
             data.zeroize();
             data.clear();
             data.push(0u8); // 0x00 prefix for private key derivation
             data.extend_from_slice(&key);
-            data.extend_from_slice(&(index + HARDENED_THRESHOLD).to_be_bytes());
+            data.extend_from_slice(&child_index.to_be_bytes());
 
             let mut mac =
                 HmacSha512::new_from_slice(&chain_code).expect("HMAC can take key of any size");
@@ -271,24 +285,16 @@ impl HdDeriver {
         let mut xprv = ed25519_bip32::XPrv::from_bytes_verified(*seed)
             .map_err(|e| HdError::DerivationFailed(e.to_string()))?;
 
-        if path == "m" {
-            return Ok(SecretBytes::new(xprv.as_ref().to_vec()));
-        }
-
-        for part in path[2..].split('/') {
-            let hardened = part.ends_with('\'');
-            let index_str = part.trim_end_matches('\'');
-            let n: u32 = index_str
-                .parse()
-                .map_err(|_| HdError::InvalidPath(format!("invalid index: {}", part)))?;
-            let idx = if hardened {
-                n.checked_add(HARDENED_THRESHOLD).ok_or_else(|| {
-                    HdError::InvalidPath(format!("invalid hardened index: {}", part))
+        for (index, hardened) in Self::parse_path_components(path)? {
+            // `parse_path_components` bounds `index` below HARDENED_THRESHOLD, so this cannot overflow
+            let child_index = if hardened {
+                index.checked_add(HARDENED_THRESHOLD).ok_or_else(|| {
+                    HdError::InvalidPath(format!("invalid hardened index: {}", index))
                 })?
             } else {
-                n
+                index
             };
-            xprv = xprv.derive(ed25519_bip32::DerivationScheme::V2, idx);
+            xprv = xprv.derive(ed25519_bip32::DerivationScheme::V2, child_index);
         }
         Ok(SecretBytes::new(xprv.as_ref().to_vec()))
     }
@@ -377,6 +383,64 @@ mod tests {
         assert!(HdDeriver::validate_path("44'/60'/0'/0/0").is_err());
         assert!(HdDeriver::validate_path("").is_err());
         assert!(HdDeriver::validate_path("x/44'/60'").is_err());
+    }
+
+    #[test]
+    fn test_path_validation_rejects_index_at_or_above_hardened_threshold() {
+        // A bare 2147483648 would alias the hardened 0' (both are child index 0x80000000),
+        // and 2147483648' would overflow the hardening offset.
+        for path in [
+            "m/2147483648",
+            "m/2147483648'",
+            "m/4294967295",
+            "m/44'/0/2147483648",
+        ] {
+            assert!(
+                HdDeriver::validate_path(path).is_err(),
+                "expected '{path}' to be rejected"
+            );
+        }
+        // The largest legal index is still accepted.
+        assert!(HdDeriver::validate_path("m/2147483647'").is_ok());
+        assert!(HdDeriver::validate_path("m/2147483647").is_ok());
+    }
+
+    #[test]
+    fn test_path_validation_rejects_repeated_hardened_marker() {
+        assert!(HdDeriver::validate_path("m/44''").is_err());
+        assert!(HdDeriver::validate_path("m/44'/0''''").is_err());
+    }
+
+    #[test]
+    fn test_derive_rejects_out_of_range_index_on_every_curve() {
+        let seed = test_seed();
+        let xprv = HdDeriver::ed25519_bip32_master_xprv_from_entropy(&[0u8; 32]);
+
+        for path in ["m/2147483648", "m/2147483648'"] {
+            for (curve, seed) in [
+                (Curve::Secp256k1, seed.expose()),
+                (Curve::Ed25519, seed.expose()),
+                (Curve::Ed25519Bip32, &xprv[..]),
+            ] {
+                let err = HdDeriver::derive(seed, path, curve)
+                    .expect_err("expected '{path}' on {curve:?} to be rejected");
+                match err {
+                    HdError::InvalidPath(_) => {}
+                    other => {
+                        panic!("expected InvalidPath for '{path}' on {curve:?}, got {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// `m/2147483648` and `m/0'` are the same child index (0x80000000); rejecting the
+    /// former is what keeps two spellings of one path from being two paths.
+    #[test]
+    fn test_ed25519_bip32_no_longer_aliases_hardened_zero() {
+        let xprv = HdDeriver::ed25519_bip32_master_xprv_from_entropy(&[0u8; 32]);
+        assert!(HdDeriver::derive(&xprv[..], "m/0'", Curve::Ed25519Bip32).is_ok());
+        assert!(HdDeriver::derive(&xprv[..], "m/2147483648", Curve::Ed25519Bip32).is_err());
     }
 
     #[test]
