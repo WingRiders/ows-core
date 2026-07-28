@@ -223,8 +223,9 @@ are supported:
 | **Blockfrost** | `project_id` API key via the `BLOCKFROST_PROJECT_ID` environment variable | No (opt-in via RPC URL override) |
 
 Both providers implement the same three operations: broadcast a signed
-transaction (CBOR), fetch UTxOs for transaction inputs, and fetch address token
-balances. `resolve_cardano_provider` selects the implementation from the
+transaction (CBOR), fetch the CBOR of a set of transactions (used to resolve
+transaction inputs, see [§4.2](#42-parsing-and-input-resolution-cardanorpcproviderfetch_txs_cbor)),
+and fetch address token balances. `resolve_cardano_provider` selects the implementation from the
 configured RPC URL (see [Provider selection](#provider-selection) below).
 
 **Default endpoints (Koios).** Built-in defaults are registered in
@@ -298,7 +299,11 @@ BIP-39 seed. Instead it follows the Cardano Icarus scheme
 1. Extract the raw BIP-39 **entropy** (checksum bits excluded) from the mnemonic.
    `Mnemonic::entropy()` was added for this purpose.
 2. `PBKDF2-HMAC-SHA512` with an **empty password**, the entropy as the **salt**,
-   `4096` iterations, producing a 96-byte output.
+   `4096` iterations, producing a 96-byte output. The password slot is left empty
+   on purpose: Cardano software wallets (Eternl, Yoroi, …) pass no
+   spending password into this step, so filling it — for example with the BIP-39
+   passphrase — would derive a different root key and produce addresses no other
+   Cardano wallet could reproduce from the same mnemonic.
 3. Normalize the result with `XPrv::normalize_bytes_force3rd` to obtain a valid
    master extended private key.
 
@@ -313,6 +318,15 @@ applies to secp256k1/ed25519 is bypassed). Path components are walked with the
 `ed25519-bip32` crate using **`DerivationScheme::V2`**, supporting both hardened
 (`'`) and non-hardened indices. The result is the 96-byte child `XPrv`.
 
+All curves share a single path parser (`parse_path_components`), so
+`validate_path` and every per-curve derivation branch agree on what a path means:
+each component is `<index>` or `<index>'`, and the bare index must be **below
+2³¹** (`0x80000000`). The bound matters most for Cardano, the only curve that also
+accepts non-hardened components: without it `m/2147483648` and `m/0'` would derive
+the same child index and be two spellings of one path. On the hardened-only
+SLIP-10 branch the same parser additionally rejects any non-hardened component
+(`Ed25519NonHardened`).
+
 The deriver continues to expose the same surface for all curves:
 `derive`, `derive_from_mnemonic`, and the cached `derive_from_mnemonic_cached`
 (the cache key incorporates the `ed25519_bip32` curve tag so it cannot collide
@@ -324,20 +338,21 @@ with secp256k1/ed25519 keys for the same path).
 `m / 1852' / 1815' / account' / role / index`, where `role` is
 `0` = external/payment, `1` = internal/change, `2` = stake:
 
-| Helper                                    | Path                                 |
-| ----------------------------------------- | ------------------------------------ |
-| `payment_derivation_path(account, index)` | `m/1852'/1815'/{account}'/0/{index}` |
-| `stake_derivation_path(account)`          | `m/1852'/1815'/{account}'/2/0`       |
-| `account_derivation_path(account)`        | `m/1852'/1815'/{account}'`           |
+| Helper                            | Path                          |
+| --------------------------------- | ----------------------------- |
+| `payment_derivation_path(index)`  | `m/1852'/1815'/{index}'/0/0`  |
+| `stake_derivation_path(index)`    | `m/1852'/1815'/{index}'/2/0`  |
 
 Per the agreed scope, only **one base address per account at address index 0** is
-supported initially. `default_derivation_path(index)` returns the payment leaf for
-account 0 (`m/1852'/1815'/0'/0/{index}`). Generic single-path key resolution no
+supported initially, so the generic `index` that OWS threads through derivation is
+used as the CIP-1852 **account** index and the address index stays `0`.
+`default_derivation_path(index)` returns the payment leaf
+(`m/1852'/1815'/{index}'/0/0`). Generic single-path key resolution no
 longer derives this leaf directly; instead generic call sites use
 `default_derivation_paths` and `encode_keys` (see
 [§3.5](#35-key-material-abstraction-default_derivation_paths-and-encode_keys)),
 which for Cardano materialize both the payment leaf and the stake key
-(`m/1852'/1815'/0'/2/0`) as a single 192-byte buffer.
+(`m/1852'/1815'/{index}'/2/0`) as a single 192-byte buffer.
 
 #### 2.5 `ChainSigner` integration
 
@@ -372,6 +387,13 @@ extended (`ows-lib/src/ops.rs`):
 - `KeyPair::key_for_curve(Curve::Ed25519Bip32)` returns this material; empty
   material yields a clear "private key for chain is empty" error for wallets
   imported before Cardano support existed.
+- An explicitly supplied `ed25519_bip32` key is validated at import time
+  (`validate_ed25519_bip32_key` in `import_wallet_private_key`): the blob must be
+  exactly 96 or 192 bytes, and each 96-byte half must pass
+  `XPrv::from_slice_verified`, i.e. satisfy the Ed25519-BIP32 scalar clamping
+  rules. A malformed key is rejected with an `InvalidInput` error naming the
+  offending half (`payment` / `stake`) instead of being stored and failing later
+  at signing time.
 - Mnemonic wallets reach the same 192-byte layout through `default_derivation_paths`
   and `encode_keys` (see
   [§3.5](#35-key-material-abstraction-default_derivation_paths-and-encode_keys)) rather than through
@@ -459,7 +481,12 @@ COSE `Sig_structure`, not the raw message. The flow:
    `Sig_structure`, which is signed with the selected raw Ed25519 key.
 4. **Serialize.** The signature is folded back into the builder, wrapped as a
    `SignedMessage::new_cose_sign1`, and serialized to CBOR. `SignOutput.signature`
-   is the serialized `COSE_Sign1`; `public_key` is the signing key's public key.
+   is the serialized `COSE_Sign1`; `public_key` is the signing key's public key
+   wrapped in a serialized **`COSE_Key`** (`EdDSA25519Key::new(raw_pubkey).build()`,
+   CBOR-encoded — `kty: OKP`, `alg: EdDSA`, `crv: Ed25519`, `x: <32-byte key>`),
+   not the bare 32 raw bytes. This is the `key` half of the `(signature, key)`
+   pair CIP-30's `signData` returns, so a CIP-8 verifier can consume the output
+   directly.
 
 #### 3.4 Transaction signing
 
@@ -468,20 +495,36 @@ transactions — input selection, fees, and change are the caller's responsibili
 
 1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure).
 2. Always create a payment witness with `make_vkey_witness(tx_hash, payment_raw_key)`.
-3. If stake key material is present **and** the transaction body's
-   `required_signers` set contains the stake key hash, also create a stake witness.
-   (Stake witnesses are only added when the transaction explicitly requires them —
-   e.g. certificate or withdrawal transactions — to avoid attaching superfluous
-   signatures.)
-4. `SignOutput.signature` is the **concatenation** of the CBOR-encoded witness(es)
-   (payment, optionally followed by stake); `public_key` is the payment witness's
-   public key.
+3. Determine whether the body needs a **stake** signature. Two independent sources
+   are consulted:
+   - **Structural requirements** (`stake_key_hashes_required_by_body`) — the key
+     hashes the ledger will demand regardless of what the builder declared:
+     - **certificate stake credentials** (`add_cert_key_hashes`), covering the
+       Conway `reg_cert` (a legacy `stake_registration` with no explicit deposit
+       needs no witness, so it is skipped), stake deregistration, stake/vote
+       delegation and the combined registration+delegation certificates, and vote
+       delegation — mirroring the stake-credential arms of the ledger's
+       `witsVKeyNeeded`. Script credentials are witnessed by the script, not a
+       vkey, so only key-hash credentials are collected. Pool **owners** on a pool
+       registration are stake key hashes and are collected; the pool operator's
+       cold key, genesis delegates, committee credentials, and DRep credentials
+       can never be a CIP-1852 stake key and are not.
+     - **withdrawals** — the reward account of every withdrawal in the body.
+   - **`required_signers`** — consulted only to decide whether *this* wallet's
+     stake key should sign, never to decide that a stake key is missing: a hash
+     listed there routinely belongs to a co-signer.
+4. If stake key material is present and its hash is in either set, a stake witness
+   is appended. If **no** stake key is available but the body structurally requires
+   a stake signature for anything other than the payment credential,
+   `sign_transaction` fails with `InvalidTransaction` rather than returning a
+   transaction that would fail phase-1 validation on submission.
+5. `SignOutput.signature` is the CBOR-encoded **`Vkeywitnesses` set** (payment,
+   optionally followed by stake); `public_key` is the payment witness's public key.
 
 `encode_signed_transaction` assembles the submittable transaction: it re-parses the
-unsigned CBOR into a `FixedTransaction`, splits the signature buffer into
-fixed-size 101-byte chunks (`VKEY_WITNESS_CBOR_BYTES` = 32-byte pubkey + 64-byte
-signature + 5 bytes of CBOR framing), decodes each chunk into a `Vkeywitness`, adds
-it with `add_vkey_witness`, and returns the CBOR of the now-witnessed transaction.
+unsigned CBOR into a `FixedTransaction`, decodes the signature buffer back into a
+`Vkeywitnesses` set (`Vkeywitnesses::from_bytes`), adds each witness with
+`add_vkey_witness`, and returns the CBOR of the now-witnessed transaction.
 This is the byte string handed to `broadcast_cardano` ([§2.7](#27-broadcast-plumbing)).
 
 #### 3.5 Key-material abstraction (`default_derivation_paths` and `encode_keys`)
@@ -497,7 +540,7 @@ exposes two overridable hooks:
   unchanged.
 
 `CardanoSigner` overrides both: `default_derivation_paths` returns the payment leaf
-`m/1852'/1815'/0'/0/{index}` and the stake key `m/1852'/1815'/0'/2/0`;
+`m/1852'/1815'/{index}'/0/0` and the stake key `m/1852'/1815'/{index}'/2/0`;
 `encode_keys` concatenates the two 96-byte `XPrv`s into the 192-byte payment ‖
 stake buffer the address and signing methods expect. Generic call sites were
 migrated to this pattern — `derive_all_accounts`, `secret_to_signing_key`,
@@ -574,7 +617,7 @@ default; see [§1.4](#14-rpc-configuration-koios-and-blockfrost)); `resolve_rpc_
 was made `pub(crate)`-visible for this. For every non-Cardano chain the URL
 stays `None`, so no network call is introduced anywhere else.
 
-#### 4.2 Parsing and input resolution (`CardanoRpcProvider::fetch_utxos`)
+#### 4.2 Parsing and input resolution (`CardanoRpcProvider::fetch_txs_cbor`)
 
 `CardanoSigner::make_transaction_context` (`ows-signer/src/chains/cardano.rs`):
 
@@ -583,21 +626,25 @@ stays `None`, so no network call is introduced anywhere else.
 2. Collect input references as `(tx_hash_hex, index)` pairs from `tx.body().inputs()`.
 3. If there are inputs, an RPC URL is **required** (else `InvalidMessage`);
    `resolve_cardano_provider` selects Koios or Blockfrost from the URL (see
-   [§1.4](#14-rpc-configuration-koios-and-blockfrost)) and calls
-   `fetch_utxos` on the resulting provider:
-   - **Koios** — `POST {rpc}/utxo_info` with
-     `{"_utxo_refs": ["<hash>#<index>", …], "_extended": true}`. `_extended: true`
-     is required so the response includes each UTxO's `asset_list`. Requests are
-     **chunked** at 80 refs per call.
-   - **Blockfrost** — per-transaction `GET {rpc}/txs/{hash}/utxos`, then the
-     matching output index for each input (Blockfrost has no batch UTxO endpoint).
+   [§1.4](#14-rpc-configuration-koios-and-blockfrost)). Inputs are resolved *not*
+   by asking the provider for UTxO values, but by fetching the **CBOR of each
+   referenced transaction** (`CardanoRpcProvider::fetch_txs_cbor`, one request set
+   per unique tx hash) and reading the referenced output out of it:
+   - **Koios** — `POST {rpc}/tx_cbor` with `{"_tx_hashes": [...]}`, **chunked** at
+     10 hashes per call.
+   - **Blockfrost** — per-transaction `GET {rpc}/txs/{hash}/cbor` (no batch
+     endpoint); a `404` is skipped, so the result may be partial.
    - Both providers use a blocking `reqwest` client with a `45s` timeout.
-   - Failures map to `SignerError::RpcError`. Koios additionally rejects a chunk
-     that returns fewer matching UTxO rows than requested (`InvalidTransaction`);
-     Blockfrost errors if a referenced output index is missing.
+   - Failures map to `SignerError::RpcError`.
+4. Each returned CBOR is decoded into a `FixedTransaction` and its
+   `transaction_hash()` is compared against the hash it was requested under; a
+   mismatch is a hard `RpcError`. A hash missing from the response is likewise an
+   `RpcError`, and an input whose index is past the end of the source
+   transaction's outputs is an `InvalidTransaction`.
 
-Each resolved `CardanoUtxo` carries the input's `address`, its lovelace amount,
-and a list of native assets keyed by `policy_id ‖ asset_name` (hex).
+Each resolved `Utxo` carries the input's `address`, its lovelace amount, and a list
+of native assets keyed by `policy_id ‖ asset_name` (hex), all read from the source
+transaction's output.
 
 #### 4.3 Computing per-address effects
 
@@ -608,6 +655,20 @@ The signer builds two `address → (asset_id → amount)` maps and diffs them:
   each native asset → `policy_id ‖ asset_name`).
 - **Outputs** map is read directly from `tx.body().outputs()`: the `coin` becomes
   `lovelace`, and each `multiasset` entry becomes `policy_id_hex ‖ asset_name_hex`.
+- **Withdrawals** (`tx.body().withdrawals()`) are folded into the **inputs** map:
+  lovelace leaves the reward account and enters the transaction, so each
+  withdrawal counts as an input from the bech32 **reward address**
+  (`stake1…`) it is drawn from.
+- **Certificate deposits and refunds** (`cert_deposit_or_refund`) are attributed to
+  the reward address of the certificate's credential, built from that credential
+  and the signer's `network_id`. A **deposit** locks lovelace under the credential
+  and is therefore counted as an *output* to that reward address; a **refund**
+  unlocks it and is counted as an *input*. Covered certificates are the Conway
+  `reg_cert`/`unreg_cert` (only when they carry an explicit `coin` on the wire),
+  stake registration-and-delegation, stake-vote registration-and-delegation, vote
+  registration-and-delegation, and DRep registration/deregistration. Legacy
+  Shelley certificates without an on-wire amount are skipped, because their
+  deposit comes from protocol parameters that the transaction bytes do not carry.
 - ADA is represented by the reserved asset id **`"lovelace"`**; every native asset
   is keyed by the concatenation of its (hex) policy id and (hex) asset name, so the
   same token nets out across inputs and outputs.
@@ -668,11 +729,32 @@ built-in rules and to executable policies over stdin.
   Cardano-only API) also gave every other chain a cheap opt-in guard against
   signing with the wrong key (`verify_sign_message_address` →
   `AddressMismatch`).
-- **Concatenated witnesses + fixed-size chunking.** `sign_transaction` returns the
-  CBOR witnesses concatenated, and `encode_signed_transaction` splits them back on
-  the fixed 101-byte `Vkeywitness` size. This keeps `SignOutput.signature` a flat
-  byte string (consistent with other chains) while still supporting the
-  multi-witness (payment + stake) case.
+- **A CBOR witness set as the signature.** `sign_transaction` returns the CBOR
+  encoding of the whole `Vkeywitnesses` set, and `encode_signed_transaction`
+  decodes it back with `Vkeywitnesses::from_bytes`. This keeps
+  `SignOutput.signature` a flat byte string (consistent with other chains) while
+  supporting the multi-witness (payment + stake) case without the caller having to
+  know a fixed per-witness length.
+- **Stake witnessing driven by the transaction body, not by `required_signers`.**
+  A builder is not obliged to list the stake key in `required_signers`, so keying
+  the decision off that field alone silently produced unsubmittable delegation and
+  withdrawal transactions. `sign_transaction` therefore derives the required stake
+  key hashes from the certificates and withdrawals themselves (mirroring the
+  ledger's `witsVKeyNeeded`) and keeps `required_signers` only as an additional
+  trigger — never as the reason to declare a stake key missing, since a hash listed
+  there frequently belongs to a co-signer. When a stake signature is structurally
+  required and no stake key is available, failing early is preferable to handing
+  back a transaction that dies in phase-1 validation.
+- **`COSE_Key` as the message-signing public key.** CIP-30's `signData` returns a
+  `(signature, key)` pair where `key` is a COSE key, not raw bytes. Returning the
+  serialized `COSE_Key` in `SignOutput.public_key` lets wallet/dApp verifiers use
+  the output as-is instead of re-wrapping the raw Ed25519 key themselves.
+- **Deposits, refunds, and withdrawals attributed to the reward address.** Staking
+  lovelace is locked under a *credential*, not at a payment address, so the only
+  faithful place to book it is the credential's reward address. Treating deposits
+  as outputs and refunds/withdrawals as inputs keeps the netting arithmetic
+  identical to the UTxO side, so a policy sees "2 ADA left this payment address and
+  2 ADA is now locked at this `stake1…`" instead of an unexplained outflow.
 - **RPC-resolved transaction effects for policy.** Cardano inputs carry no value,
   so a meaningful `TransactionContext` cannot be built from the transaction bytes
   alone. Rather than inventing a Cardano-only policy path, the existing
@@ -681,18 +763,18 @@ built-in rules and to executable policies over stdin.
   the same chain-agnostic `TransactionEffect` shape every other chain uses — so
   executable policies see uniform per-address asset deltas regardless of chain. The
   RPC dependency is threaded only for Cardano; all other chains keep passing `None`.
-- **Reject missing input UTxOs.** If the provider returns fewer UTxOs than
-  requested (Koios) or a referenced output is absent (Blockfrost),
-  `make_transaction_context` errors instead of proceeding. An unresolved input would
-  silently understate the ADA/asset outflow and could let a spending policy pass a
-  transaction it should have denied, so a partial resolution is treated as a hard
-  failure.
+- **Reject missing input UTxOs.** If the provider omits a referenced transaction,
+  returns CBOR whose hash does not match, or the referenced output index does not
+  exist, `make_transaction_context` errors instead of proceeding. An unresolved
+  input would silently understate the ADA/asset outflow and could let a spending
+  policy pass a transaction it should have denied, so a partial resolution is
+  treated as a hard failure.
 
   > **⚠️ Warning — chained/unconfirmed transactions.** This same strictness breaks
   > transaction *chaining*. If a transaction spends an input that was created by an
   > earlier transaction which has **not yet been confirmed in a block**, the RPC
-  > provider does not know that UTxO yet and omits it from the response. Because the
-  > returned data is then incomplete,
+  > provider does not know that transaction yet and omits it from the response.
+  > Because the returned data is then incomplete,
   > `make_transaction_context` fails (surfaced as `InvalidTransaction` or
   > `RpcError`) and the signing request is rejected, even though
   > the transaction itself is well-formed. In other words, a transaction cannot be
@@ -723,28 +805,32 @@ These deliverables are considered complete when:
 6. `CardanoSigner` reports curve `Ed25519Bip32`, coin type `1815`, and the
    CIP-1852 payment leaf as its default path.
 7. Multi-curve key storage carries an `ed25519_bip32` entry (192 bytes for
-   imported keys) without changing the wallet schema version.
+   imported keys) without changing the wallet schema version, and an explicitly
+   supplied key is accepted only in the 96/192-byte shapes with valid
+   Ed25519-BIP32 clamping.
 8. `derive_address` produces the correct mainnet Shelley **base** address from
    192-byte key material and the correct **enterprise** address from 96-byte
    payment-only material (verified against fixed vectors for 12- and 24-word
    mnemonics).
 9. `sign_message` produces a CIP-8 `COSE_Sign1` matching reference vectors for the
-   no-address, base, enterprise, and reward-address cases, and rejects an address
-   the key does not control with `AddressMismatch`.
+   no-address, base, enterprise, and reward-address cases, returns the signing
+   key as a serialized `COSE_Key`, and rejects an address the key does not control
+   with `AddressMismatch`.
 10. `sign_transaction` produces correct `Vkeywitness`(es) — payment only, and
-    payment + stake when the transaction's `required_signers` demand it — and
-    `encode_signed_transaction` round-trips them into a submittable transaction
-    matching reference CBOR vectors.
+    payment + stake when the transaction's certificates, withdrawals, or
+    `required_signers` demand it — and `encode_signed_transaction` round-trips the
+    witness set into a submittable transaction matching reference CBOR vectors.
 11. `default_derivation_paths` returns both CIP-1852 paths for Cardano, and
     `encode_keys` returns the 192-byte payment ‖ stake buffer; all other chains
     remain on their single-path defaults.
 12. `make_transaction_context` parses an unsigned Cardano transaction, resolves its
-    inputs via `CardanoRpcProvider::fetch_utxos` (Koios or Blockfrost), and produces
+    inputs via the configured provider (Koios or Blockfrost), and produces
     per-address `TransactionEffect`s with correct signed ADA and native-asset diffs
     (verified against mocked provider responses for self-transfer, external+change,
-    asset-carrying, and multi-input/multi-output cases); it errors when the RPC URL
-    is missing for a transaction with inputs, or when the provider returns incomplete
-    UTxO data.
+    asset-carrying, and multi-input/multi-output cases); withdrawals and
+    certificate deposits/refunds are booked against the corresponding reward
+    address; it errors when the RPC URL is missing for a transaction with inputs,
+    or when the provider returns incomplete UTxO data.
 
 ### Implementation Plan
 
@@ -798,7 +884,17 @@ fetching, persisting both payment and stake paths per `WalletAccount`.
 - **Key material handling.** All derived keys are wrapped in `SecretBytes`
   (zeroized on drop). Intermediate buffers in HD derivation are explicitly
   zeroized. The 96-byte extended private keys are treated as secrets identical to
-  other curve keys.
+  other curve keys. Every buffer that transiently holds an Ed25519-BIP32 secret is
+  covered: the PBKDF2 output and normalized master `XPrv`
+  (`ed25519_bip32_master_xprv_from_entropy`), the randomly generated import keys,
+  the decoded hex of an explicitly supplied key, the `KeyPair` fields and the JSON
+  blob they are serialized into, and the bit accumulator and phrase copy inside
+  `Mnemonic::entropy()` — all are `Zeroizing`/explicitly wiped rather than left to
+  the allocator.
+- **Malformed imported keys are rejected.** A user-supplied `ed25519_bip32` key is
+  shape- and clamping-checked at import (see
+  [§2.6](#26-multi-credential-key-storage)), so an unusable key surfaces at import
+  time rather than as an opaque failure on first use.
 - **Icarus master key.** Uses the standard PBKDF2-HMAC-SHA512 (4096 iterations,
   empty password, entropy as salt) and `normalize_bytes_force3rd`, matching
   ecosystem wallets; deviating would produce incompatible (and potentially
@@ -807,6 +903,11 @@ fetching, persisting both payment and stake paths per `WalletAccount`.
   This is required for Cardano interoperability, but callers should remain aware
   that a non-hardened branch's xpub + a single child xprv can expose sibling keys;
   the default account/payment/stake paths use hardened account-level segments.
+  Path components at or above 2³¹ are rejected on every curve, so a bare
+  `m/2147483648` cannot be used as an alias for the hardened `m/0'` (see
+  [§2.3](#23-child-derivation)) — two spellings of one path would otherwise let the
+  same key be reached under a path a policy or an account record does not
+  recognize.
 - **Key cache isolation.** The derivation cache key includes the curve tag, so
   Ed25519-BIP32 keys cannot be confused with secp256k1/ed25519 keys derived at the
   same BIP path string.
@@ -821,23 +922,36 @@ fetching, persisting both payment and stake paths per `WalletAccount`.
   COSE protected headers, so a verifier can confirm which credential signed. Across
   other chains the same `verify_sign_message_address` guard prevents signing a
   message under an address the wallet did not derive.
-- **Selective stake witnessing.** `sign_transaction` only attaches a stake
-  witness when the transaction body's `required_signers` explicitly lists the
-  stake key hash, so a routine payment transaction is never signed with the stake
-  key. Transaction *content* is not otherwise inspected or policy-checked here —
+- **Selective stake witnessing.** `sign_transaction` only attaches a stake witness
+  when the transaction body actually calls for one — a certificate stake
+  credential, a pool-owner hash, a withdrawal reward account, or an explicit
+  `required_signers` entry matching the stake key hash — so a routine payment
+  transaction is never signed with the stake key. Conversely, when the body
+  structurally requires a stake signature the wallet cannot provide, signing fails
+  instead of emitting a transaction that would be rejected on submission.
+  Transaction *content* is not otherwise inspected or policy-checked here —
   the signer trusts the caller-provided unsigned CBOR — so transaction building and
   vetting remain the responsibility of upstream layers.
 - **Trust in the RPC-derived context.** Cardano input values come from the
   configured RPC provider, so the `TransactionContext` a policy evaluates is only
-  as trustworthy as that endpoint: a malicious or compromised provider could
-  misreport input values and skew the computed effects. The keyless Koios default
+  as trustworthy as that endpoint. Fetching whole source transactions rather than
+  provider-computed UTxO values narrows that trust: each returned CBOR is re-hashed
+  and must match the hash it was requested under, so a provider cannot fabricate
+  input values under a tx hash the transaction actually references (it can still
+  withhold a transaction, which fails closed). The keyless Koios default
   trades authentication for operational simplicity; deployments with stronger
   requirements can point RPC config at Blockfrost (with `BLOCKFROST_PROJECT_ID`) or
   another trusted host via the `koios|` / `blockfrost|` URL prefixes. To limit
   silent under-reporting, a transaction with inputs and no RPC URL is rejected,
   and incomplete UTxO resolution aborts context construction rather than degrading
-  to a partial view. Unparseable quantities are coerced to `0`, which can
-  understate a flow — a known limitation of the current implementation.
+  to a partial view. On the balance path the same strictness applies to Koios: an
+  unparseable lovelace balance or asset quantity is a hard `Decode` error
+  (surfaced as `PayErrorCode::InvalidData`) rather than a silent `0`, so a
+  malformed response cannot understate holdings. Nullable Koios fields
+  (`asset_list`, `asset_name`, token-registry `decimals`) are modelled as optional
+  and default to empty/`0`, because their absence is a normal response shape rather
+  than corrupt data. Blockfrost balance quantities still fall back to `0` when they
+  fail to parse — a remaining gap on that provider.
 
 ## Implementation
 
@@ -853,13 +967,16 @@ Components modified or added:
   `ed25519_bip32`.
 - `ows-signer/src/curve.rs` — `Curve::Ed25519Bip32` and key lengths.
 - `ows-signer/src/mnemonic.rs` — `Mnemonic::entropy()` (raw BIP-39 entropy).
-- `ows-signer/src/hd.rs` — Icarus master-key generation and V2 child derivation.
+- `ows-signer/src/hd.rs` — Icarus master-key generation and V2 child derivation;
+  a single shared path parser (`parse_path_components`) that bounds every index
+  below 2³¹.
 - `ows-signer/src/chains/cardano.rs` — `CardanoSigner`, CIP-1852 path helpers,
   network selection, and the full `ChainSigner` impl: base/enterprise/reward
   address encoding, `sign`, CIP-8 `sign_message`, `sign_transaction`,
   `encode_signed_transaction`, the `default_derivation_paths` / `encode_keys`
   overrides, and the `make_transaction_context` override (resolves inputs via
-  `resolve_cardano_provider` and `CardanoRpcProvider::fetch_utxos`).
+  `resolve_cardano_provider` and `CardanoRpcProvider::fetch_txs_cbor`, and books
+  withdrawals and certificate deposits/refunds against the reward address).
 - `ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
   default methods `verify_sign_message_address`, `default_derivation_paths`, and
   `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
@@ -869,14 +986,16 @@ Components modified or added:
   `sign_with_api_key` resolve the Cardano RPC URL and pass it into
   `make_transaction_context`; `broadcast_cardano` uses `resolve_cardano_provider`;
   `resolve_rpc_url` is exposed for reuse.
-- `ows-pay/src/cardano.rs` — address balance fetching via
-  `CardanoRpcProvider::get_balances`.
+- `ows-pay/src/cardano.rs` & `ows-pay/src/error.rs` — address balance fetching via
+  `CardanoRpcProvider::get_balances`; new `PayErrorCode::InvalidData` for a
+  provider response whose amounts cannot be decoded.
 - `ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
   signature and calls `verify_sign_message_address`.
 - `ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
   `signer_for_chain`; integration test uses `default_derivation_paths` and
   `encode_keys`.
 - `ows-lib/src/ops.rs` — `KeyPair.ed25519_bip32`, random 192-byte generation,
+  `validate_ed25519_bip32_key` on private-key import,
   curve dispatch, `broadcast_cardano`; `sign_message`/`sign_typed_data` thread the
   `address` argument; mnemonic derivation routes through `default_derivation_paths`
   and `encode_keys`.
@@ -909,8 +1028,14 @@ Implemented and passing for these deliverables:
   `ed25519-bip32` crate vectors; rejection of a 64-byte BIP-39 seed for the
   Ed25519-BIP32 curve; equivalence of mnemonic-based vs master-`XPrv`-based
   derivation for `m/1852'/1815'/0'/0/0`.
+- **Path validation** (`hd.rs`): indices at or above 2³¹ are rejected by
+  `validate_path` and by `derive` on all three curves, while `2147483647`(`'`) is
+  still accepted; repeated hardened markers (`m/44''`) are rejected; and
+  `m/2147483648` no longer aliases `m/0'` on the Ed25519-BIP32 curve.
 - **Mnemonic** (`mnemonic.rs`): `entropy()` returns all-zero entropy for the
-  "abandon" vector.
+  "abandon" vector, and matches the Trezor BIP-39 vectors for 12- and 24-word
+  phrases (the 24-word cases pin the checksum-byte truncation, since 24 words
+  carry 264 bits).
 - **Chain registry** (`chain.rs`): serde round-trip including Cardano; namespace,
   coin type, and `from_namespace("cip34")` mappings; `parse_chain` for friendly
   names and `cip34:*` ids; universal-wallet order/count (mainnet + preprod +
@@ -924,11 +1049,17 @@ Implemented and passing for these deliverables:
   **enterprise** address from a payment-only key against fixed `addr1v…` vectors.
 - **Message signing** (`cardano.rs`): CIP-8 `COSE_Sign1` output against reference
   vectors for the no-address, base, enterprise, and reward-address cases
-  (including the expected public key per signing credential).
-- **Transaction signing** (`cardano.rs`): a CBOR test-transaction builder
-  exercises the payment-only witness path and the payment + required-stake-key
-  path; both `sign_transaction` signatures and the `encode_signed_transaction`
-  output are asserted against reference CBOR.
+  (including the expected serialized `COSE_Key` per signing credential).
+- **Transaction signing** (`cardano.rs`): a CBOR test-transaction builder takes a
+  body-customization closure and exercises the payment-only witness path, the
+  payment + `required_signers` stake path, a stake-delegation certificate, and a
+  withdrawal; `sign_transaction` signatures and the `encode_signed_transaction`
+  output are asserted against reference CBOR, and the certificate/withdrawal cases
+  assert that the witness set carries exactly the payment and stake public keys.
+- **Key import** (`ows-lib/src/ops.rs`): a private-key wallet imports both the
+  96-byte payment and the 192-byte payment ‖ stake Ed25519-BIP32 shapes and
+  exports them unchanged; a 64-byte key and a 96-byte key with invalid scalar
+  clamping are both rejected at import.
 - **Cross-chain `sign_message`** (`evm.rs`, etc.): `AddressMismatch` is returned
   for a wrong `address`, and signing succeeds when the derived address is passed;
   `None` reproduces prior signatures (`solana.rs`, `bitcoin.rs`).
@@ -936,15 +1067,21 @@ Implemented and passing for these deliverables:
   address via `default_derivation_paths`, `encode_keys`, and `derive_address`, now
   passing end-to-end.
 - **Policy context** (`cardano.rs`, `cardano_rpc/`): `make_transaction_context` is
-  exercised with a mocked Koios `utxo_info` endpoint (`mockito`, via the `koios|`
-  URL prefix) across the flow shapes that matter for policy evaluation — a
+  exercised with a mocked Koios `tx_cbor` endpoint (`mockito`, via the `koios|`
+  URL prefix, serving real CBOR for the source transactions) across the flow shapes
+  that matter for policy evaluation — a
   self-transfer (only the negative fee shows up), a single input with an external
   payment plus change, the same with a native asset split between external and
   change outputs, and multi-input/multi-output transactions that rebalance across
-  the wallet's own addresses and to a third party. Each asserts the exact sorted
+  the wallet's own addresses and to a third party. Three staking shapes are covered
+  on top of those: a **withdrawal** (reward address debited, payment address
+  credited with the withdrawal minus the fee), a **stake registration deposit**
+  (payment address debited by deposit + fee, reward address credited with the
+  locked deposit), and a **stake deregistration refund** (the mirror image). Each
+  asserts the exact sorted
   `effects` (per-address signed lovelace and asset diffs) and that the mock
   endpoint was hit. `KoiosProvider` and `BlockfrostProvider` have dedicated unit
-  tests for broadcast, UTxO fetch, and balance queries.
+  tests for broadcast, transaction-CBOR fetch, and balance queries.
 
 ## References
 
