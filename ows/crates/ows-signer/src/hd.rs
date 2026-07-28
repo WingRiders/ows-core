@@ -3,6 +3,7 @@ use crate::mnemonic::Mnemonic;
 use crate::zeroizing::SecretBytes;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use zeroize::Zeroizing;
 
 const HARDENED_THRESHOLD: u32 = 0x80000000;
 
@@ -44,7 +45,7 @@ impl HdDeriver {
                     return Err(HdError::InvalidSeedLength(seed.len()));
                 }
 
-                Self::derive_ed25519_bip32(&seed.try_into().unwrap(), path)
+                Self::derive_ed25519_bip32(seed, path)
             }
         }
     }
@@ -60,7 +61,7 @@ impl HdDeriver {
             Curve::Ed25519Bip32 => {
                 let entropy = mnemonic.entropy();
                 let seed = Self::ed25519_bip32_master_xprv_from_entropy(entropy.expose());
-                Self::derive(&seed, path, curve)
+                Self::derive(seed.as_ref(), path, curve)
             }
             _ => {
                 let seed = mnemonic.to_seed(passphrase);
@@ -270,19 +271,18 @@ impl HdDeriver {
     }
 
     /// Build the Ed25519-BIP32 master extended private key (96-byte `XPrv`) from raw BIP-39 entropy
-    fn ed25519_bip32_master_xprv_from_entropy(entropy: &[u8]) -> [u8; ed25519_bip32::XPRV_SIZE] {
-        let mut out = [0u8; ed25519_bip32::XPRV_SIZE];
+    fn ed25519_bip32_master_xprv_from_entropy(
+        entropy: &[u8],
+    ) -> Zeroizing<[u8; ed25519_bip32::XPRV_SIZE]> {
+        let mut out = Zeroizing::new([0u8; ed25519_bip32::XPRV_SIZE]);
         // password slot stays empty on purpose to keep compatibility with Cardano software wallets
-        pbkdf2::pbkdf2_hmac::<sha2::Sha512>("".as_bytes(), entropy, 4096, &mut out);
-        ed25519_bip32::XPrv::normalize_bytes_force3rd(out).into()
+        pbkdf2::pbkdf2_hmac::<sha2::Sha512>("".as_bytes(), entropy, 4096, out.as_mut());
+        Zeroizing::new(ed25519_bip32::XPrv::normalize_bytes_force3rd(*out).into())
     }
 
     /// Ed25519-BIP32 path derivation (V2) from an existing seed (master extended private key).
-    fn derive_ed25519_bip32(
-        seed: &[u8; ed25519_bip32::XPRV_SIZE],
-        path: &str,
-    ) -> Result<SecretBytes, HdError> {
-        let mut xprv = ed25519_bip32::XPrv::from_bytes_verified(*seed)
+    fn derive_ed25519_bip32(seed: &[u8], path: &str) -> Result<SecretBytes, HdError> {
+        let mut xprv = ed25519_bip32::XPrv::from_slice_verified(seed)
             .map_err(|e| HdError::DerivationFailed(e.to_string()))?;
 
         for (index, hardened) in Self::parse_path_components(path)? {

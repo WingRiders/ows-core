@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use zeroize::Zeroizing;
 
 use ows_core::{
     default_chain_for_type, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
@@ -58,26 +59,28 @@ fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAcco
     Ok(accounts)
 }
 
-fn random_32() -> Result<Vec<u8>, OwsLibError> {
-    let mut b = vec![0u8; 32];
+fn random_32() -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
+    let mut b = Zeroizing::new(vec![0u8; 32]);
     getrandom::getrandom(&mut b)
         .map_err(|e| OwsLibError::InvalidInput(format!("failed to generate random key: {e}")))?;
     Ok(b)
 }
 
-fn random_ed25519_bip32_key() -> Result<[u8; ed25519_bip32::XPRV_SIZE], OwsLibError> {
-    let mut key = [0u8; ed25519_bip32::XPRV_SIZE];
-    getrandom::getrandom(&mut key).map_err(|e| {
+fn random_ed25519_bip32_key() -> Result<Zeroizing<[u8; ed25519_bip32::XPRV_SIZE]>, OwsLibError> {
+    let mut key = Zeroizing::new([0u8; ed25519_bip32::XPRV_SIZE]);
+    getrandom::getrandom(key.as_mut()).map_err(|e| {
         OwsLibError::InvalidInput(format!("failed to generate random Ed25519-BIP32 key: {e}"))
     })?;
 
-    Ok(ed25519_bip32::XPrv::normalize_bytes_force3rd(key).into())
+    Ok(Zeroizing::new(
+        ed25519_bip32::XPrv::normalize_bytes_force3rd(*key).into(),
+    ))
 }
 
-fn random_ed25519_bip32() -> Result<Vec<u8>, OwsLibError> {
+fn random_ed25519_bip32() -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
     let payment_key = random_ed25519_bip32_key()?;
     let stake_key = random_ed25519_bip32_key()?;
-    Ok([payment_key, stake_key].concat())
+    Ok(Zeroizing::new([*payment_key, *stake_key].concat()))
 }
 
 fn validate_ed25519_bip32_key(bytes: &[u8]) -> Result<(), OwsLibError> {
@@ -103,18 +106,9 @@ fn validate_ed25519_bip32_key(bytes: &[u8]) -> Result<(), OwsLibError> {
 /// A key pair: one key per curve.
 /// Private key material is zeroized on drop.
 struct KeyPair {
-    secp256k1: Vec<u8>,
-    ed25519: Vec<u8>,
-    ed25519_bip32: Vec<u8>,
-}
-
-impl Drop for KeyPair {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.secp256k1.zeroize();
-        self.ed25519.zeroize();
-        self.ed25519_bip32.zeroize();
-    }
+    secp256k1: Zeroizing<Vec<u8>>,
+    ed25519: Zeroizing<Vec<u8>>,
+    ed25519_bip32: Zeroizing<Vec<u8>>,
 }
 
 impl KeyPair {
@@ -128,13 +122,13 @@ impl KeyPair {
     }
 
     /// Serialize to JSON bytes for encryption.
-    fn to_json_bytes(&self) -> Vec<u8> {
+    fn to_json_bytes(&self) -> Zeroizing<Vec<u8>> {
         let obj = serde_json::json!({
-            "secp256k1": hex::encode(&self.secp256k1),
-            "ed25519": hex::encode(&self.ed25519),
-            "ed25519_bip32": hex::encode(&self.ed25519_bip32),
+            "secp256k1": hex::encode(&*self.secp256k1),
+            "ed25519": hex::encode(&*self.ed25519),
+            "ed25519_bip32": hex::encode(&*self.ed25519_bip32),
         });
-        obj.to_string().into_bytes()
+        Zeroizing::new(obj.to_string().into_bytes())
     }
 
     /// Deserialize from JSON bytes after decryption.
@@ -152,13 +146,18 @@ impl KeyPair {
         let ed_bip32 = obj["ed25519_bip32"].as_str().unwrap_or("");
 
         Ok(KeyPair {
-            secp256k1: hex::decode(secp)
-                .map_err(|e| OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}")))?,
-            ed25519: hex::decode(ed)
-                .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
-            ed25519_bip32: hex::decode(ed_bip32).map_err(|e| {
+            secp256k1: Zeroizing::new(
+                hex::decode(secp).map_err(|e| {
+                    OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}"))
+                })?,
+            ),
+            ed25519: Zeroizing::new(
+                hex::decode(ed)
+                    .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
+            ),
+            ed25519_bip32: Zeroizing::new(hex::decode(ed_bip32).map_err(|e| {
                 OwsLibError::InvalidInput(format!("invalid ed25519_bip32 hex: {e}"))
-            })?,
+            })?),
         })
     }
 }
@@ -332,9 +331,10 @@ pub fn import_wallet_mnemonic(
 }
 
 /// Decode a hex-encoded key, stripping an optional `0x` prefix.
-fn decode_hex_key(hex_str: &str) -> Result<Vec<u8>, OwsLibError> {
+fn decode_hex_key(hex_str: &str) -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
     let trimmed = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     hex::decode(trimmed)
+        .map(Zeroizing::new)
         .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex private key: {e}")))
 }
 
@@ -370,23 +370,24 @@ pub fn import_wallet_private_key(
         .transpose()?
         .unwrap_or(ows_signer::Curve::Secp256k1);
 
-    let get_key = |key_hex: Option<&str>,
-                   curve: ows_signer::Curve,
-                   generate_random: fn() -> Result<Vec<u8>, OwsLibError>| {
-        key_hex.map(decode_hex_key).transpose()?.map_or_else(
-            || {
-                if curve == source_curve {
-                    private_key
-                        .as_ref()
-                        .cloned()
-                        .map_or_else(generate_random, Ok)
-                } else {
-                    generate_random()
-                }
-            },
-            Ok,
-        )
-    };
+    let get_key =
+        |key_hex: Option<&str>,
+         curve: ows_signer::Curve,
+         generate_random: fn() -> Result<Zeroizing<Vec<u8>>, OwsLibError>| {
+            key_hex.map(decode_hex_key).transpose()?.map_or_else(
+                || {
+                    if curve == source_curve {
+                        private_key
+                            .as_ref()
+                            .cloned()
+                            .map_or_else(generate_random, Ok)
+                    } else {
+                        generate_random()
+                    }
+                },
+                Ok,
+            )
+        };
 
     let secp256k1 = get_key(secp256k1_key_hex, ows_signer::Curve::Secp256k1, random_32)?;
     let ed25519 = get_key(ed25519_key_hex, ows_signer::Curve::Ed25519, random_32)?;
@@ -1180,8 +1181,8 @@ mod tests {
         let ed_bip32 = random_ed25519_bip32().unwrap();
 
         let keys = KeyPair {
-            secp256k1: key_bytes,
-            ed25519: ed_key,
+            secp256k1: Zeroizing::new(key_bytes),
+            ed25519: Zeroizing::new(ed_key),
             ed25519_bip32: ed_bip32,
         };
         let accounts = derive_all_accounts_from_keys(&keys).unwrap();
