@@ -6,7 +6,7 @@ use cardano_serialization_lib::{
     CertificateKind, Credential, Ed25519KeyHashes, EnterpriseAddress, FixedTransaction,
     NetworkInfo, RewardAddress, TransactionBody, Vkeywitnesses,
 };
-use emurgo_cardano_message_signing::builders::{AlgorithmId, COSESign1Builder};
+use emurgo_cardano_message_signing::builders::{AlgorithmId, COSESign1Builder, EdDSA25519Key};
 use emurgo_cardano_message_signing::cbor::CBORValue;
 use emurgo_cardano_message_signing::utils::ToBytes as EmurgoToBytes;
 use emurgo_cardano_message_signing::{
@@ -325,11 +325,12 @@ impl ChainSigner for CardanoSigner {
         let cose = builder.build(sig.to_bytes());
         let signed = SignedMessage::new_cose_sign1(&cose);
         let signature = EmurgoToBytes::to_bytes(&signed);
+        let cose_key = EdDSA25519Key::new(sk.to_public().to_raw_key().as_bytes()).build();
 
         Ok(SignOutput {
             signature,
             recovery_id: None,
-            public_key: Some(sk.to_public().to_raw_key().as_bytes()),
+            public_key: Some(EmurgoToBytes::to_bytes(&cose_key)),
         })
     }
 
@@ -572,7 +573,7 @@ mod tests {
         assert_eq!(hex::encode(sig.signature), "845846a20127676164647265737358390106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed0303127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f3983a166686173686564f442cafe5840a16c4eb2e963ebd2555292d3dd51bb6ede526ade7e127a8815c940c51a29029931bf5f1b7ce842f12efe25a8aa28037bc9fcb834501aef79ba3df9c0b80ab009");
         assert_eq!(
             hex::encode(sig.public_key.unwrap()),
-            "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
+            "a401010327200621582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
         );
     }
 
@@ -590,7 +591,7 @@ mod tests {
         assert_eq!(hex::encode(sig.signature), "845846a20127676164647265737358390106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed0303127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f3983a166686173686564f442cafe5840a16c4eb2e963ebd2555292d3dd51bb6ede526ade7e127a8815c940c51a29029931bf5f1b7ce842f12efe25a8aa28037bc9fcb834501aef79ba3df9c0b80ab009");
         assert_eq!(
             hex::encode(sig.public_key.unwrap()),
-            "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
+            "a401010327200621582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
         );
     }
 
@@ -614,7 +615,7 @@ mod tests {
         assert_eq!(hex::encode(sig.signature), "84582aa201276761646472657373581d6106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed0303a166686173686564f442cafe58401bb30176a6f48c3eefd4f659afd29c98e4668e4d5676474b7e4497e960e6a8e79860fd3bdb41093e448fc62aa74291490b683adb579e6a3e17a89d0b329ea70f");
         assert_eq!(
             hex::encode(sig.public_key.unwrap()),
-            "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
+            "a401010327200621582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128"
         );
     }
 
@@ -638,7 +639,7 @@ mod tests {
         assert_eq!(hex::encode(sig.signature), "84582aa201276761646472657373581de1127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f3983a166686173686564f442cafe58401152563eb2dd6dd9775b1e8cd21d829edb93851aba7705156b68c6b9cde9634e9f85f434287172129d8f49c655876ac64293d5ad8370247a5b04e9bdf675d505");
         assert_eq!(
             hex::encode(sig.public_key.unwrap()),
-            "097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c2206"
+            "a4010103272006215820097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c2206"
         );
     }
 
