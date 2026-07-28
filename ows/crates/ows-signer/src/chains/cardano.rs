@@ -2,8 +2,9 @@ use crate::curve::Curve;
 use crate::traits::{ChainSigner, SignOutput, SignerError};
 use crate::{DerivedKey, SecretBytes};
 use cardano_serialization_lib::{
-    make_vkey_witness, Address, AddressKind, BaseAddress, Bip32PrivateKey, Credential,
-    EnterpriseAddress, FixedTransaction, NetworkInfo, RewardAddress, Vkeywitnesses,
+    make_vkey_witness, Address, AddressKind, BaseAddress, Bip32PrivateKey, Certificate,
+    CertificateKind, Credential, Ed25519KeyHashes, EnterpriseAddress, FixedTransaction,
+    NetworkInfo, RewardAddress, TransactionBody, Vkeywitnesses,
 };
 use emurgo_cardano_message_signing::builders::{AlgorithmId, COSESign1Builder};
 use emurgo_cardano_message_signing::cbor::CBORValue;
@@ -98,6 +99,93 @@ impl CardanoSigner {
         ent.to_address()
             .to_bech32(None)
             .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))
+    }
+
+    /// Adds the vkey hashes `cert` needs a signature from, limited to the credential
+    /// kinds that can be a CIP-1852 stake key. Mirrors the stake-credential arms of
+    /// the ledger's `witsVKeyNeeded`.
+    fn add_cert_key_hashes(cert: &Certificate, hashes: &mut Ed25519KeyHashes) {
+        let stake_credential = match cert.kind() {
+            // A legacy `stake_registration` needs no witness; a Conway `reg_cert`
+            // (registration with an explicit deposit) does. `as_reg_cert` returns
+            // `Some` only for the latter.
+            CertificateKind::StakeRegistration => cert.as_reg_cert().map(|c| c.stake_credential()),
+            CertificateKind::StakeDeregistration => {
+                cert.as_stake_deregistration().map(|c| c.stake_credential())
+            }
+            CertificateKind::StakeDelegation => {
+                cert.as_stake_delegation().map(|c| c.stake_credential())
+            }
+            CertificateKind::StakeAndVoteDelegation => cert
+                .as_stake_and_vote_delegation()
+                .map(|c| c.stake_credential()),
+            CertificateKind::StakeRegistrationAndDelegation => cert
+                .as_stake_registration_and_delegation()
+                .map(|c| c.stake_credential()),
+            CertificateKind::StakeVoteRegistrationAndDelegation => cert
+                .as_stake_vote_registration_and_delegation()
+                .map(|c| c.stake_credential()),
+            CertificateKind::VoteDelegation => {
+                cert.as_vote_delegation().map(|c| c.stake_credential())
+            }
+            CertificateKind::VoteRegistrationAndDelegation => cert
+                .as_vote_registration_and_delegation()
+                .map(|c| c.stake_credential()),
+            // Pool owners are stake key hashes. The operator is a cold pool key, so
+            // it is not collected here.
+            CertificateKind::PoolRegistration => {
+                if let Some(cert) = cert.as_pool_registration() {
+                    let owners = cert.pool_params().pool_owners();
+                    for i in 0..owners.len() {
+                        hashes.add(&owners.get(i));
+                    }
+                }
+                None
+            }
+            // Pool cold keys, genesis delegates, committee cold credentials and DRep
+            // credentials are never derived at the CIP-1852 stake role, so a stake
+            // key can never satisfy them and we do not collect them.
+            CertificateKind::PoolRetirement
+            | CertificateKind::GenesisKeyDelegation
+            | CertificateKind::MoveInstantaneousRewardsCert
+            | CertificateKind::CommitteeHotAuth
+            | CertificateKind::CommitteeColdResign
+            | CertificateKind::DRepRegistration
+            | CertificateKind::DRepDeregistration
+            | CertificateKind::DRepUpdate => None,
+        };
+
+        // Script credentials are witnessed by the script, not by a vkey.
+        if let Some(hash) = stake_credential.and_then(|c| c.to_keyhash()) {
+            hashes.add(&hash);
+        }
+    }
+
+    /// Vkey hashes the transaction structurally requires a stake signature from:
+    /// certificate stake credentials, pool owners and withdrawal reward accounts.
+    ///
+    /// `required_signers` is deliberately not folded in here: a hash listed there
+    /// routinely belongs to a co-signer rather than to this wallet, so it must not
+    /// drive the "we are missing a stake key" error.
+    fn stake_key_hashes_required_by_body(body: &TransactionBody) -> Ed25519KeyHashes {
+        let mut hashes = Ed25519KeyHashes::new();
+
+        if let Some(certs) = body.certs() {
+            for i in 0..certs.len() {
+                Self::add_cert_key_hashes(&certs.get(i), &mut hashes);
+            }
+        }
+
+        if let Some(withdrawals) = body.withdrawals() {
+            let reward_addresses = withdrawals.keys();
+            for i in 0..reward_addresses.len() {
+                if let Some(hash) = reward_addresses.get(i).payment_cred().to_keyhash() {
+                    hashes.add(&hash);
+                }
+            }
+        }
+
+        hashes
     }
 
     fn reward_address_bech32(&self, stake: &Bip32PrivateKey) -> Result<String, SignerError> {
@@ -255,39 +343,51 @@ impl ChainSigner for CardanoSigner {
         let tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
             .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
 
-        let pay_witness = make_vkey_witness(&tx.transaction_hash(), &pay.to_raw_key());
-        let stake_witness = match stake {
-            Some(stake) => {
-                let needs_stake_signature = tx
-                    .body()
-                    .required_signers()
-                    .map(|required_signers| {
-                        required_signers.contains(&stake.to_public().to_raw_key().hash())
-                    })
-                    .unwrap_or(false);
+        let tx_hash = tx.transaction_hash();
+        let body = tx.body();
+        let stake_hashes = Self::stake_key_hashes_required_by_body(&body);
 
-                if needs_stake_signature {
-                    Some(make_vkey_witness(
-                        &tx.transaction_hash(),
-                        &stake.to_raw_key(),
-                    ))
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
+        let pay_witness = make_vkey_witness(&tx_hash, &pay.to_raw_key());
 
         let mut witnesses = Vkeywitnesses::new();
         witnesses.add(&pay_witness);
-        if let Some(sw) = stake_witness {
-            witnesses.add(&sw);
+
+        match stake {
+            Some(stake) => {
+                let stake_hash = stake.to_public().to_raw_key().hash();
+                let needs_stake_signature = stake_hashes.contains(&stake_hash)
+                    || body
+                        .required_signers()
+                        .map(|required_signers| required_signers.contains(&stake_hash))
+                        .unwrap_or(false);
+
+                if needs_stake_signature {
+                    witnesses.add(&make_vkey_witness(&tx_hash, &stake.to_raw_key()));
+                }
+            }
+            None => {
+                // No stake key to offer. If the body needs one for anything other than
+                // the payment credential, refuse rather than hand back a transaction
+                // that fails phase-1 validation.
+                let pay_hash = pay.to_public().to_raw_key().hash();
+                let unsatisfied = (0..stake_hashes.len())
+                    .map(|i| stake_hashes.get(i))
+                    .any(|hash| hash != pay_hash);
+
+                if unsatisfied {
+                    return Err(SignerError::InvalidTransaction(
+                        "transaction requires a stake key signature but the key material \
+                         contains no stake key"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         let signature = witnesses.to_bytes();
 
         Ok(SignOutput {
-            // signature is the concatenation of the payment and stake witnesses
+            // signature is the CBOR-encoded witness set
             signature,
             recovery_id: None,
             public_key: Some(pay_witness.vkey().public_key().as_bytes()),
@@ -352,8 +452,8 @@ mod tests {
     use crate::hd::HdDeriver;
     use crate::mnemonic::Mnemonic;
     use cardano_serialization_lib::{
-        BigNum, Ed25519KeyHash, Ed25519KeyHashes, TransactionBody, TransactionHash,
-        TransactionInput, TransactionInputs, TransactionOutput, TransactionOutputs, Value,
+        BigNum, Certificates, Ed25519KeyHash, StakeDelegation, TransactionHash, TransactionInput,
+        TransactionInputs, TransactionOutput, TransactionOutputs, Value, Withdrawals,
     };
     use hex::FromHex;
 
@@ -545,7 +645,7 @@ mod tests {
     fn build_test_tx_cbor(
         inputs: &[(&str, u32)],  // (tx hash, index)
         outputs: &[(&str, u64)], // (bech32 address, lovelace)
-        required_signers: &[&Ed25519KeyHash],
+        customize: impl FnOnce(&mut TransactionBody),
     ) -> Vec<u8> {
         let mut tx_inputs = TransactionInputs::new();
         for (tx_hash, index) in inputs {
@@ -566,13 +666,7 @@ mod tests {
         let mut body =
             TransactionBody::new_tx_body(&tx_inputs, &tx_outputs, &BigNum::from(1_000_000u64));
 
-        if required_signers.len() > 0 {
-            let mut signers = Ed25519KeyHashes::new();
-            for s in required_signers {
-                signers.add(s);
-            }
-            body.set_required_signers(&signers);
-        }
+        customize(&mut body);
 
         FixedTransaction::new_from_body_bytes(&body.to_bytes())
             .unwrap()
@@ -597,7 +691,7 @@ mod tests {
                 0,
             )],
             &[(&output_address, 2_000_000)],
-            &[],
+            |_body| {},
         );
 
         let sign_output = signer
@@ -634,7 +728,11 @@ mod tests {
                 1,
             )],
             &[(&output_address, 3_000_000)],
-            &[&stake_key.to_public().to_raw_key().hash()],
+            |body| {
+                let mut signers = Ed25519KeyHashes::new();
+                signers.add(&stake_key.to_public().to_raw_key().hash());
+                body.set_required_signers(&signers);
+            },
         );
 
         let sig = signer.sign_transaction(key.expose(), &tx_cbor).unwrap();
@@ -647,6 +745,95 @@ mod tests {
         assert_eq!(
             hex::encode(signed_tx),
             "84a400d9010281825820cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe0101818258390106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed0303127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f39831a002dc6c0021a000f42400ed9010281581c127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f3983a100d901028282582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a696121285840f0389089c22a690bcbcab9d5865a2b33c06f0a58ba236adaada5f24adb5a39759667876c24250f8c991d1b8c71dca80e05c789eb23a34b66fd53b81d629d1504825820097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c22065840610945a63febb28741a4d2f9870e3de903f0a8c2f1c7b86e0a61adb667b973306177827559a1e7bacd452682b90eb5b15f4e5ab5a1433b62e0b2429b76b0a604f5f6"
+        );
+    }
+
+    #[test]
+    fn sign_transaction_with_stake_delegation_cert() {
+        let signer = CardanoSigner::mainnet();
+        let m = Mnemonic::from_phrase(
+            "jelly wolf grass equip diagram mixed bottom speed luggage venture stool end",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &m, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+
+        let address = signer.derive_address(key.expose()).unwrap();
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(
+                "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
+                0,
+            )],
+            &[(&address, 2_000_000)],
+            |body| {
+                let mut certs = Certificates::new();
+                let cert = Certificate::new_stake_delegation(&StakeDelegation::new(
+                    &Credential::from_keyhash(&stake_key.unwrap().to_public().to_raw_key().hash()),
+                    &Ed25519KeyHash::from_bytes(vec![0xcd; 28]).unwrap(), // dummy pool keyhash
+                ));
+                certs.add(&cert);
+                body.set_certs(&certs);
+            },
+        );
+
+        let sign_output = signer.sign_transaction(key.expose(), &tx_cbor).unwrap();
+        let witnesses = Vkeywitnesses::from_bytes(sign_output.signature.clone()).unwrap();
+
+        let witnesses_keys = (0..witnesses.len())
+            .map(|i| hex::encode(witnesses.get(i).vkey().public_key().as_bytes()))
+            .collect::<Vec<String>>();
+        assert_eq!(
+            witnesses_keys,
+            [
+                "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128", // payment key
+                "097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c2206"  // stake key
+            ]
+        );
+    }
+
+    #[test]
+    fn sign_transaction_with_withdrawals() {
+        let signer = CardanoSigner::mainnet();
+        let m = Mnemonic::from_phrase(
+            "jelly wolf grass equip diagram mixed bottom speed luggage venture stool end",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &m, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+
+        let address = signer.derive_address(key.expose()).unwrap();
+        let reward_address = RewardAddress::new(
+            signer.network_id,
+            &Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash()),
+        );
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(
+                "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
+                0,
+            )],
+            &[(&address, 2_000_000)],
+            |body| {
+                let mut withdrawals = Withdrawals::new();
+                withdrawals.insert(&reward_address, &BigNum::from(1_000_000u64));
+                body.set_withdrawals(&withdrawals);
+            },
+        );
+
+        let sign_output = signer.sign_transaction(key.expose(), &tx_cbor).unwrap();
+        let witnesses = Vkeywitnesses::from_bytes(sign_output.signature.clone()).unwrap();
+
+        let witnesses_keys = (0..witnesses.len())
+            .map(|i| hex::encode(witnesses.get(i).vkey().public_key().as_bytes()))
+            .collect::<Vec<String>>();
+        assert_eq!(
+            witnesses_keys,
+            [
+                "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128", // payment key
+                "097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c2206"  // stake key
+            ]
         );
     }
 }
