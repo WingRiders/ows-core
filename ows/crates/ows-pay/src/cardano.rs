@@ -66,12 +66,22 @@ pub(crate) async fn get_cardano_balances(
         return Ok(Vec::new());
     };
 
-    let total_lovelace = info.balance.parse::<u64>().unwrap_or(0);
+    let total_lovelace = info.balance.parse::<u64>().map_err(|e| {
+        PayError::new(
+            PayErrorCode::InvalidData,
+            format!("invalid lovelace balance: {e}"),
+        )
+    })?;
 
     let mut assets_quantities: HashMap<(String, String, String), u64> = HashMap::new();
     for utxo in info.utxo_set {
         for asset in utxo.asset_list.unwrap_or_default() {
-            let qty = asset.quantity.parse::<u64>().unwrap_or(0);
+            let qty = asset.quantity.parse::<u64>().map_err(|e| {
+                PayError::new(
+                    PayErrorCode::InvalidData,
+                    format!("invalid asset quantity: {e}"),
+                )
+            })?;
             if qty == 0 {
                 continue;
             }
