@@ -80,6 +80,26 @@ fn random_ed25519_bip32() -> Result<Vec<u8>, OwsLibError> {
     Ok([payment_key, stake_key].concat())
 }
 
+fn validate_ed25519_bip32_key(bytes: &[u8]) -> Result<(), OwsLibError> {
+    use ed25519_bip32::XPRV_SIZE;
+
+    if bytes.len() != XPRV_SIZE && bytes.len() != XPRV_SIZE * 2 {
+        return Err(OwsLibError::InvalidInput(format!(
+            "Ed25519-BIP32 key must be 96 (payment) or 192 (payment||stake) bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    for (i, half) in bytes.chunks(XPRV_SIZE).enumerate() {
+        let role = if i == 0 { "payment" } else { "stake" };
+        ed25519_bip32::XPrv::from_slice_verified(half).map_err(|e| {
+            OwsLibError::InvalidInput(format!("invalid Ed25519-BIP32 {role} key: {e}"))
+        })?;
+    }
+
+    Ok(())
+}
+
 /// A key pair: one key per curve.
 /// Private key material is zeroized on drop.
 struct KeyPair {
@@ -375,6 +395,7 @@ pub fn import_wallet_private_key(
         ows_signer::Curve::Ed25519Bip32,
         random_ed25519_bip32,
     )?;
+    validate_ed25519_bip32_key(&ed25519_bip32)?;
 
     let keys = KeyPair {
         secp256k1,
@@ -1631,6 +1652,55 @@ mod tests {
         let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
         assert_eq!(obj["secp256k1"].as_str().unwrap(), TEST_PRIVKEY);
         assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), ed_bip32_key);
+    }
+
+    /// A single 96-byte payment `XPrv` and a 192-byte payment‖stake blob are the two shapes
+    /// the Cardano signer decodes; both must import.
+    #[test]
+    fn privkey_wallet_import_accepts_both_ed25519_bip32_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let payment = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+        let payment_and_stake = format!("{payment}{payment}");
+
+        for (name, key) in [("bip32-96", payment), ("bip32-192", &payment_and_stake)] {
+            import_wallet_private_key(name, "", None, None, Some(vault), None, None, Some(key))
+                .unwrap();
+            let exported = export_wallet(name, None, Some(vault)).unwrap();
+            let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+            assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn privkey_wallet_rejects_malformed_ed25519_bip32_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        // A 64-byte key: valid hex, but not a shape any Cardano signer can decode.
+        let too_short = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a24";
+        // 96 bytes, but the scalar's high bits violate the Ed25519-BIP32 clamping rules
+        // (first byte's low 3 bits set, byte 31 not 0b01xxxxxx).
+        let bad_scalar_bits = "f".repeat(ed25519_bip32::XPRV_SIZE * 2);
+
+        for key in [too_short, bad_scalar_bits.as_str()] {
+            let err = import_wallet_private_key(
+                "bip32-bad",
+                "",
+                None,
+                None,
+                Some(vault),
+                None,
+                None,
+                Some(key),
+            )
+            .expect_err("expected malformed Ed25519-BIP32 key to be rejected");
+            assert!(
+                err.to_string().contains("Ed25519-BIP32"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     // ================================================================
