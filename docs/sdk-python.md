@@ -203,7 +203,7 @@ print(len(wallet["accounts"]))  # => 15
 |-------|------|---------|-------------|
 | `name` | `str` | &mdash; | Wallet name |
 | `private_key_hex` | `str` | &mdash; | Hex-encoded private key. Ignored when all three curve keys (`secp256k1Key`, `ed25519Key`, and `ed25519Bip32Key`) are provided. |
-| `chain` | `str` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) |
+| `chain` | `str` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) or `"cardano"` (Ed25519-BIP32) |
 | `passphrase` | `str` | `None` | Encryption passphrase |
 | `vault_path` | `str` | `None` | Custom vault directory |
 | `secp256k1_key` | `str` | `None` | Explicit secp256k1 private key (hex) |
