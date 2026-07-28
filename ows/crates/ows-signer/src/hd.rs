@@ -258,6 +258,7 @@ impl HdDeriver {
     /// Build the Ed25519-BIP32 master extended private key (96-byte `XPrv`) from raw BIP-39 entropy
     fn ed25519_bip32_master_xprv_from_entropy(entropy: &[u8]) -> [u8; ed25519_bip32::XPRV_SIZE] {
         let mut out = [0u8; ed25519_bip32::XPRV_SIZE];
+        // password slot stays empty on purpose to keep compatibility with Cardano software wallets
         pbkdf2::pbkdf2_hmac::<sha2::Sha512>("".as_bytes(), entropy, 4096, &mut out);
         ed25519_bip32::XPrv::normalize_bytes_force3rd(out).into()
     }
