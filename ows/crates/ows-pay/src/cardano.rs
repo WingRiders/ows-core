@@ -11,13 +11,13 @@ struct KoiosAddressInfoRow {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosAddressUtxo {
-    asset_list: Vec<KoiosAsset>,
+    asset_list: Option<Vec<KoiosAsset>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosAsset {
     policy_id: String,
-    asset_name: String,
+    asset_name: Option<String>,
     fingerprint: String,
     quantity: String,
 }
@@ -25,13 +25,14 @@ struct KoiosAsset {
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosAssetInfoRow {
     policy_id: String,
-    asset_name: String,
+    asset_name: Option<String>,
     token_registry_metadata: Option<KoiosTokenRegistryMetadata>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosTokenRegistryMetadata {
     ticker: Option<String>,
+    #[serde(default)]
     decimals: u32,
 }
 
@@ -69,7 +70,7 @@ pub(crate) async fn get_cardano_balances(
 
     let mut assets_quantities: HashMap<(String, String, String), u64> = HashMap::new();
     for utxo in info.utxo_set {
-        for asset in utxo.asset_list {
+        for asset in utxo.asset_list.unwrap_or_default() {
             let qty = asset.quantity.parse::<u64>().unwrap_or(0);
             if qty == 0 {
                 continue;
@@ -77,7 +78,7 @@ pub(crate) async fn get_cardano_balances(
 
             let key = (
                 asset.policy_id.clone(),
-                asset.asset_name.clone(),
+                asset.asset_name.clone().unwrap_or_default(),
                 asset.fingerprint.clone(),
             );
             *assets_quantities.entry(key).or_insert(0) += qty;
@@ -177,7 +178,10 @@ async fn fetch_assets_info(
         }
         let rows: Vec<KoiosAssetInfoRow> = resp.json().await?;
         for row in rows {
-            let key = (row.policy_id.clone(), row.asset_name.clone());
+            let key = (
+                row.policy_id.clone(),
+                row.asset_name.clone().unwrap_or_default(),
+            );
             out.insert(key, row);
         }
     }
@@ -225,12 +229,12 @@ mod tests {
             &[KoiosAddressInfoRow {
                 balance: "10000000".into(),
                 utxo_set: vec![KoiosAddressUtxo {
-                    asset_list: vec![KoiosAsset {
+                    asset_list: Some(vec![KoiosAsset {
                         policy_id: policy_id.into(),
-                        asset_name: asset_name.into(),
+                        asset_name: Some(asset_name.into()),
                         fingerprint: fingerprint.into(),
                         quantity: "2500000".into(),
-                    }],
+                    }]),
                 }],
             }],
         );
@@ -239,7 +243,7 @@ mod tests {
             &mut server,
             &[KoiosAssetInfoRow {
                 policy_id: policy_id.into(),
-                asset_name: asset_name.into(),
+                asset_name: Some(asset_name.into()),
                 token_registry_metadata: Some(KoiosTokenRegistryMetadata {
                     ticker: Some("TEST".into()),
                     decimals: 6,
