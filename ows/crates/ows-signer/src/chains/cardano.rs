@@ -229,6 +229,52 @@ impl CardanoSigner {
             .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))
     }
 
+    /// Explicit deposit/refund carried on a certificate, attributed to the
+    /// credential's reward address. Legacy Shelley certs without an on-wire
+    /// `coin` are skipped (amount comes from protocol parameters).
+    ///
+    /// Returns `(credential, lovelace, is_deposit)`.
+    fn cert_deposit_or_refund(cert: &Certificate) -> Option<(Credential, u64, bool)> {
+        match cert.kind() {
+            CertificateKind::StakeRegistration => cert.as_reg_cert().and_then(|c| {
+                c.coin()
+                    .map(|coin| (c.stake_credential(), u64::from(coin), true))
+            }),
+            CertificateKind::StakeDeregistration => cert.as_unreg_cert().and_then(|c| {
+                c.coin()
+                    .map(|coin| (c.stake_credential(), u64::from(coin), false))
+            }),
+            CertificateKind::StakeRegistrationAndDelegation => cert
+                .as_stake_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::StakeVoteRegistrationAndDelegation => cert
+                .as_stake_vote_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::VoteRegistrationAndDelegation => cert
+                .as_vote_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::DRepRegistration => cert
+                .as_drep_registration()
+                .map(|c| (c.voting_credential(), u64::from(c.coin()), true)),
+            CertificateKind::DRepDeregistration => cert
+                .as_drep_deregistration()
+                .map(|c| (c.voting_credential(), u64::from(c.coin()), false)),
+            _ => None,
+        }
+    }
+
+    fn add_lovelace_balance(
+        balances: &mut BTreeMap<String, AssetBalanceMap>,
+        address: String,
+        amount: u64,
+    ) {
+        *balances
+            .entry(address)
+            .or_default()
+            .entry(LOVELACE_ASSET_ID.to_string())
+            .or_insert(0) += amount;
+    }
+
     fn fetch_txs_cbor(
         koios_base_url: &str,
         tx_hashes: &[String],
@@ -687,6 +733,52 @@ impl ChainSigner for CardanoSigner {
             }
         }
 
+        // Withdrawals leave the reward account and enter the transaction, so
+        // treat them as inputs from the reward address.
+        if let Some(withdrawals) = tx.body().withdrawals() {
+            let reward_addresses = withdrawals.keys();
+            for i in 0..reward_addresses.len() {
+                let reward_address = reward_addresses.get(i);
+                let amount: u64 = withdrawals
+                    .get(&reward_address)
+                    .ok_or_else(|| {
+                        SignerError::InvalidTransaction(
+                            "withdrawal amount missing for reward address".into(),
+                        )
+                    })?
+                    .into();
+                let addr = reward_address.to_address().to_bech32(None).map_err(|e| {
+                    SignerError::InvalidTransaction(format!("invalid withdrawal address: {e}"))
+                })?;
+                Self::add_lovelace_balance(&mut inputs_balances_by_address, addr, amount);
+            }
+        }
+
+        // Certificate deposits lock lovelace under the credential (like an
+        // output to its reward address); refunds unlock it (like an input).
+        if let Some(certs) = tx.body().certs() {
+            for i in 0..certs.len() {
+                let Some((credential, amount, is_deposit)) =
+                    Self::cert_deposit_or_refund(&certs.get(i))
+                else {
+                    continue;
+                };
+                let addr = RewardAddress::new(self.network_id, &credential)
+                    .to_address()
+                    .to_bech32(None)
+                    .map_err(|e| {
+                        SignerError::InvalidTransaction(format!(
+                            "invalid certificate reward address: {e}"
+                        ))
+                    })?;
+                if is_deposit {
+                    Self::add_lovelace_balance(&mut outputs_balances_by_address, addr, amount);
+                } else {
+                    Self::add_lovelace_balance(&mut inputs_balances_by_address, addr, amount);
+                }
+            }
+        }
+
         let mut all_addresses: BTreeSet<&String> = BTreeSet::new();
         for c in inputs_balances_by_address.keys() {
             all_addresses.insert(c);
@@ -787,8 +879,9 @@ mod tests {
     use crate::mnemonic::Mnemonic;
     use cardano_serialization_lib::{
         AssetName, BigNum, Certificates, Ed25519KeyHash, Ed25519KeyHashes, MultiAsset, ScriptHash,
-        StakeDelegation, TransactionBody, TransactionHash, TransactionInput, TransactionInputs,
-        TransactionOutput, TransactionOutputs, Value, Withdrawals,
+        StakeDelegation, StakeDeregistration, StakeRegistration, TransactionBody, TransactionHash,
+        TransactionInput, TransactionInputs, TransactionOutput, TransactionOutputs, Value,
+        Withdrawals,
     };
     use hex::FromHex;
     use mockito::Server;
@@ -1505,6 +1598,175 @@ mod tests {
                 TransactionEffect {
                     address: address_c,
                     diff: vec![("lovelace".into(), 10_000_000)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_withdrawal() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let reward_address = RewardAddress::new(
+            signer.network_id,
+            &Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash()),
+        );
+
+        let input_value = 10_000_000u64;
+        let withdrawal = 5_000_000u64;
+        let output_value = input_value + withdrawal - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut withdrawals = Withdrawals::new();
+                withdrawals.insert(&reward_address, &BigNum::from(withdrawal));
+                body.set_withdrawals(&withdrawals);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), (withdrawal - TX_FEE) as i64)],
+                },
+                TransactionEffect {
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), -(withdrawal as i64))],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_stake_registration_deposit() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+
+        let deposit = 2_000_000u64;
+        let input_value = 10_000_000u64;
+        let output_value = input_value - deposit - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut certs = Certificates::new();
+                let reg = StakeRegistration::new_with_explicit_deposit(
+                    &stake_cred,
+                    &BigNum::from(deposit),
+                );
+                certs.add(&Certificate::new_reg_cert(&reg).unwrap());
+                body.set_certs(&certs);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), -((deposit + TX_FEE) as i64))],
+                },
+                TransactionEffect {
+                    // Deposit is locked under the stake credential.
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), deposit as i64)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_stake_deregistration_refund() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+
+        let refund = 2_000_000u64;
+        let input_value = 10_000_000u64;
+        let output_value = input_value + refund - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut certs = Certificates::new();
+                let unreg = StakeDeregistration::new_with_explicit_refund(
+                    &stake_cred,
+                    &BigNum::from(refund),
+                );
+                certs.add(&Certificate::new_unreg_cert(&unreg).unwrap());
+                body.set_certs(&certs);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), (refund - TX_FEE) as i64)],
+                },
+                TransactionEffect {
+                    // Locked deposit is released from the stake credential.
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), -(refund as i64))],
                 },
             ]
         );
