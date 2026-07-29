@@ -1,6 +1,5 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use zeroize::Zeroizing;
 
 use ows_core::{
@@ -937,91 +936,11 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
 }
 
 fn broadcast_cardano(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
-    let expected_tx_hash = ows_signer::chains::CardanoSigner::transaction_id(signed_bytes)?;
-    let url = format!("{}/submittx", rpc_url.trim_end_matches('/'));
-
-    // `--data-binary @-` tells curl to read the request body verbatim from stdin
-    let mut child = Command::new("curl")
-        .args([
-            "-sSL",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/cbor",
-            "--data-binary",
-            "@-",
-            "-w",
-            "\n%{http_code}",
-            &url,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            OwsLibError::BroadcastFailed(format!("Cardano broadcast: failed to run curl: {e}"))
-        })?;
-
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            OwsLibError::BroadcastFailed("Cardano broadcast: failed to open curl stdin".into())
-        })?;
-        stdin.write_all(signed_bytes).map_err(|e| {
-            OwsLibError::BroadcastFailed(format!(
-                "Cardano broadcast: failed to write request body to curl stdin: {e}"
-            ))
-        })?;
-    }
-
-    let output = child.wait_with_output().map_err(|e| {
-        OwsLibError::BroadcastFailed(format!("Cardano broadcast: failed to wait for curl: {e}"))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast failed: {stderr}"
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (body, status_raw) = stdout.rsplit_once('\n').unwrap_or(("", stdout.as_str()));
-
-    let status: u16 = status_raw.parse().map_err(|_| {
-        OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: could not parse HTTP status from curl output: {stdout}"
-        ))
-    })?;
-
-    if status != 202 {
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: failed to broadcast transaction: {body}"
-        )));
-    }
-
-    let body = body.trim();
-    let invalid_hash = || {
-        OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: invalid transaction hash in response for {expected_tx_hash}: {body}"
-        ))
-    };
-    // Koios returns a JSON string. Preserve support for providers returning bare
-    // hex, but do not accept malformed quoting or a merely 64-character string.
-    let tx_hash = if body.starts_with('"') {
-        serde_json::from_str::<String>(body).map_err(|_| invalid_hash())?
-    } else {
-        body.to_string()
-    };
-    let mut hash_bytes = [0u8; 32];
-    hex::decode_to_slice(&tx_hash, &mut hash_bytes).map_err(|_| invalid_hash())?;
-    let tx_hash = hex::encode(hash_bytes);
-    if tx_hash != expected_tx_hash {
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: transaction hash mismatch: expected {expected_tx_hash}, got {tx_hash}"
-        )));
-    }
-
-    Ok(expected_tx_hash)
+    let provider = ows_core::resolve_cardano_provider(rpc_url)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))?;
+    provider
+        .broadcast_tx(signed_bytes)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))
 }
 
 fn broadcast_xrpl(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
