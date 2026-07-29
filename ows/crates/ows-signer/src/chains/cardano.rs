@@ -1628,6 +1628,11 @@ mod tests {
             .create()
     }
 
+    /// Wrap a mockito server URL so [`resolve_cardano_provider`] selects Koios.
+    fn koios_rpc_url(server: &Server) -> String {
+        format!("koios|{}", server.url())
+    }
+
     #[test]
     fn transaction_context_self_transfer() {
         let signer = CardanoSigner::mainnet();
@@ -1651,7 +1656,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
 
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
@@ -1698,7 +1703,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1762,7 +1767,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1831,7 +1836,7 @@ mod tests {
             &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
         );
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1896,7 +1901,7 @@ mod tests {
             &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
         );
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1956,8 +1961,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2013,8 +2020,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2071,8 +2080,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2127,8 +2138,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2189,8 +2202,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2228,8 +2243,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
