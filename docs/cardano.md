@@ -707,7 +707,10 @@ configured RPC URL with `resolve_cardano_provider` and calls
 - Each native asset is reported with `address` set to its **asset fingerprint**
   (`asset1…`), `name` set to `policy_id.asset_name`, and `symbol`/`decimals`
   taken from the token-registry metadata — falling back to the first 10
-  characters of the asset name and `0` decimals when no metadata exists.
+  characters of the asset name and `0` decimals when no metadata exists. On
+  Blockfrost the fingerprint comes from the per-asset lookup, so when
+  `GET {rpc}/assets/{unit}` returns a non-success status the `address` falls back
+  to the raw `policy_id ‖ asset_name` hex instead of an `asset1…` fingerprint.
   Zero-quantity entries are dropped, and the list is sorted by descending
   amount.
 - **Koios** reads `POST {rpc}/address_info` (summing `asset_list` across the
@@ -717,9 +720,12 @@ configured RPC URL with `resolve_cardano_provider` and calls
   balances" rather than an error.
 
 The provider API is blocking, so the `async` wrapper runs it on
-`tokio::task::spawn_blocking`. Provider errors are mapped onto `PayErrorCode`:
-transport → `HttpTransport`, non-success status → `HttpStatus`, and an
-undecodable response body or amount → the new `InvalidData`.
+`tokio::task::spawn_blocking`. Errors are mapped onto `PayErrorCode`: a failure to
+select a provider from the configured RPC URL — an unsupported host, or a
+Blockfrost URL with no `BLOCKFROST_PROJECT_ID` (see
+[§1.4](#14-rpc-configuration-koios-and-blockfrost)) — is `InvalidInput`, while the
+provider's own errors map transport → `HttpTransport`, non-success status →
+`HttpStatus`, and an undecodable response body or amount → the new `InvalidData`.
 
 ## Rationale
 
