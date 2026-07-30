@@ -2,7 +2,7 @@
 
 > Status: work in progress. This document specifies the Cardano integration parts
 > that are **implemented** in this fork, and flags the parts that are still
-> **planned**. It is scoped to five deliverables that are complete:
+> **planned**. The implemented surface is:
 >
 > 1. **Analysis, architecture, and setup** — codebase familiarization, build/test
 >    pipeline, and a map of where Cardano fits into the existing abstractions (see
@@ -20,10 +20,19 @@
 >    Blockfrost) so that ADA
 >    and native-asset flows can be computed per address (see
 >    [Policy Engine Support](#4-policy-engine-support)).
+> 6. **Address balance fetching** — ADA and native-asset balances for a Cardano
+>    address through `CardanoRpcProvider::get_balances` (see
+>    [Address balance fetching](#5-address-balance-fetching)).
+> 7. **Pluggable RPC providers** — a provider-agnostic `CardanoRpcProvider` trait
+>    with keyless **Koios** as the default and **Blockfrost** as an authenticated
+>    opt-in (see [Provider selection](#provider-selection)).
+> 8. **Documentation and bindings** — this document, plus the optional `address`
+>    argument exposed through the CLI and the Node/Python bindings (see
+>    [§3.6](#36-address-aware-sign_message-across-all-chains)).
 >
-> Transaction *building* (input selection, fee/change calculation) and balance/UTxO
-> fetching remain out of scope for these deliverables and are tracked separately;
-> the signer operates on an already-assembled unsigned transaction (CBOR).
+> Transaction *building* (input selection, fee/change calculation) remains out of
+> scope and is tracked separately; the signer operates on an already-assembled
+> unsigned transaction (CBOR).
 
 ## Abstract
 
@@ -177,7 +186,7 @@ network as `<networkId>-<networkMagic>`:
 | Preview | `cardano-preview` | `cip34:0-2`         | 0         | 2            |
 
 A new `ChainType::Cardano` variant is added to the chain-family enum
-(`ows-core/src/chain.rs`). The namespace mapping is wired in both directions:
+(`ows/crates/ows-core/src/chain.rs`). The namespace mapping is wired in both directions:
 
 - `ChainType::Cardano.namespace()` → `"cip34"`
 - `ChainType::from_namespace("cip34")` → `Some(ChainType::Cardano)`
@@ -203,7 +212,7 @@ The account id is assembled in `derive_all_accounts` as
 
 #### 1.3 Universal wallet membership
 
-`ALL_CHAIN_TYPES` now contains 13 families (Cardano appended last). Because a
+`ChainType::Cardano` is appended to `ALL_CHAIN_TYPES`. Because a
 universal wallet derives one account per family plus the explicitly listed
 testnet extras, Cardano contributes three rows:
 
@@ -214,7 +223,7 @@ testnet extras, Cardano contributes three rows:
 #### 1.4 RPC configuration (Koios and Blockfrost)
 
 Cardano network access is implemented behind a provider-agnostic
-`CardanoRpcProvider` trait in `ows-core/src/cardano_rpc/`. Two concrete providers
+`CardanoRpcProvider` trait in `ows/crates/ows-core/src/cardano_rpc/`. Two concrete providers
 are supported:
 
 | Provider    | Authentication | Default |
@@ -252,7 +261,7 @@ selects Blockfrost.
 
 ##### Provider selection
 
-`resolve_cardano_provider` (`ows-core/src/cardano_rpc/mod.rs`) inspects the RPC
+`resolve_cardano_provider` (`ows/crates/ows-core/src/cardano_rpc/mod.rs`) inspects the RPC
 URL string and returns a `Box<dyn CardanoRpcProvider>`:
 
 - **Blockfrost** — when the URL contains `blockfrost.io/api` **or** is prefixed
@@ -284,7 +293,7 @@ selects network parameters from the CAIP-2 id (`cip34:0-1` → preprod, `cip34:0
 
 #### 2.1 New curve
 
-A third `Curve` variant, `Ed25519Bip32`, is added (`ows-signer/src/curve.rs`):
+A third `Curve` variant, `Ed25519Bip32`, is added (`ows/crates/ows-signer/src/curve.rs`):
 
 - `private_key_len()` → `ed25519_bip32::XPRV_SIZE` (96 bytes: 64-byte extended
   secret key + 32-byte chain code)
@@ -374,7 +383,7 @@ which yields an enterprise address with no staking component).
 #### 2.6 Multi-credential key storage
 
 Because a Cardano account needs two credentials, the multi-curve key material was
-extended (`ows-lib/src/ops.rs`):
+extended (`ows/crates/ows-lib/src/ops.rs`):
 
 - The `KeyPair` struct (used for raw-private-key imports) gains an
   `ed25519_bip32` field, serialized as
@@ -572,7 +581,7 @@ it performs richer, address-kind-aware selection and verification inline (see
 
 OWS gates every signing request through a **Policy Engine**: before a key is
 decrypted and used, the request is turned into a chain-agnostic
-`PolicyContext` (`ows-core/src/policy.rs`) that built-in rules and custom
+`PolicyContext` (`ows/crates/ows-core/src/policy.rs`) that built-in rules and custom
 **executable** policies evaluate and can veto. The core of that context is a
 `TransactionContext`, whose `effects` field is a list of per-address asset
 deltas:
@@ -619,7 +628,7 @@ stays `None`, so no network call is introduced anywhere else.
 
 #### 4.2 Parsing and input resolution (`CardanoRpcProvider::fetch_txs_cbor`)
 
-`CardanoSigner::make_transaction_context` (`ows-signer/src/chains/cardano.rs`):
+`CardanoSigner::make_transaction_context` (`ows/crates/ows-signer/src/chains/cardano.rs`):
 
 1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure),
    and record the raw hex for `TransactionContext.raw_hex`.
@@ -684,6 +693,33 @@ negative fee.
 The result is returned as `TransactionContext { effects, raw_hex, data: None }` and
 handed to the policy engine, which passes it (as part of `PolicyContext`) to
 built-in rules and to executable policies over stdin.
+
+### 5. Address balance fetching
+
+Balance queries go through the same provider abstraction.
+`get_cardano_balances` (`ows/crates/ows-pay/src/cardano.rs`) resolves the
+configured RPC URL with `resolve_cardano_provider` and calls
+`CardanoRpcProvider::get_balances(address)`, returning the generic
+`TokenBalance` list that every other chain in `ows-pay` produces:
+
+- ADA is reported with `address: "lovelace"`, symbol `ADA`, and 6 decimals; the
+  amount is the lovelace total scaled by `10^-6`.
+- Each native asset is reported with `address` set to its **asset fingerprint**
+  (`asset1…`), `name` set to `policy_id.asset_name`, and `symbol`/`decimals`
+  taken from the token-registry metadata — falling back to the first 10
+  characters of the asset name and `0` decimals when no metadata exists.
+  Zero-quantity entries are dropped, and the list is sorted by descending
+  amount.
+- **Koios** reads `POST {rpc}/address_info` (summing `asset_list` across the
+  UTxO set) and resolves metadata via `POST {rpc}/asset_info`, chunked.
+  **Blockfrost** reads `GET {rpc}/addresses/{address}` and one
+  `GET {rpc}/assets/{unit}` per native asset; a `404` on the address means "no
+  balances" rather than an error.
+
+The provider API is blocking, so the `async` wrapper runs it on
+`tokio::task::spawn_blocking`. Provider errors are mapped onto `PayErrorCode`:
+transport → `HttpTransport`, non-success status → `HttpStatus`, and an
+undecodable response body or amount → the new `InvalidData`.
 
 ## Rationale
 
@@ -831,18 +867,23 @@ These deliverables are considered complete when:
     certificate deposits/refunds are booked against the corresponding reward
     address; it errors when the RPC URL is missing for a transaction with inputs,
     or when the provider returns incomplete UTxO data.
+13. Address balance fetching returns ADA under `lovelace` plus one entry per
+    native asset (fingerprint, `policy_id.asset_name`, token-registry
+    symbol/decimals) on both providers, and an amount that cannot be decoded
+    fails with `PayErrorCode::InvalidData` instead of reporting `0`.
 
 ### Implementation Plan
 
-All five deliverables are landed and covered by unit/integration tests (see
+Everything specified above is landed and covered by unit/integration tests (see
 [Testing](#testing)): the chain-registry/addressing layer, Ed25519-BIP32 key
 derivation, the chain plugin interface (Shelley base/enterprise/reward address
 encoding, raw signing, CIP-8 message signing, and transaction signing/witness
 encoding), policy-engine support (`make_transaction_context` with provider-based
-input resolution), and a pluggable Cardano RPC layer (Koios default, Blockfrost
-opt-in). Remaining Cardano work (separate deliverables) proceeds as:
-transaction *building* (input selection, fee/change), general balance/UTxO
-fetching, persisting both payment and stake paths per `WalletAccount`.
+input resolution), address balance fetching, a pluggable Cardano RPC layer (Koios
+default, Blockfrost opt-in), and the CLI/binding surface for the optional
+`address` argument. Remaining Cardano work (separate deliverables) proceeds as:
+transaction *building* (input selection, fee/change) and persisting both payment
+and stake paths per `WalletAccount`.
 
 ## Backwards Compatibility Assessment
 
@@ -944,79 +985,85 @@ fetching, persisting both payment and stake paths per `WalletAccount`.
   another trusted host via the `koios|` / `blockfrost|` URL prefixes. To limit
   silent under-reporting, a transaction with inputs and no RPC URL is rejected,
   and incomplete UTxO resolution aborts context construction rather than degrading
-  to a partial view. On the balance path the same strictness applies to Koios: an
-  unparseable lovelace balance or asset quantity is a hard `Decode` error
-  (surfaced as `PayErrorCode::InvalidData`) rather than a silent `0`, so a
+  to a partial view. On the balance path the same strictness applies to both
+  providers: an unparseable lovelace balance or asset quantity is a hard `Decode`
+  error (surfaced as `PayErrorCode::InvalidData`) rather than a silent `0`, so a
   malformed response cannot understate holdings. Nullable Koios fields
   (`asset_list`, `asset_name`, token-registry `decimals`) are modelled as optional
   and default to empty/`0`, because their absence is a normal response shape rather
-  than corrupt data. Blockfrost balance quantities still fall back to `0` when they
-  fail to parse — a remaining gap on that provider.
+  than corrupt data.
 
 ## Implementation
 
 Components modified or added:
 
-- `ows-core/src/chain.rs` — `ChainType::Cardano`; `cip34` namespace mapping;
+- `ows/crates/ows-core/src/chain.rs` — `ChainType::Cardano`; `cip34` namespace mapping;
   coin type `1815`; mainnet/preprod/preview registry entries;
   `UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES`; `parse_chain` support.
-- `ows-core/src/config.rs` — default Koios RPC endpoints for the three networks.
-- `ows-core/src/cardano_rpc/` — `CardanoRpcProvider` trait,
+- `ows/crates/ows-core/src/config.rs` — default Koios RPC endpoints for the three networks.
+- `ows/crates/ows-core/src/cardano_rpc/` — `CardanoRpcProvider` trait,
   `resolve_cardano_provider`, `KoiosProvider`, and `BlockfrostProvider`.
-- `ows-core/src/wallet_file.rs` — `KeyType::PrivateKey` doc updated to include
+- `ows/crates/ows-core/src/wallet_file.rs` — `KeyType::PrivateKey` doc updated to include
   `ed25519_bip32`.
-- `ows-signer/src/curve.rs` — `Curve::Ed25519Bip32` and key lengths.
-- `ows-signer/src/mnemonic.rs` — `Mnemonic::entropy()` (raw BIP-39 entropy).
-- `ows-signer/src/hd.rs` — Icarus master-key generation and V2 child derivation;
+- `ows/crates/ows-signer/src/curve.rs` — `Curve::Ed25519Bip32` and key lengths.
+- `ows/crates/ows-signer/src/mnemonic.rs` — `Mnemonic::entropy()` (raw BIP-39 entropy).
+- `ows/crates/ows-signer/src/hd.rs` — Icarus master-key generation and V2 child derivation;
   a single shared path parser (`parse_path_components`) that bounds every index
   below 2³¹.
-- `ows-signer/src/chains/cardano.rs` — `CardanoSigner`, CIP-1852 path helpers,
+- `ows/crates/ows-signer/src/chains/cardano.rs` — `CardanoSigner`, CIP-1852 path helpers,
   network selection, and the full `ChainSigner` impl: base/enterprise/reward
   address encoding, `sign`, CIP-8 `sign_message`, `sign_transaction`,
   `encode_signed_transaction`, the `default_derivation_paths` / `encode_keys`
   overrides, and the `make_transaction_context` override (resolves inputs via
   `resolve_cardano_provider` and `CardanoRpcProvider::fetch_txs_cbor`, and books
   withdrawals and certificate deposits/refunds against the reward address).
-- `ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
+- `ows/crates/ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
   default methods `verify_sign_message_address`, `default_derivation_paths`, and
   `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
   (`make_transaction_context` already existed as a default-empty hook; Cardano now
   overrides it.)
-- `ows-lib/src/ops.rs` & `ows-lib/src/key_ops.rs` — `sign_and_send` and
+- `ows/crates/ows-lib/src/ops.rs` & `ows/crates/ows-lib/src/key_ops.rs` — `sign_and_send` and
   `sign_with_api_key` resolve the Cardano RPC URL and pass it into
   `make_transaction_context`; `broadcast_cardano` uses `resolve_cardano_provider`;
   `resolve_rpc_url` is exposed for reuse.
-- `ows-pay/src/cardano.rs` & `ows-pay/src/error.rs` — address balance fetching via
+- `ows/crates/ows-pay/src/cardano.rs` & `ows/crates/ows-pay/src/error.rs` — address balance fetching via
   `CardanoRpcProvider::get_balances`; new `PayErrorCode::InvalidData` for a
   provider response whose amounts cannot be decoded.
-- `ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
+- `ows/crates/ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
   signature and calls `verify_sign_message_address`.
-- `ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
+- `ows/crates/ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
   `signer_for_chain`; integration test uses `default_derivation_paths` and
   `encode_keys`.
-- `ows-lib/src/ops.rs` — `KeyPair.ed25519_bip32`, random 192-byte generation,
+- `ows/crates/ows-lib/src/ops.rs` — `KeyPair.ed25519_bip32`, random 192-byte generation,
   `validate_ed25519_bip32_key` on private-key import,
   curve dispatch, `broadcast_cardano`; `sign_message`/`sign_typed_data` thread the
   `address` argument; mnemonic derivation routes through `default_derivation_paths`
   and `encode_keys`.
-- `ows-lib/src/key_ops.rs` — API-key `sign_message`/`sign_typed_data` thread
+- `ows/crates/ows-lib/src/key_ops.rs` — API-key `sign_message`/`sign_typed_data` thread
   `address` and call `verify_sign_message_address`.
-- `ows-cli` — `sign message --address` flag; `derive` uses `default_derivation_paths`
-  and `encode_keys`.
+- `ows/crates/ows-cli` — `sign message --address` flag; `derive` uses
+  `default_derivation_paths` and `encode_keys`.
 - `bindings/node` & `bindings/python` — `sign_message`/`sign_typed_data` expose
   the optional `address` argument.
 
-Dependencies added (`ows-signer/Cargo.toml`):
+Dependencies added:
 
-- `ed25519-bip32 = "0.4.1"` — generic BIP32-Ed25519 derivation.
-- `pbkdf2 = "0.12"` — Icarus master-key derivation.
+- `ed25519-bip32 = "0.4.1"` — generic BIP32-Ed25519 derivation
+  (`ows/crates/ows-signer/Cargo.toml`, `ows/crates/ows-lib/Cargo.toml`).
+- `pbkdf2 = "0.12"` — Icarus master-key derivation
+  (`ows/crates/ows-signer/Cargo.toml`).
 - `cardano-serialization-lib = "14.1.1"` — Cardano network parameters
-  (`NetworkInfo`), Shelley address encoding, and transaction/witness encoding.
-- `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers.
-- `reqwest = "0.12"` (blocking, `json`, `rustls-tls`, no default features) —
-  HTTP client for the Cardano RPC providers (`ows-core/src/cardano_rpc/`).
+  (`NetworkInfo`), Shelley address encoding, and transaction/witness encoding
+  (`ows/crates/ows-signer/Cargo.toml`).
+- `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers
+  (`ows/crates/ows-signer/Cargo.toml`).
+- `reqwest = "0.12"` (`json`, `rustls-tls`, no default features; `blocking` in
+  `ows-core`) — HTTP client for the Cardano RPC providers
+  (`ows/crates/ows-core/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`).
 - `mockito = "1"` (dev-dependency) — mocks provider endpoints in the
-  `make_transaction_context` and `cardano_rpc` tests.
+  `make_transaction_context`, `cardano_rpc`, and balance tests
+  (`ows/crates/ows-core/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`,
+  `ows/crates/ows-signer/Cargo.toml`).
 
 ## Testing
 
@@ -1056,7 +1103,7 @@ Implemented and passing for these deliverables:
   withdrawal; `sign_transaction` signatures and the `encode_signed_transaction`
   output are asserted against reference CBOR, and the certificate/withdrawal cases
   assert that the witness set carries exactly the payment and stake public keys.
-- **Key import** (`ows-lib/src/ops.rs`): a private-key wallet imports both the
+- **Key import** (`ows/crates/ows-lib/src/ops.rs`): a private-key wallet imports both the
   96-byte payment and the 192-byte payment ‖ stake Ed25519-BIP32 shapes and
   exports them unchanged; a 64-byte key and a 96-byte key with invalid scalar
   clamping are both rejected at import.
