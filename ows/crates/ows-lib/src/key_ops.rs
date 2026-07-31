@@ -116,9 +116,17 @@ pub fn sign_with_api_key(
 
     // Second, effect-aware policy pass at the plan→authorize seam: a denial drops the key unused, so a
     // transaction the policy rejects is never proved.
-    let signable_tx = crate::ops::prepare_signable_tx(chain, tx_bytes.to_vec(), &key, |effects| {
-        enforce_effect_policies(&key_file, &wallet_id, chain, policy_tx, effects, vault_path)
-    })?;
+    let signable_tx =
+        crate::ops::prepare_signable_tx(chain, tx_bytes.to_vec(), &key, |chain_extra| {
+            enforce_effect_policies(
+                &key_file,
+                &wallet_id,
+                chain,
+                policy_tx,
+                chain_extra,
+                vault_path,
+            )
+        })?;
     let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
     let transaction =
@@ -360,24 +368,24 @@ pub fn enforce_policies_and_decrypt_key(
 }
 
 /// The connector seam's second policy pass, as a gate: re-evaluate every policy on the key with the
-/// transaction's key-derived, wallet-relative `effects` filled in — after the balancing plan is built,
+/// transaction's key-derived `chain_extra` context filled in — after the balancing plan is built,
 /// before it is authorized. A denial returns an error, so no bearer spend witness is ever built for a
 /// transaction the policy rejects. The declarative rules run again too: planning can take minutes
 /// (a cold sync), and a rule such as an expiry that held at the first pass
 /// ([`enforce_policies_and_decrypt_key`]) may no longer hold. An executable policy therefore sees a
-/// Midnight transaction twice, first with empty `effects` and then with them.
+/// Midnight transaction twice, first without `chain_extra` and then with it.
 pub(crate) fn enforce_effect_policies(
     key_file: &ApiKeyFile,
     wallet_id: &str,
     chain: &ows_core::Chain,
     mut transaction: ows_core::policy::TransactionContext,
-    effects: &[ows_core::policy::TransactionEffect],
+    chain_extra: serde_json::Value,
     vault_path: Option<&Path>,
 ) -> Result<(), OwsLibError> {
     let policies = load_policies_for_key(key_file, vault_path)?;
     let now = chrono::Utc::now();
     let date = now.format("%Y-%m-%d").to_string();
-    transaction.effects = effects.to_vec();
+    transaction.chain_extra = Some(chain_extra);
     let context = ows_core::PolicyContext {
         chain_id: chain.chain_id.to_string(),
         wallet_id: wallet_id.to_string(),
@@ -1428,15 +1436,17 @@ else:
         let wallet_id = setup_test_wallet(&vault, passphrase);
 
         // An executable policy that denies when the summed absolute movement across the transaction's
-        // effects exceeds 1000 — the kind of cap a real deployment expresses as a custom program.
+        // per-segment `chain_extra` effects exceeds 1000 — the kind of cap a real deployment expresses as
+        // a custom program, now reading the Midnight per-segment effects rather than the empty `effects`.
         let script = dir.path().join("cap.py");
         std::fs::write(
             &script,
             "#!/usr/bin/env python3\n\
              import sys, json\n\
              ctx = json.load(sys.stdin)\n\
-             effects = (ctx.get('transaction') or {}).get('effects', [])\n\
-             total = sum(abs(int(d)) for e in effects for _, d in e.get('diff', []))\n\
+             extra = (ctx.get('transaction') or {}).get('chain_extra') or {}\n\
+             segs = extra.get('segment_effects', [])\n\
+             total = sum(abs(int(d)) for s in segs for e in s.get('effects', []) for _, d in e.get('diff', []))\n\
              print(json.dumps({'allow': total <= 1000, 'reason': f'moved {total}'}))\n",
         )
         .unwrap();
@@ -1475,11 +1485,18 @@ else:
             data: None,
             chain_extra: None,
         };
-        let native_move = |amount: i64| {
-            vec![ows_core::policy::TransactionEffect {
-                address: "mn_addr_wallet".into(),
-                diff: vec![("0".repeat(64), amount.to_string())],
-            }]
+        // The per-segment `chain_extra` a Midnight plan hands to the seam: one guaranteed-segment native
+        // movement of `amount`.
+        let chain_extra = |amount: i64| {
+            serde_json::json!({
+                "segment_effects": [{
+                    "segment": 0,
+                    "effects": [{
+                        "address": "mn_addr_wallet",
+                        "diff": [["0".repeat(64), amount.to_string()]],
+                    }],
+                }],
+            })
         };
 
         // Over the cap → denied at the seam (in the real path the key drops unused, nothing is proved).
@@ -1488,7 +1505,7 @@ else:
             &wallet_id,
             &chain,
             tx(),
-            &native_move(-5_000),
+            chain_extra(-5_000),
             Some(&vault),
         );
         assert!(matches!(
@@ -1502,7 +1519,7 @@ else:
             &wallet_id,
             &chain,
             tx(),
-            &native_move(-500),
+            chain_extra(-500),
             Some(&vault),
         );
         assert!(
@@ -1550,7 +1567,14 @@ else:
             data: None,
             chain_extra: None,
         };
-        let denied = enforce_effect_policies(&key_file, &wallet_id, &chain, tx, &[], Some(&vault));
+        let denied = enforce_effect_policies(
+            &key_file,
+            &wallet_id,
+            &chain,
+            tx,
+            serde_json::json!({ "segment_effects": [] }),
+            Some(&vault),
+        );
         assert!(matches!(
             denied,
             Err(OwsLibError::Core(OwsError::PolicyDenied { .. }))
