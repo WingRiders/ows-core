@@ -12,9 +12,10 @@ use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::Signature as MnSig;
 use midnight_coin_structure::coin::TokenType as LedgerTokenType;
-use midnight_ledger::structure::{ProofMarker, Transaction};
-use midnight_serialize::tagged_deserialize;
+use midnight_ledger::structure::{ProofMarker, Transaction, UtxoSpend};
+use midnight_serialize::{tagged_deserialize, Serializable};
 use midnight_storage::db::InMemoryDB;
+use ows_signer::chains::MidnightNetwork;
 use serde::{Deserialize, Serialize};
 use transient_crypto::commitment::PureGeneratorPedersen;
 
@@ -42,6 +43,22 @@ pub struct SegmentTerms {
     pub wants: Vec<TokenAmount>,
 }
 
+/// One unshielded output an offer spends, named the way the indexer names UTXOs.
+///
+/// The identifiers here are join keys, not labels: `token` is always the raw lowercase 64-hex id
+/// (never the `night` shorthand [`TokenAmount`] uses) and `owner` is the Bech32m address rather than
+/// the verifying key the transaction actually carries, because those are the forms the chain answers
+/// questions in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InputRef {
+    /// The intent that created the spent output, lowercase hex, no `0x`.
+    pub intent_hash: String,
+    pub output_no: u32,
+    pub owner: String,
+    pub token: String,
+    pub value: u128,
+}
+
 /// Everything a keyless reader can derive from a sealed offer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OfferInspection {
@@ -49,6 +66,11 @@ pub struct OfferInspection {
     /// When the offer stops being executable: the earliest intent TTL, in Unix seconds.
     pub min_ttl_secs: u64,
     pub segments: Vec<SegmentTerms>,
+    /// The unshielded outputs this offer spends. Shielded inputs are deliberately absent: a Zswap
+    /// spend publishes only a nullifier, so there is no public reference to follow — anything
+    /// watching an offer on chain can watch its unshielded legs and nothing more.
+    #[serde(default)]
+    pub inputs: Vec<InputRef>,
 }
 
 /// Derive a sealed offer's terms from its bytes.
@@ -100,10 +122,45 @@ pub fn inspect_sealed_offer(bytes: &[u8]) -> std::io::Result<OfferInspection> {
         }
     }
 
+    let network = MidnightNetwork::from_reference(&stx.network_id);
+    let mut inputs = Vec::new();
+    for pair in stx.intents.iter() {
+        let (_seg_sp, intent_sp) = pair.deref();
+        let intent = intent_sp.deref();
+        for offer in [
+            intent.guaranteed_unshielded_offer.as_ref(),
+            intent.fallible_unshielded_offer.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for spend in offer.deref().inputs.iter_deref() {
+                inputs.push(input_ref(&network, spend)?);
+            }
+        }
+    }
+
     Ok(OfferInspection {
         network_id: stx.network_id.clone(),
         min_ttl_secs,
         segments: per_segment.into_values().collect(),
+        inputs,
+    })
+}
+
+fn input_ref(network: &MidnightNetwork, spend: &UtxoSpend) -> std::io::Result<InputRef> {
+    let mut vk_raw = Vec::new();
+    Serializable::serialize(&spend.owner, &mut vk_raw)
+        .map_err(|e| std::io::Error::other(format!("unreadable input owner: {e}")))?;
+    let owner = network
+        .unshielded_address_for_verifying_key(&vk_raw)
+        .map_err(|e| std::io::Error::other(format!("unreadable input owner: {e}")))?;
+    Ok(InputRef {
+        intent_hash: hex::encode(spend.intent_hash.0 .0),
+        output_no: spend.output_no,
+        owner,
+        token: hex::encode(spend.type_.0 .0),
+        value: spend.value,
     })
 }
 
@@ -205,5 +262,67 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(inspect_sealed_offer(b"not a transaction").is_err());
+    }
+
+    #[test]
+    fn reads_the_fixture_unshielded_input_refs() {
+        let insp = inspect_sealed_offer(&fixture_bytes()).unwrap();
+
+        // The fixture funds its 500,000 NIGHT give from the maker's own unshielded UTXOs, so it
+        // names them — and a watcher can follow exactly these on chain.
+        assert!(
+            !insp.inputs.is_empty(),
+            "an offer that gives unshielded NIGHT must spend unshielded inputs"
+        );
+        for input in &insp.inputs {
+            assert_eq!(input.intent_hash.len(), 64, "{input:?}");
+            assert!(
+                input.intent_hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "{input:?}"
+            );
+            assert!(
+                input.intent_hash.chars().all(|c| !c.is_ascii_uppercase()),
+                "identifiers are lowercase hex: {input:?}"
+            );
+            assert_eq!(input.token.len(), 64, "{input:?}");
+            assert!(input.value > 0, "{input:?}");
+            // The owner is the address the indexer keys UTXOs by, not the raw verifying key.
+            assert!(
+                input.owner.starts_with("mn_addr_preprod1"),
+                "{} is not a preprod unshielded address",
+                input.owner
+            );
+        }
+
+        // The inputs must cover what the offer hands over.
+        let native = hex::encode([0u8; 32]);
+        let supplied: u128 = insp
+            .inputs
+            .iter()
+            .filter(|i| i.token == native)
+            .map(|i| i.value)
+            .sum();
+        let given: u128 = insp
+            .segments
+            .iter()
+            .flat_map(|s| &s.gives)
+            .filter(|g| g.domain == "unshielded" && g.token == "night")
+            .map(|g| g.value)
+            .sum();
+        assert!(
+            supplied >= given,
+            "inputs supply {supplied} but the offer gives {given}"
+        );
+    }
+
+    #[test]
+    fn an_offer_with_no_unshielded_inputs_names_none() {
+        // Garbage never parses, so the empty case is asserted where it is reachable: the refs are
+        // read per intent, and an intent without an unshielded offer contributes nothing.
+        let insp = inspect_sealed_offer(&fixture_bytes()).unwrap();
+        assert!(insp
+            .inputs
+            .iter()
+            .all(|i| !i.owner.is_empty() && !i.intent_hash.is_empty()));
     }
 }

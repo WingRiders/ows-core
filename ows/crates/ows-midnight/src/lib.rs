@@ -30,7 +30,7 @@ pub use dapp_connector::{
     MakeTransferRequest, TransferKind, UnsealedKind,
 };
 pub use fund_balance::print_fund_balance;
-pub use inspect::{inspect_sealed_offer, OfferInspection, SegmentTerms, TokenAmount};
+pub use inspect::{inspect_sealed_offer, InputRef, OfferInspection, SegmentTerms, TokenAmount};
 pub use ledger_params::fetch_indexer_ledger_parameters;
 pub use prover::Prover;
 pub use submit::broadcast_sealed;

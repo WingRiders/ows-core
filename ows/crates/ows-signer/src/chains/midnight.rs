@@ -132,6 +132,25 @@ impl MidnightNetwork {
     pub fn ledger_network_id(&self) -> &str {
         &self.reference
     }
+
+    /// The unshielded address that owns the UTXOs a BIP-340 x-only verifying key can spend.
+    ///
+    /// A transaction names the owner of each unshielded input by verifying key, while the indexer
+    /// keys UTXOs by address — this is the bridge between the two, and it needs no secret: the
+    /// address is a hash of the public key under this network's HRP, exactly as derivation builds it.
+    pub fn unshielded_address_for_verifying_key(
+        &self,
+        xonly_pubkey: &[u8],
+    ) -> Result<String, SignerError> {
+        if xonly_pubkey.len() != 32 {
+            return Err(SignerError::AddressDerivationFailed(format!(
+                "expected a 32-byte x-only verifying key, got {} bytes",
+                xonly_pubkey.len()
+            )));
+        }
+        let hash = sha2::Sha256::digest(xonly_pubkey);
+        MidnightSigner::bech32m_encode(&self.unshielded_hrp()?, &hash)
+    }
 }
 
 /// Bech32m HRP bases used for Midnight addresses; network references must produce valid
@@ -1424,6 +1443,40 @@ mod tests {
             blob.extend_from_slice(&hex::decode(h).unwrap());
         }
         blob
+    }
+
+    #[test]
+    fn unshielded_address_from_a_verifying_key_matches_derivation() {
+        // The same address, reached from the public side: what a transaction's inputs name (a
+        // verifying key) must resolve to what the wallet publishes (an address), or nothing can
+        // follow an offer's inputs on chain.
+        let signer = MidnightSigner::mainnet();
+        let derived = signer.derive_addresses(&signing_key_blob()).unwrap();
+
+        let seeds = MidnightSigner::decode_keys(&signing_key_blob()).unwrap();
+        let vk = MidnightSigner::signing_key(seeds.unshielded.expose())
+            .unwrap()
+            .verifying_key()
+            .to_bytes();
+
+        let from_key = MidnightNetwork::mainnet()
+            .unshielded_address_for_verifying_key(&vk)
+            .unwrap();
+        assert_eq!(from_key, derived.unshielded);
+
+        // The HRP is the network's, so the same key is a different address per network.
+        let preview = MidnightNetwork::from_reference("preview")
+            .unshielded_address_for_verifying_key(&vk)
+            .unwrap();
+        assert!(preview.starts_with("mn_addr_preview1"));
+        assert_ne!(preview, from_key);
+    }
+
+    #[test]
+    fn an_unshielded_address_needs_a_32_byte_key() {
+        assert!(MidnightNetwork::mainnet()
+            .unshielded_address_for_verifying_key(&[0u8; 31])
+            .is_err());
     }
 
     #[test]
