@@ -15,6 +15,14 @@
 //! and the proved fragment is merged into the proved maker frame, so the bearer preimage never leaves the
 //! signer.
 //!
+//! The offer's **expiry** is load-bearing in a way it is not for the other methods. `Intent.ttl` sits
+//! inside the seal cover, and makeIntent runs no balancing tail, so nothing after this module can move
+//! it — not the taker, not a service relaying the offer. It is also the maker's only unilateral way out:
+//! a sealed offer is a bearer artifact, cancellable only by letting it expire or by double-spending one
+//! of its inputs. Left at the wallet default it is the widest window the ledger allows, which is a free
+//! option written against the maker's quoted price; `options.ttl` lets a maker that re-quotes often say
+//! how long its price stands.
+//!
 //! Both the shielded and unshielded legs ride the transaction's **guaranteed section** (segment 0),
 //! and — unlike `makeTransfer` — a swap keeps its NIGHT there rather than steering it to a fallible
 //! segment. The ledger balances value **per segment**: every `(token, segment)` cell must net on its
@@ -27,12 +35,13 @@
 //! its zswap legs pool in `fallible_coins` — but that saves nothing (only the guaranteed *unshielded*
 //! offer loads the segment-0 `time_to_dismiss` budget) and weakens the swap's all-or-nothing atomicity,
 //! so makeIntent keeps every leg guaranteed. The maker's intent still keys at a fallible segment
-//! (`intentSegment`); only the coins settle guaranteed. See [`GUARANTEED_SEGMENT`].
+//! (`intentId`); only the coins settle guaranteed. See [`GUARANTEED_SEGMENT`].
 
 use std::collections::BTreeMap;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
     Info as CoinInfo, QualifiedInfo, ShieldedTokenType, UserAddress,
 };
@@ -56,21 +65,26 @@ use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
-    decode_shielded_recipient, decode_unshielded_recipient, deserialize_u128, err, far_future_ttl,
-    prove_preimage, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
-    DesiredOutput, PreimageTx, TransferKind,
+    decode_shielded_recipient, decode_unshielded_recipient, default_intent_ttl, deserialize_u128,
+    effects_from_movements, err, max_ttl_secs, mock_prove_unsealed, now_secs, prove_preimage,
+    prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
+    Movement, PreimageTx, TransferKind,
 };
 use crate::parse_token_type;
+use ows_core::policy::TransactionEffect;
 
-/// The connector convention default when a request omits `intentSegment`.
+/// The segment a maker's intent keys at when the request omits `intentId`. The spec's own guidance for
+/// picking one: segment 1 "ensures no transaction merging will result in actions executed before created
+/// intent in the same transaction".
 const DEFAULT_INTENT_SEGMENT: u16 = 1;
 
 /// Segment 0 is the transaction's guaranteed section. A swap offer's shielded coins ride it — like
 /// `makeTransfer` and `mip6` place theirs — so both legs of the swap sit in **one** segment. The ledger
 /// applies each segment atomically (a segment-0 failure reverts the whole tx; a fallible segment fails
 /// alone), so a swap split across the guaranteed and a fallible section could settle one leg and drop
-/// the other. The intent itself still keys at a fallible segment (`intentSegment`); only the coins move.
-const GUARANTEED_SEGMENT: u16 = 0;
+/// the other. The intent itself still keys at a fallible segment (`intentId`); only the coins move.
+/// The merge path reuses this for the taker complement's own coins, which settle guaranteed the same way.
+pub(super) const GUARANTEED_SEGMENT: u16 = 0;
 
 /// One input the maker contributes: a `value` of `token_type` in `kind`'s domain (no recipient — the
 /// maker spends its own coins).
@@ -84,18 +98,35 @@ pub struct DesiredInput {
     pub value: u128,
 }
 
-/// A parsed `makeIntent` request: the maker's inputs and desired outputs and the intent segment. Unlike
-/// the balancing methods, makeIntent builds a deliberately imbalanced maker offer and never pays fees —
-/// the taker completes and balances the swap — so there is no `payFees` option here.
+/// A parsed `makeIntent` request: the maker's inputs and desired outputs, the resolved intent segment
+/// (`intentId`, with `"random"` already drawn), and the offer's expiry. `ttl` is `None` when the request
+/// names no expiry, leaving the wallet's [`default_intent_ttl`]. `payFees` is not carried: a maker offer
+/// is fee-free by construction here, and a request asking otherwise is rejected at parse.
 #[derive(Debug, Clone)]
 pub struct MakeIntentRequest {
     pub desired_inputs: Vec<DesiredInput>,
     pub desired_outputs: Vec<DesiredOutput>,
     pub intent_segment: u16,
+    pub ttl: Option<Timestamp>,
 }
 
-fn default_intent_segment() -> u16 {
-    DEFAULT_INTENT_SEGMENT
+/// The `options` bag of a `makeIntent` request: the connector spec's `intentId` and `payFees`, plus the
+/// `ttl` extension.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MakeIntentOptions {
+    intent_id: Option<IntentIdJson>,
+    pay_fees: Option<bool>,
+    ttl: Option<u64>,
+}
+
+/// The spec's `intentId: number | "random"` — the segment the maker's intent keys at, or a request that
+/// the wallet pick one.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IntentIdJson {
+    Segment(u64),
+    Keyword(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,12 +136,15 @@ struct MakeIntentJson {
     desired_inputs: Vec<DesiredInput>,
     #[serde(default)]
     desired_outputs: Vec<DesiredOutput>,
-    #[serde(default = "default_intent_segment")]
-    intent_segment: u16,
+    #[serde(default)]
+    options: Option<MakeIntentOptions>,
 }
 
-/// Parse a stringified DApp Connector `makeIntent` request. `intentSegment` defaults to the connector
-/// convention (segment 1) and must be >= 1.
+/// Parse a stringified DApp Connector `makeIntent` request. `options.intentId` names the maker intent's
+/// segment (see [`resolve_intent_segment`]) and defaults to segment 1; `options.payFees` may only ask for
+/// the fee-free maker offer this wallet builds (see [`check_pay_fees`]); `options.ttl` defaults to the
+/// wallet's own [`default_intent_ttl`] and must name an instant the ledger will still accept (see
+/// [`parse_intent_ttl`]).
 pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::Error> {
     let req: MakeIntentJson = serde_json::from_str(json)
         .map_err(|e| std::io::Error::other(format!("invalid makeIntent request JSON: {e}")))?;
@@ -119,20 +153,133 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
             "makeIntent requires at least one desired input or output",
         ));
     }
-    // The ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
-    // (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`), so the maker's
-    // intent must key at a fallible segment >= 1. makeTransfer hardcodes segment 1; makeIntent lets the
-    // dapp choose, so guard the lower bound here rather than build an offer the node will reject.
-    if req.intent_segment == 0 {
-        return Err(std::io::Error::other(
-            "makeIntent intentSegment must be >= 1: segment 0 is the guaranteed section, where the ledger rejects an intent",
-        ));
-    }
+    let (intent_id, pay_fees, ttl) = match req.options {
+        Some(o) => (o.intent_id, o.pay_fees, o.ttl),
+        None => (None, None, None),
+    };
+    check_pay_fees(pay_fees)?;
     Ok(MakeIntentRequest {
         desired_inputs: req.desired_inputs,
         desired_outputs: req.desired_outputs,
-        intent_segment: req.intent_segment,
+        intent_segment: resolve_intent_segment(intent_id)?,
+        ttl: parse_intent_ttl(ttl, now_secs())?,
     })
+}
+
+/// Resolve the spec's `intentId` to the segment the maker's intent keys at: a number is taken as given,
+/// `"random"` is drawn by the wallet (the spec's suggested mode for swaps), and an absent option falls
+/// back to [`DEFAULT_INTENT_SEGMENT`].
+///
+/// Two bounds are the ledger's. Segment ids are 16-bit, and segment 0 is the guaranteed section, where an
+/// intent is rejected outright (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error:
+/// 167`) — the spec's "within ledger limitations". Rejecting here beats building an offer the node will
+/// throw away.
+fn resolve_intent_segment(intent_id: Option<IntentIdJson>) -> Result<u16, std::io::Error> {
+    match intent_id {
+        None => Ok(DEFAULT_INTENT_SEGMENT),
+        Some(IntentIdJson::Segment(0)) => Err(std::io::Error::other(
+            "makeIntent options.intentId must be >= 1: segment 0 is the guaranteed section, where the ledger rejects an intent",
+        )),
+        Some(IntentIdJson::Segment(n)) => u16::try_from(n).map_err(|_| {
+            std::io::Error::other(format!(
+                "makeIntent options.intentId {n} is out of range: a segment id is at most {}",
+                u16::MAX
+            ))
+        }),
+        // Any fallible segment will do for a lone maker intent, so draw from the whole space rather than
+        // the low end: a wide draw is what keeps two independently-built intents from colliding
+        // (`IntentSegmentIdCollision`) when a taker merges its own into the same transaction.
+        Some(IntentIdJson::Keyword(k)) if k == "random" => Ok(OsRng.gen_range(1..=u16::MAX)),
+        Some(IntentIdJson::Keyword(k)) => Err(std::io::Error::other(format!(
+            "makeIntent options.intentId must be a segment number or \"random\", not \"{k}\""
+        ))),
+    }
+}
+
+/// Reject a request asking the wallet to pay the maker's fees. `makeIntent` here builds a fee-free maker
+/// offer — the taker funds the DUST when it completes and balances the swap — so `payFees: true` is a
+/// thing this wallet cannot do, and saying so beats returning an offer that silently does the opposite of
+/// what was asked. An absent option is read as the fee-free offer, which is also what the reference wallet
+/// SDK's `initSwap` defaults to.
+fn check_pay_fees(pay_fees: Option<bool>) -> Result<(), std::io::Error> {
+    if pay_fees == Some(true) {
+        return Err(std::io::Error::other(
+            "makeIntent options.payFees: true is not supported: a maker offer is imbalanced and fee-free, and the taker funds the DUST fee when it completes the swap",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a requested expiry (Unix epoch seconds) against the window the ledger will accept for an
+/// offer built *now*. Both bounds are the ledger's own, measured against the block the offer lands in
+/// (`tblock`): it rejects `ttl < tblock` (`IntentTtlExpired`) and `ttl > tblock + global_ttl`
+/// (`IntentTtlTooFarInFuture`). `tblock` is unknowable at build time but is never earlier than now, so
+/// `now` is the conservative stand-in — an offer inside this window is acceptable whenever it settles,
+/// and one outside it is rejected at build rather than after the maker has paid to prove it.
+fn parse_intent_ttl(ttl: Option<u64>, now: u64) -> Result<Option<Timestamp>, std::io::Error> {
+    let Some(ttl) = ttl else {
+        return Ok(None);
+    };
+    if ttl <= now {
+        return Err(std::io::Error::other(format!(
+            "makeIntent options.ttl {ttl} is not in the future (now {now}): the offer would be born expired"
+        )));
+    }
+    let max = now.saturating_add(max_ttl_secs());
+    if ttl > max {
+        return Err(std::io::Error::other(format!(
+            "makeIntent options.ttl {ttl} is further ahead than the ledger's global_ttl ({}s) allows: at most {max}",
+            max_ttl_secs()
+        )));
+    }
+    Ok(Some(Timestamp::from_secs(ttl)))
+}
+
+/// The wallet-relative effects a `makeIntent` maker offer will have, derived from the request alone: the
+/// maker contributes each desired input (outflow), and receives each desired output routed back to its
+/// own address (inflow) — an output to some other recipient is not the maker's movement. The policy seam
+/// gates on this before [`authorize`] proves anything.
+pub(super) fn request_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeIntentRequest,
+) -> Result<Vec<TransactionEffect>, std::io::Error> {
+    let addresses = crypto_provider
+        .addresses(&MidnightNetwork::from_chain_id(chain_id))
+        .map_err(|e| err(e.to_string()))?;
+    let inputs = req.desired_inputs.iter().map(|i| Movement {
+        kind: i.kind,
+        token_type: &i.token_type,
+        value: -(i.value as i128),
+    });
+    let outputs = req.desired_outputs.iter().filter_map(|o| {
+        let self_addr = match o.kind {
+            TransferKind::Unshielded => &addresses.unshielded,
+            TransferKind::Shielded => &addresses.shielded,
+        };
+        (o.recipient == *self_addr).then_some(Movement {
+            kind: o.kind,
+            token_type: &o.token_type,
+            value: o.value as i128,
+        })
+    });
+    effects_from_movements(&addresses, inputs.chain(outputs))
+}
+
+/// The `makeIntent` maker offer's wallet-relative effects as [`request_effects`] computes them, all in
+/// the transaction's guaranteed section ([`GUARANTEED_SEGMENT`]): a swap keeps every leg guaranteed — the
+/// maker's coins settle in segment 0 even though its intent keys at a fallible `intentId` — so the
+/// movement a policy sees is a guaranteed one. An offer that nets nothing yields no segment entry.
+pub(super) fn request_segment_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeIntentRequest,
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+    let effects = request_effects(chain_id, crypto_provider, req)?;
+    Ok(crate::balance_tx::single_segment(
+        GUARANTEED_SEGMENT,
+        effects,
+    ))
 }
 
 /// Build the maker's imbalanced offer, prove it, and return the signable bytes. Runs **after** the
@@ -164,6 +311,7 @@ pub(super) fn authorize(
         &unshielded_out,
         &shielded_out,
         !shielded_in.is_empty(),
+        req.ttl,
     )?;
 
     // No shielded inputs: the frame is the whole maker offer; prove and return it.
@@ -191,9 +339,62 @@ pub(super) fn authorize(
     Ok(out)
 }
 
+/// Build the same maker offer as [`authorize`] — same frame, same real coin selection — but **mock-prove**
+/// it instead of really proving: the proofs are fixed-size, non-verifying stand-ins that serialize to the
+/// exact length of the real ones, so a transaction sized against this offer gets the real fee. No real
+/// proving happens, so it is safe to call **before** the policy seam. The sealed-merge effects path uses
+/// it to size the merged DUST fee against a mock-proven taker complement, leaving the real spend proving to
+/// [`authorize`] post-seam.
+pub(super) fn mock_authorize(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeIntentRequest,
+) -> Result<StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, std::io::Error>
+{
+    let signer = MidnightSigner::from_chain_id(chain_id);
+
+    let (unshielded_in, shielded_in): (Vec<_>, Vec<_>) = req
+        .desired_inputs
+        .iter()
+        .partition(|d| d.kind == TransferKind::Unshielded);
+    let (unshielded_out, shielded_out): (Vec<_>, Vec<_>) = req
+        .desired_outputs
+        .iter()
+        .partition(|d| d.kind == TransferKind::Unshielded);
+
+    let frame = build_make_intent_frame(
+        chain_id,
+        &signer,
+        crypto_provider,
+        req.intent_segment,
+        &unshielded_in,
+        &unshielded_out,
+        &shielded_out,
+        !shielded_in.is_empty(),
+        req.ttl,
+    )?;
+    // Mock-prove into the *unsealed* proven form: `mock_prove` would seal the taker, but the merge fee
+    // sizing seals the taker itself (once the DUST section is spliced in), so it needs the unsealed taker.
+    let unsealed = mock_prove_unsealed(frame)?;
+    let Transaction::Standard(base) = unsealed else {
+        return Err(err(
+            "mock-proven makeIntent frame is not a Standard transaction",
+        ));
+    };
+
+    // No shielded inputs: the mock-proven frame is the whole offer. Otherwise select the maker's shielded
+    // coins (the same selection the real path makes) and splice a mock-proven spend section in.
+    if shielded_in.is_empty() {
+        return Ok(base);
+    }
+    let funding =
+        plan_shielded_input_funding(chain_id, crypto_provider, GUARANTEED_SEGMENT, &shielded_in)?;
+    crate::balance_tx::splice_mock_shielded_for_sizing(&base, crypto_provider, &funding)
+}
+
 /// Construct the `proof-preimage` maker frame: the maker's unshielded inputs (with change back to the
 /// maker) + unshielded/shielded outputs, deliberately imbalanced. The intent keys at `segment`
-/// (`intentSegment`), but the shielded outputs ride the guaranteed section (see [`GUARANTEED_SEGMENT`]).
+/// (`intentId`), but the shielded outputs ride the guaranteed section (see [`GUARANTEED_SEGMENT`]).
 /// Shielded *inputs* are authorized separately, after proving, so `has_shielded_in` keeps the empty-offer
 /// guard from firing when the maker's only contribution is shielded inputs.
 #[allow(clippy::too_many_arguments)]
@@ -206,6 +407,7 @@ fn build_make_intent_frame(
     unshielded_out: &[&DesiredOutput],
     shielded_out: &[&DesiredOutput],
     has_shielded_in: bool,
+    ttl: Option<Timestamp>,
 ) -> Result<PreimageTx, std::io::Error> {
     let sender_vk = crypto_provider
         .unshielded_verifying_key()
@@ -233,7 +435,10 @@ fn build_make_intent_frame(
         fallible_unshielded_offer: None,
         actions: vec![].into(),
         dust_actions: None,
-        ttl: far_future_ttl(),
+        // Unlike the balancing methods, makeIntent never runs the balancing tail, so nothing downstream
+        // re-aligns this TTL to the chain tip — and it is inside the seal cover, so no later holder of
+        // the offer can change it either. Whatever is chosen here is the offer's real expiry.
+        ttl: ttl.unwrap_or_else(default_intent_ttl),
         binding_commitment: rng.r#gen(),
     };
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(segment, intent);
@@ -249,18 +454,16 @@ fn build_make_intent_frame(
     Ok(Transaction::Standard(stx))
 }
 
-/// Authorize the maker's shielded inputs into the already-proved frame: sync the wallet, select whole
-/// coins covering each token's declared amount, and hand them to [`MidnightCryptoProvider::authorize_shielded`],
-/// which builds + proves the spend witnesses and the self-change, both in the guaranteed section (see
-/// [`GUARANTEED_SEGMENT`]). The proved fragment is merged into `base`'s guaranteed coins and its Pedersen
-/// binding delta folded in (a proved tx can't recompute its own).
-fn authorize_shielded_inputs(
+/// Sync the wallet's shielded coins and select whole coins covering each declared shielded input,
+/// returning a fee-sizeable funding plan: the selected spend plan bound to `segment`, plus the synced,
+/// merkle-ready coin tree. Shared by [`authorize_shielded_inputs`] (which really proves the spend) and
+/// [`mock_authorize`] (which mock-proves it for effect sizing), so both select the same coins.
+fn plan_shielded_input_funding(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     segment: u16,
     shielded_in: &[&DesiredInput],
-    base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
-) -> Result<(), std::io::Error> {
+) -> Result<crate::balance_tx::ShieldedFundingPlan, std::io::Error> {
     let deficits = shielded_input_deficits(shielded_in)?;
 
     let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
@@ -285,14 +488,31 @@ fn authorize_shielded_inputs(
         coins: selection.coins,
         change: selection.change_by_token,
     };
+    Ok(crate::balance_tx::ShieldedFundingPlan {
+        plans: vec![plan],
+        tree,
+    })
+}
+
+/// Authorize the maker's shielded inputs into the already-proved frame: select whole coins covering each
+/// token's declared amount (via [`plan_shielded_input_funding`]) and hand them to
+/// [`MidnightCryptoProvider::authorize_shielded`], which builds + proves the spend witnesses and the
+/// self-change, both in the guaranteed section (see [`GUARANTEED_SEGMENT`]). The proved fragment is merged
+/// into `base`'s guaranteed coins and its Pedersen binding delta folded in (a proved tx can't recompute
+/// its own).
+fn authorize_shielded_inputs(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    segment: u16,
+    shielded_in: &[&DesiredInput],
+    base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> Result<(), std::io::Error> {
+    let funding = plan_shielded_input_funding(chain_id, crypto_provider, segment, shielded_in)?;
 
     let prover = crate::balance_tx::midnight_prover(chain_id)?;
-    let authorized = crate::block_on(crypto_provider.authorize_shielded(
-        std::slice::from_ref(&plan),
-        &tree,
-        prover,
-    ))
-    .map_err(|e| err(e.to_string()))?;
+    let authorized =
+        crate::block_on(crypto_provider.authorize_shielded(&funding.plans, &funding.tree, prover))
+            .map_err(|e| err(e.to_string()))?;
 
     for (seg, proven_offer) in &authorized.proven {
         crate::balance_tx::place_shielded_fragment(base, *seg, proven_offer)?;
@@ -535,27 +755,100 @@ mod tests {
         assert_eq!(req.desired_inputs[0].kind, TransferKind::Unshielded);
         assert_eq!(req.desired_outputs.len(), 1);
         assert_eq!(req.intent_segment, DEFAULT_INTENT_SEGMENT);
+        assert_eq!(req.ttl, None);
     }
 
     #[test]
-    fn honours_intent_segment_and_ignores_legacy_options() {
-        // makeIntent no longer honours `options.payFees` (the maker never pays fees); a legacy request
-        // that still carries it must be accepted with the field ignored, not rejected.
+    fn honours_requested_ttl() {
+        let ttl = now_secs() + 30;
+        let req = parse_make_intent_json(&format!(
+            r#"{{"desiredInputs":[{{"kind":"unshielded","type":"night","value":1}}],"options":{{"ttl":{ttl}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(req.ttl, Some(Timestamp::from_secs(ttl)));
+    }
+
+    #[test]
+    fn rejects_ttl_at_or_before_now() {
+        // The ledger rejects an intent whose ttl is behind the block it lands in, and that block is never
+        // earlier than now — so an already-past ttl can only ever produce a dead offer.
+        let now = 1_000_000;
+        assert!(parse_intent_ttl(Some(now), now).is_err());
+        assert!(parse_intent_ttl(Some(now - 1), now).is_err());
+        assert!(parse_intent_ttl(Some(now + 1), now).is_ok());
+    }
+
+    #[test]
+    fn rejects_ttl_beyond_the_ledger_window() {
+        // `ttl > tblock + global_ttl` is IntentTtlTooFarInFuture; measured from now, the furthest expiry
+        // guaranteed to be accepted whenever the offer settles is now + global_ttl.
+        let now = 1_000_000;
+        let max = now + max_ttl_secs();
+        assert!(parse_intent_ttl(Some(max), now).is_ok());
+        assert!(parse_intent_ttl(Some(max + 1), now).is_err());
+    }
+
+    #[test]
+    fn omitted_ttl_leaves_the_wallet_default() {
+        // A spec-shaped request that names no ttl must behave exactly as before the option existed.
+        assert_eq!(parse_intent_ttl(None, now_secs()).unwrap(), None);
+        let default = default_intent_ttl().to_secs();
+        let now = now_secs();
+        assert!(default >= now + max_ttl_secs() && default <= now + max_ttl_secs() + 2);
+    }
+
+    #[test]
+    fn honours_intent_id_and_fee_free_pay_fees() {
         let req = parse_make_intent_json(
-            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":3,"options":{"payFees":false}}"#,
+            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":3,"payFees":false}}"#,
         )
         .unwrap();
         assert_eq!(req.intent_segment, 3);
     }
 
     #[test]
-    fn rejects_intent_segment_zero() {
+    fn draws_a_fallible_segment_for_random_intent_id() {
+        for _ in 0..32 {
+            let req = parse_make_intent_json(
+                r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":"random"}}"#,
+            )
+            .unwrap();
+            assert!(req.intent_segment >= 1);
+        }
+    }
+
+    #[test]
+    fn rejects_intent_id_zero_and_out_of_range() {
         // Segment 0 is the transaction's guaranteed section; the ledger rejects an intent declared
-        // there, so the parse must reject it up front instead of building a doomed offer.
+        // there, so the parse must reject it up front instead of building a doomed offer. Above the
+        // 16-bit segment space there is no segment to key at at all.
+        assert!(resolve_intent_segment(Some(IntentIdJson::Segment(0))).is_err());
+        assert!(resolve_intent_segment(Some(IntentIdJson::Segment(u16::MAX as u64 + 1))).is_err());
+        assert_eq!(
+            resolve_intent_segment(Some(IntentIdJson::Segment(u16::MAX as u64))).unwrap(),
+            u16::MAX
+        );
+        assert_eq!(
+            resolve_intent_segment(None).unwrap(),
+            DEFAULT_INTENT_SEGMENT
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_intent_id_keyword() {
+        assert!(resolve_intent_segment(Some(IntentIdJson::Keyword("any".into()))).is_err());
+    }
+
+    #[test]
+    fn rejects_pay_fees_true() {
+        // This wallet's maker offer is fee-free by construction, so the honest answer to a request that
+        // asks it to pay is an error, not an offer that quietly does something else.
         assert!(parse_make_intent_json(
-            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":0}"#
+            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":1,"payFees":true}}"#
         )
         .is_err());
+        assert!(check_pay_fees(Some(false)).is_ok());
+        assert!(check_pay_fees(None).is_ok());
     }
 
     #[test]

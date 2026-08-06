@@ -515,9 +515,9 @@ pub fn sign_transaction(
         );
     }
 
-    // Owner mode: passphrase-based signing
+    // Owner mode: passphrase-based signing — full authority, no policy gate.
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signable_tx = prepare_signable_tx(&chain, tx_bytes, &key)?;
+    let signable_tx = prepare_signable_tx(&chain, tx_bytes, &key, |_| Ok(()))?;
     let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
@@ -549,12 +549,15 @@ pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8
 /// Second, key-aware step of preparing a signable transaction. A no-op for every chain except
 /// Midnight, where the DApp Connector request carried through by `decode_tx_input` is parsed and
 /// balanced — using `key` to pull in the wallet's own inputs — into the transaction to sign. Every
-/// caller resolves the key first (the agent path only after policy evaluation). Not wired yet, so
-/// Midnight errors.
+/// caller resolves the key first (the agent path only after the first policy pass). `gate` is the
+/// second, effect-aware policy pass, run at the plan→authorize seam over the plan's per-segment
+/// wallet-relative effects, handed in as the `chain_extra` policy context; owner callers pass a gate
+/// that always allows.
 pub fn prepare_signable_tx(
     chain: &ows_core::Chain,
     tx_bytes: Vec<u8>,
     key: &SecretBytes,
+    gate: impl FnOnce(serde_json::Value) -> Result<(), OwsLibError>,
 ) -> Result<Vec<u8>, OwsLibError> {
     if chain.chain_type != ChainType::Midnight {
         return Ok(tx_bytes);
@@ -575,9 +578,27 @@ pub fn prepare_signable_tx(
     let plan = ows_midnight::plan_connector_tx(chain.chain_id, &crypto_provider, json)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
 
-    // ── POLICY SEAM ── TODO(policy): gate on `plan` here (the 2nd policy pass, over the plan's
-    // key-derived effects) before authorizing. `ConnectorPlan::authorize` builds and proves the
-    // wallet's shielded/dust spend witnesses (the bearer instruments) in the signer.
+    // ── POLICY SEAM ── the second, effect-aware policy pass. The plan is inert (no bearer instrument),
+    // so its per-segment wallet-relative effects can be derived and handed to `gate` — as the chain's
+    // `chain_extra` context — to veto here, before `authorize` builds and proves any spend witness. A
+    // denial returns and nothing is proved; owner callers pass a gate that always allows. Only Midnight
+    // reaches this: every other chain returned above, its effects already known at the first pass.
+    let segment_effects = plan
+        .segment_effects(chain.chain_id, &crypto_provider)
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+    // The two halves of the seam's view, kept disjoint: `segment_effects` is how much the *wallet*
+    // moves, `contracts` is *who* the transaction talks to and how much value each contract declares.
+    let contracts = plan
+        .contracts()
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+    let chain_extra = serde_json::json!({
+        "segment_effects": serde_json::to_value(&segment_effects)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+        "contracts": serde_json::to_value(&contracts)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+    });
+    gate(chain_extra)?;
+
     plan.authorize(chain.chain_id, &crypto_provider)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
 }
@@ -767,29 +788,42 @@ pub fn sign_and_send(
     // a no-op passthrough elsewhere) so the bytes handed to broadcast are the wallet's real transaction.
     let tx_bytes = decode_tx_input(&chain_info, tx_hex)?;
 
-    // Agent mode: enforce policies, decrypt key, authorize the balancing, then sign + broadcast.
+    // Agent mode: first policy pass + key decryption, then authorize the balancing behind the second
+    // (effect-aware) policy pass, then sign + broadcast.
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
+        let wallet_id = wallet_obj.id.clone();
         let signer = signer_for_chain(&chain_info);
-        let transaction = signer.make_transaction_context(&tx_bytes, rpc_url)?;
-        let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
+        let policy_tx = signer.make_transaction_context(&tx_bytes, rpc_url)?;
+        let (key, key_file) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
             key_file,
             wallet_obj,
             &chain_info,
-            Some(transaction),
+            Some(policy_tx.clone()),
             None,
             index,
             vault_path,
         )?;
-        let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key)?;
+        // Second, effect-aware policy pass at the plan→authorize seam: a denial drops the key unused,
+        // so a transaction the policy rejects is never proved.
+        let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key, |chain_extra| {
+            crate::key_ops::enforce_effect_policies(
+                &key_file,
+                &wallet_id,
+                &chain_info,
+                policy_tx,
+                chain_extra,
+                vault_path,
+            )
+        })?;
         return sign_encode_and_broadcast(key.expose(), chain, &signable_tx, rpc_url);
     }
 
-    // Owner mode
+    // Owner mode — full authority, no policy gate.
     let key = decrypt_signing_key(wallet, chain_info.chain_type, credential, index, vault_path)?;
-    let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key)?;
+    let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key, |_| Ok(()))?;
     sign_encode_and_broadcast(key.expose(), chain, &signable_tx, rpc_url)
 }
 

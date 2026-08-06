@@ -211,6 +211,9 @@ pub(super) fn complement_from_balance(
         desired_inputs,
         desired_outputs,
         intent_segment: first_disjoint_segment(maker_segments),
+        // The complement's own expiry never reaches the chain: the merge path rebuilds the taker's intent
+        // with a tip-aligned TTL. Only the maker's sealed TTL bounds when the merged tx can still land.
+        ttl: None,
     }
 }
 
@@ -257,6 +260,23 @@ pub(super) fn sealed_maker_complement(
         taker_unshielded_addr,
         taker_shielded_addr,
     ))
+}
+
+/// The contract actions a sealed maker offer carries. A merge preserves both halves' intents verbatim,
+/// so the maker's contract actions — the taker's complement adds none — are exactly what the submitted
+/// transaction performs, at the maker's own segments.
+pub(super) fn maker_contracts(
+    maker_bytes: &[u8],
+) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+    let mut r: &[u8] = maker_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut r)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+    let Transaction::Standard(base) = &tx else {
+        return Err(std::io::Error::other(
+            "balanceSealedTransaction expects a Standard maker transaction",
+        ));
+    };
+    Ok(crate::contracts::contract_interactions(base.actions()))
 }
 
 /// Authorize the sealed-maker merge: build the taker's complementary half from its own coins, fold in a
@@ -327,6 +347,85 @@ pub(super) fn authorize_merge(
     Ok(ows_signer::chains::wrap_merge_envelope(
         &taker_bytes,
         maker_bytes,
+    ))
+}
+
+/// The wallet-relative effects a sealed-maker MERGE will have — the taker's own half **plus** the merged
+/// DUST fee it funds — all in the transaction's guaranteed section (segment 0): the taker's coins settle
+/// guaranteed just like a plain makeIntent (see [`super::make_intent::GUARANTEED_SEGMENT`]), and the fee
+/// is a guaranteed cost. The token movement is request-derived from the taker's
+/// [complement](sealed_maker_complement), exactly as a plain makeIntent. On a live-DUST chain, when the
+/// taker pays fees, the fee covers the whole merged tx (the maker contributes bytes but never pays), so
+/// it is sized against a **mock-proven** taker complement — fixed-size proofs give the exact fee with no
+/// real proving — and folded in as a DUST outflow, so a `sum(|diff|)` cap at the policy seam sees the
+/// burn. Sizing needs the same tip + spendable-dust sync the real merge uses; the real, submittable spend
+/// is proved only post-seam in [`authorize_merge`], so a merge denied at the seam never reaches a real
+/// proof.
+pub(super) fn merge_segment_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    maker_bytes: &[u8],
+    complement: &MakeIntentRequest,
+    pay_fees: bool,
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+    let mut effects = super::make_intent::request_effects(chain_id, crypto_provider, complement)?;
+
+    let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
+    let adding_dust =
+        pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(&indexer_url));
+    if !adding_dust {
+        return Ok(crate::balance_tx::single_segment(
+            super::make_intent::GUARANTEED_SEGMENT,
+            effects,
+        ));
+    }
+
+    // Size the merged DUST fee against the taker's mock-proven complement — same coin selection as the
+    // real merge, fixed-size mock proofs, no real proving. The maker (sealed) is needed only to size the
+    // fee against the merged tx.
+    let taker_base = super::make_intent::mock_authorize(chain_id, crypto_provider, complement)?;
+    let taker_seg = complement.intent_segment;
+    let binding_commitment = taker_base
+        .intents
+        .get(&taker_seg)
+        .ok_or_else(|| std::io::Error::other("taker complement missing its intent segment"))?
+        .deref()
+        .binding_commitment;
+
+    let mut mr: &[u8] = maker_bytes;
+    let maker: TxSealed = tagged_deserialize(&mut mr)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+
+    let scope = SyncCacheScope {
+        chain_id: Some(chain_id.to_string()),
+        ..Default::default()
+    };
+    let (ledger_params, tip_secs) =
+        crate::block_on(crate::ledger_params::fetch_indexer_tip(&indexer_url))?;
+    let dust_ctime = Timestamp::from_secs(tip_secs);
+
+    // Discard the synced dust state — that is only needed to prove the real, submittable spend post-seam.
+    let (plan, _dust_state) = crate::balance_tx::size_merge_dust_fee(
+        &maker,
+        &taker_base,
+        taker_seg,
+        binding_commitment,
+        crypto_provider,
+        dust_ctime,
+        &ledger_params,
+        &indexer_url,
+        &scope,
+    )?;
+
+    let addresses = crypto_provider
+        .addresses(&MidnightNetwork::from_chain_id(chain_id))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if let Some(effect) = crate::balance_tx::dust_outflow_effect(addresses.dust, plan.fee_dust) {
+        effects.push(effect);
+    }
+    Ok(crate::balance_tx::single_segment(
+        super::make_intent::GUARANTEED_SEGMENT,
+        effects,
     ))
 }
 
@@ -501,6 +600,18 @@ mod merge_tests {
                 "token {token}: taker must negate the maker's imbalance"
             );
         }
+    }
+
+    #[test]
+    fn contracts_of_a_real_sealed_maker_are_read_from_its_intents() {
+        let hex_str = include_str!("testdata/sealed_maker_preprod.hex");
+        let hex_str = hex_str.trim();
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+
+        // The fixture is a plain token swap, so it names no contract — what matters here is that a
+        // sealed maker's actions are readable at all, i.e. the seam reports `contracts` for a merge
+        // instead of failing to parse the maker it already balances against.
+        assert_eq!(maker_contracts(&bytes).unwrap(), Vec::new());
     }
 }
 
