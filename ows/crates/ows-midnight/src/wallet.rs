@@ -25,6 +25,19 @@ pub fn resolve_indexer_url(chain_id: &str) -> Result<String, std::io::Error> {
         })
 }
 
+/// Resolve an optional Midnight proof-server URL for a CAIP-2 chain id.
+///
+/// Looks up `rpc["{chain_id}:prover"]` (e.g. `midnight:preview:prover`). Absent or blank means
+/// use the in-process local prover — there is no shipped default proof-server endpoint.
+pub fn resolve_midnight_prover_url(chain_id: &str) -> Option<String> {
+    let key = format!("{chain_id}:prover");
+    Config::load_or_default()
+        .rpc
+        .get(&key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Build a sync-cache scope co-located with the wallet's vault entry.
 ///
 /// The caller has already resolved the wallet id (it loaded the wallet to read
@@ -48,4 +61,17 @@ pub fn sum_utxos_by_token(utxos: &[UnshieldedUtxo]) -> BTreeMap<String, u128> {
         *totals.entry(u.token_type.clone()).or_insert(0) += u.value;
     }
     totals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prover_url_absent_by_default() {
+        // Built-in defaults never set `:prover` — local proving is the default.
+        assert!(resolve_midnight_prover_url("midnight:preview").is_none());
+        assert!(resolve_midnight_prover_url("midnight:mainnet").is_none());
+        assert!(resolve_midnight_prover_url("midnight:preprod").is_none());
+    }
 }
