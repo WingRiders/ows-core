@@ -229,6 +229,12 @@ fi
 # The artifact is a proven-unsealed (proof,embedded-fr) maker bound to one network; the CLI can't
 # produce one (makeIntent seals), so it's checked in per-network and selected above. The guard below
 # still skips if the selected artifact's network doesn't match this chain (e.g. an unshipped network).
+#
+# ⚠ The artifact is SINGLE-USE per network: it names the maker's real inputs, so once this flow has
+# actually SUBMITTED it, those inputs are spent and every later run is rejected by the node ("Invalid
+# Transaction") no matter what the taker does. Answer "no" to the submit prompt to exercise the path
+# without burning it; once burnt, the artifact has to be rebuilt from a funded maker before flow 5b
+# can submit again. Sealing-only (5a) has no such limit — makeIntent mints a fresh maker each run.
 if [ -f "$ARTIFACT" ]; then
   ART_NET="$(tr -d ' \n' < "$ARTIFACT" | xxd -r -p 2>/dev/null | strings 2>/dev/null | grep -ioE 'preview|preprod|mainnet|devnet' | head -1)"
   CHAIN_NET="${CHAIN##*:}"

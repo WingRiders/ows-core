@@ -111,6 +111,13 @@ $OWS sign tx --chain $CHAIN --wallet <taker-wallet> --json --tx '{
 > place. Either way the taker needs **dust** for fees; a freshly-funded wallet with only NIGHT and no dust
 > cannot be the taker.
 
+> **⚠ The checked-in proven makers are single-use per network.** `e2e/shielded-movement-cap/tx-proven*.hex`
+> name a real maker's real inputs, so the first run that actually **submits** one spends them; every later
+> submission of that same artifact is rejected by the node (`Invalid Transaction`) regardless of what the
+> taker contributes. Seal without submitting to rehearse the path, and rebuild the artifact from a funded
+> maker once it has been burnt. Only the *checked-in* makers have this limit — `makeIntent` (§2) mints a
+> fresh one every run, so the merge path (3a) is repeatable.
+
 > **Supported maker shapes (in-place balancing).** The in-place proven path — 3b and
 > `balanceUnsealedTransaction` (§4) — balances a maker that carries **no unshielded inputs of its own**.
 > The taker supplies *and signs* the balancing inputs and cannot sign an input belonging to the maker, so
