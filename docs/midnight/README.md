@@ -75,6 +75,33 @@ private key** (which carries no packed roles) is never mistakenly split into rol
 it simply yields no Midnight capability, so shielded/dust degrade to "unavailable" rather
 than erroring. See [mnemonic-derive.md](./mnemonic-derive.md) and [wallet.md](./wallet.md).
 
+### Intents and segments are not the same thing
+
+These two words are easy to blur, and several commands depend on the difference.
+
+An **intent** is *physical* structure: a transaction carries a map of them, keyed by a `u16`
+**intent id**. One intent bundles a guaranteed unshielded offer, a fallible unshielded offer,
+contract actions, and dust actions — the unit the wallet authorizes together, with one
+signature and one binding commitment.
+
+A **segment** is *logical* execution structure: the unit the ledger applies atomically.
+A transaction executes in segments, and there are two kinds:
+
+- **Segment 0, the guaranteed segment** — assembled **across every intent**: the guaranteed
+  half of *all* of them applies together, as one all-or-nothing unit. It is not any single
+  intent's segment, which is exactly why no intent may be keyed at id 0.
+- **A fallible segment** — one per intent that has a fallible half, allowed to fail on its
+  own without reverting segment 0. Its segment id **is** that intent's id.
+
+So the id `7` names *one intent* and *its fallible segment*, while that same intent's
+guaranteed half executes in segment 0 alongside every other intent's. The ledger keeps both
+coordinates on every event it emits — `logical_segment` (which segment executed it) and
+`physical_segment` (which intent contributed it).
+
+Two consequences run through the docs below: a value movement is reported per **segment**
+(what will execute together), while `makeIntent`'s `intentId` names an **intent** — and
+because that id doubles as the intent's fallible segment id, `0` is rejected.
+
 ### Network identity is a verbatim CAIP-2 reference
 
 A Midnight network is identified by the reference after `midnight:` — `mainnet`,

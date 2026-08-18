@@ -21,7 +21,7 @@ A Midnight `sign tx` on the agent path is gated **twice** (see [sign-tx.md](./si
    is no movement to see.
 2. **Second pass — executable policies**, over the transaction's *effects*. After the
    wallet plans the balancing, the plan's key-derived, wallet-relative effects are filled
-   in **per transaction segment** and **only the executable programs** are re-evaluated
+   in **per execution segment** and **only the executable programs** are re-evaluated
    (`evaluate_executable_policies`).
 
 The Midnight effects are handed to the program under **`transaction.chain_extra`**, not the
@@ -45,12 +45,13 @@ after planning.
 
 The policy JSON points `executable` at a program (any language) that reads the policy
 context on stdin and prints an `{allow, reason}` verdict. The effects are under
-`transaction.chain_extra.segment_effects`, one entry **per transaction segment** —
+`transaction.chain_extra.segment_effects`, one entry **per execution segment** —
 `{segment, effects:[{address, diff:[[token, delta], …]}]}`, each domain effect keyed by the
-wallet's own address. `segment == 0` is the guaranteed section (always executed); anything
-non-zero is a fallible section (executed in segment order, allowed to fail). A cap that treats
-all movement the same sums across every segment; one that only bounds what *will* execute can
-restrict itself to segment 0:
+wallet's own address. `segment == 0` is the guaranteed segment, always executed and pooled
+across every intent in the transaction; anything non-zero is one intent's fallible half,
+allowed to fail on its own (see
+[README.md](./README.md#intents-and-segments-are-not-the-same-thing)). A cap that treats all movement the same sums across every segment;
+one that only bounds what *will* execute can restrict itself to segment 0:
 
 ```python
 #!/usr/bin/env python3
@@ -63,10 +64,11 @@ print(json.dumps({"allow": total <= 1_000_000,
                   "reason": f"summed movement {total} (cap 1000000)"}))
 ```
 
-> **⚠ A fallible segment id is an identifier, not a sequence number.** It is whatever `u16`
-> the transaction's author picked for that intent — a real preprod transaction carries intents
-> at segments 2260 and 15441, not 1 and 2. Never assume small or contiguous ids: test
-> guaranteed-versus-fallible as `segment == 0` versus `segment != 0`.
+> **⚠ A fallible segment id is an identifier, not a sequence number.** It is the id of the
+> intent whose fallible half runs there, whatever `u16` that transaction's author picked — a
+> real preprod transaction carries intents at ids 2260 and 15441, not 1 and 2. Never assume
+> small or contiguous ids, and never read one as a position: test guaranteed-versus-fallible
+> as `segment == 0` versus `segment != 0`.
 
 Registered as a policy that `deny`s on failure:
 
@@ -98,9 +100,10 @@ performs, so a policy can gate on *who* as well as *how much*:
 ```
 
 - **`segment`** — the segment this action executes in, same convention as the effects: `0`
-  guaranteed, non-zero fallible. A call declaring both a guaranteed and a fallible transcript
-  appears **twice**, once per transcript, each at its own segment — so a record is read on
-  its own rather than by where it sits in the list.
+  guaranteed, non-zero fallible (the carrying intent's id). One call carried by one intent can
+  declare both a guaranteed and a fallible transcript, and then appears **twice** — once per
+  transcript, each at the segment that transcript runs in — so a record is read on its own
+  rather than by where it sits in the list. Entry count tracks transcripts, not intents.
 - **`kind`** — `call`, `deploy`, or `maintain`. Only a `call` names an `entry_point`; a
   deploy or a maintenance update declares no value movement, so its amounts are empty.
 - **`sent_to` / `received_from`** — per token, the value the contract's transcript declares

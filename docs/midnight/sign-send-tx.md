@@ -27,9 +27,10 @@ The request is routed by its JSON `method` field:
   compatibility) — the DApp hands over a proven, *unsealed* transaction with a deficit; the wallet
   balances it with its own inputs across all three value domains, then seals and submits.
 - **`makeTransfer`** — the wallet *builds* the outputs (a deficit), balances them with its own inputs,
-  and seals. The intent keys off a fallible segment; unshielded NIGHT movement rides that segment's
-  fallible offer (a multi-UTXO move would overrun the guaranteed section's tight `time_to_dismiss`
-  budget), while shielded outputs ride the guaranteed section.
+  and seals. The intent keys off a non-zero id; unshielded NIGHT movement rides that intent's
+  fallible offer, so it executes in the intent's own fallible segment (a multi-UTXO move would
+  overrun the guaranteed segment's tight `time_to_dismiss` budget), while shielded outputs ride
+  the guaranteed segment.
 - **`makeIntent`** — build an imbalanced *maker offer* (real inputs + declared wanted outputs), able
   to contribute shielded inputs with per-token whole-coin change returned to the maker's own keys.
 - **`balanceSealedTransaction`** — the *taker* completes a proven maker offer. The maker input may be
@@ -47,8 +48,8 @@ broadcasts, surfaced through a command that never submits.
 ## What it does
 
 1. **Parse** the connector request and classify the method.
-2. **Plan (inert).** Select the wallet's own inputs to cover the deficit — per intent segment,
-   across unshielded Night, shielded Zswap, and dust — **without** building any spend witness. The
+2. **Plan (inert).** Select the wallet's own inputs to cover the deficit — per intent, across
+   unshielded Night, shielded Zswap, and dust — **without** building any spend witness. The
    plan carries only public selection data; no bearer instrument exists yet. This is the point a
    policy pass can gate on the plan's key-derived effects (the `prepare_signable_tx` seam).
 3. **Authorize (past the seam).** Inside `ows-signer`, build and prove the shielded/dust spend
