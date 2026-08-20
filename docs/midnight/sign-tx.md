@@ -89,10 +89,11 @@ behavior. Each method has its own submodule under `ows-midnight/src/dapp_connect
 deficit), then balances it with its **own** inputs, proves, signs, and seals. Fees are
 paid in **dust**, never in the transferred token.
 
-- Unshielded outputs ride the guaranteed section of an intent keyed at a **fallible
-  segment (≥1)** — the ledger reserves segment 0 for the guaranteed section and rejects an
-  intent declared there (surfaced on-chain as `Custom error: 167`). The outputs still
-  execute unconditionally; only the *intent* is off segment 0.
+- Unshielded outputs ride the guaranteed offer of an intent keyed at a **non-zero intent
+  id** — id 0 names the guaranteed segment, which is built across every intent rather than
+  belonging to one, so the ledger rejects an intent declared there (surfaced on-chain as
+  `Custom error: 167`). The outputs still execute unconditionally, in segment 0 with every
+  other intent's guaranteed half; only the *intent's id* is non-zero.
 - Shielded outputs ride the guaranteed Zswap offer directly.
 - The outputs-only proven transaction reuses the same `plan_unsealed_proven_tx →
   authorize_proven_tx` tail as `balanceUnsealed` — one "diagonal" that every method funnels
@@ -107,11 +108,13 @@ Shielded *inputs* to a maker offer are supported — the wallet selects whole sh
 returns the excess as change to the maker, and the spend witnesses are built and proved in
 the signer.
 
-**`options.intentId`** — the segment the maker's intent keys at, per the spec: a number, or
+**`options.intentId`** — the id the maker's intent keys at, per the spec: a number, or
 `"random"` to let the wallet draw one (its suggested mode for swaps; a wide draw is what keeps
 two independently-built intents from colliding when the taker merges its own in). Omitted, it
-is segment 1. Segment 0 is rejected — that is the guaranteed section, where the ledger rejects
-an intent outright (`Custom error: 167`) — as is anything past the 16-bit segment space.
+is `1`. Id `0` is rejected — it names the guaranteed segment, which spans all intents rather
+than being any one intent's, so the ledger rejects an intent declared there (`Custom error:
+167`) — as is anything past the 16-bit id space. The id doubles as the segment id of this
+intent's fallible half, which is what a policy reading effects sees.
 
 **`options.payFees`** — `true` is **rejected** here, with an error saying so. A maker offer is
 imbalanced and fee-free by construction: the taker funds the DUST fee when it completes the
@@ -194,10 +197,14 @@ rotated through a fallible offer so change returns cleanly.
 ## The effect model (what the policy seam gates on)
 
 `ConnectorPlan::segment_effects` computes the transaction's **wallet-relative net
-movement**, grouped by the transaction segment each piece executes in — `0` guaranteed
-(applied unconditionally once the tx lands), non-zero fallible (may revert on its own).
-Within a segment it is one `TransactionEffect` per value domain that nets non-zero, keyed
-by the wallet's own address for that domain. How it is derived depends on the method:
+movement**, grouped by the **segment** each piece executes in — not by the intent that
+carried it. Segment `0` is the guaranteed one (applied unconditionally once the tx lands,
+pooling the guaranteed halves of every intent); a non-zero segment is one intent's fallible
+half, which may revert on its own, and its id is that intent's id. Within a segment it is one
+`TransactionEffect` per value domain that nets non-zero, keyed by the wallet's own address for
+that domain. (Intent versus segment is spelled out in
+[README.md](./README.md#intents-and-segments-are-not-the-same-thing).) How it is derived depends
+on the method:
 
 - **`balanceUnsealed` / `balanceSealed` / `makeTransfer`** → *plan-derived*, from an inert
   `BalancedPlan`: the wallet's inputs netted against its own change and outputs. This
@@ -218,7 +225,7 @@ by the wallet's own address for that domain. How it is derived depends on the me
 
 Shielded value a dapp routes back to the wallet is netted in as well: the base offers'
 outputs are trial-decrypted with the shielded viewing key and each recognized receipt is
-keyed by its own offer's segment. Without it the list would only carry the wallet's own
+keyed by the segment its offer executes in. Without it the list would only carry the wallet's own
 balancing contribution, over-stating outflow — a conservative cap bound rather than the
 wallet's true net. Recognizing a receipt needs no spend key.
 

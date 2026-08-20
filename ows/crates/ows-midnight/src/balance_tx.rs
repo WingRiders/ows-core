@@ -935,16 +935,23 @@ struct FallibleNightDeficit {
     outputs: Vec<UtxoOutput>,
 }
 
-/// Build the local [`Prover`](crate::Prover) for a chain's vault-rooted proving-key directory.
-/// Keyless: the prover holds proving/verifier keys, never a wallet secret. A fresh one is built per
-/// authorized section so their proving randomness is independent.
+/// Build a [`Prover`](crate::Prover) for authorize / prove paths.
+///
+/// When `rpc["{chain_id}:prover"]` is set, posts to that proof server; otherwise proves in-process
+/// with keys from the vault-rooted proving-key directory. Keyless either way: the prover holds
+/// proving/verifier keys (or talks to a server that does), never a wallet secret. A fresh one is
+/// built per authorized section so their proving randomness is independent.
 pub(crate) fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
     let scope = SyncCacheScope {
         chain_id: Some(chain_id.to_string()),
         ..Default::default()
     };
-    let dir = crate::cache_io::proving_keys_dir(&scope)
-        .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
+    let keys_dir = crate::cache_io::proving_keys_dir(&scope);
+    if let Some(url) = crate::wallet::resolve_midnight_prover_url(chain_id) {
+        return crate::Prover::remote(url, keys_dir);
+    }
+    let dir =
+        keys_dir.ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
     Ok(crate::Prover::new(dir))
 }
 
@@ -1227,7 +1234,7 @@ fn plan_unsealed_proven_standard_tx(
             .dust_public_key()
             .map_err(|e| err(e.to_string()))?;
         let night_vk = sender_vk.clone();
-        let dust = fee_sizing::size_dust_fee(&DustFeeContext {
+        fee_sizing::size_dust_fee(&DustFeeContext {
             stx: &stx_for_sizing,
             seg_id,
             intent_in: &intent_in,
@@ -1241,8 +1248,7 @@ fn plan_unsealed_proven_standard_tx(
             ledger_params: &ledger_params,
             indexer_url,
             scope,
-        })?;
-        (dust, chain_aligned_intent_ttl(dust_ctime))
+        })?
     } else {
         (DustFeePlan::None, intent_in.ttl)
     };
