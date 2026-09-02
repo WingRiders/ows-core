@@ -46,6 +46,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
+pub(crate) use fee_sizing::size_merge_dust_fee;
 use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
@@ -58,7 +59,7 @@ fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
 
-fn parse_intent_hash_hex(
+pub(crate) fn parse_intent_hash_hex(
     s: &str,
 ) -> Result<midnight_ledger::structure::IntentHash, std::io::Error> {
     use midnight_base_crypto::hash::HashOutput;
@@ -75,7 +76,7 @@ fn parse_intent_hash_hex(
 
 /// Resolve a UTXO owner field (32-byte hex x-only pubkey, or the sender's own address) to a
 /// verifying key.
-fn resolve_owner_vk(
+pub(crate) fn resolve_owner_vk(
     owner_field: &str,
     sender_bech32: &str,
     sender_vk: &VerifyingKey,
@@ -128,7 +129,7 @@ fn sender_utxos_sorted(
 }
 
 /// Pick just enough sender-owned UTXOs for `token_wire` to cover `need`.
-fn select_utxos_for_token(
+pub(crate) fn select_utxos_for_token(
     utxos: &[UnshieldedUtxo],
     sender_bech32: &str,
     sender_vk: &VerifyingKey,
@@ -203,7 +204,7 @@ fn tx_balance_imbalances(tx: &TxProven) -> Result<Vec<String>, std::io::Error> {
 /// `well_formed` verifies the guaranteed offer at a hardcoded segment 0 and each fallible offer at its
 /// map-key segment, and `balance()` attributes deltas the same way — so a seg-N>=1 fragment in the
 /// guaranteed offer would fail proof verification and leave the seg-N deficit uncovered.
-fn place_shielded_fragment(
+pub(crate) fn place_shielded_fragment(
     base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     segment: u16,
     proven: &ZswapOffer<ZswapProof, InMemoryDB>,
@@ -485,22 +486,57 @@ fn guaranteed_outputs_of(
         .unwrap_or_default()
 }
 
+/// Pick the intent the wallet folds its balancing offer + dust fee into, or synthesize a fresh empty
+/// skeleton when there is none to reuse.
+///
+/// Reuse the lowest-segment existing intent (re-emitting its own guaranteed outputs) unless a fresh
+/// skeleton is required — which happens in two cases:
+/// - the tx carries **no reusable intent** at all: a pure-shielded MIP-0005/0006 zswap offer lives
+///   entirely in `guaranteed_coins`/`fallible_coins` and has an **empty** `intents` map, so the taker's
+///   dust fee has nowhere to go without a new intent; or
+/// - the tx **already carries a dust section**: an intent holds only one dust section and the wallet's
+///   dust needs its own timestamp, so it rides a brand-new intent (spec §L961-967).
+///
+/// The fresh skeleton sits at a new segment with no outputs to re-emit — every existing intent keeps its
+/// own guaranteed offer, so their outputs stay put — and is binding-neutral.
+fn balancing_intent(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    chosen: Option<(
+        u16,
+        Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    )>,
+    adding_dust: bool,
+    has_preexisting_dust: bool,
+) -> (
+    u16,
+    Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    Vec<UtxoOutput>,
+) {
+    match chosen {
+        Some((seg_id, intent_in)) if !(adding_dust && has_preexisting_dust) => {
+            let outputs_in = guaranteed_outputs_of(&intent_in);
+            (seg_id, intent_in, outputs_in)
+        }
+        _ => (fresh_segment_id(base), empty_intent_skeleton(), Vec::new()),
+    }
+}
+
 /// The wallet's inert shielded funding plan for one intent segment: the coins to spend — chosen whole
 /// and largest-first to cover each per-token deficit — and the self-change to mint per token. Built
 /// from the synced coin set alone (viewing + nullifier detection), it carries **no** spend witness, so
 /// it is not a bearer instrument; the authorizing `spend()` happens later, in the signer's
 /// [`MidnightCryptoProvider::authorize_shielded`], after the policy seam.
 #[derive(Debug, Clone)]
-struct SegmentPlan {
-    coins: Vec<QualifiedInfo>,
-    change_by_token: Vec<(ShieldedTokenType, u128)>,
+pub(crate) struct SegmentPlan {
+    pub(crate) coins: Vec<QualifiedInfo>,
+    pub(crate) change_by_token: Vec<(ShieldedTokenType, u128)>,
 }
 
 /// Choose which of the wallet's coins to spend to cover each per-token `deficit` — whole coins,
 /// largest-first — and size the self-change (selected total − deficit) per token. Pure over the synced
 /// coin set: it neither spends nor proves, so it needs no spend key (only the viewing/nullifier
 /// detection that produced `coins`). Errors when a token's coins cannot cover its deficit.
-fn plan_shielded_inputs(
+pub(crate) fn plan_shielded_inputs(
     coins: &[QualifiedInfo],
     deficits: &[(ShieldedTokenType, u128)],
 ) -> Result<SegmentPlan, std::io::Error> {
@@ -653,7 +689,7 @@ struct FallibleNightDeficit {
 /// Build the local [`Prover`](crate::Prover) for a chain's vault-rooted proving-key directory.
 /// Keyless: the prover holds proving/verifier keys, never a wallet secret. A fresh one is built per
 /// authorized section so their proving randomness is independent.
-fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
+pub(crate) fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
     let scope = SyncCacheScope {
         chain_id: Some(chain_id.to_string()),
         ..Default::default()
@@ -668,6 +704,24 @@ fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
 /// offer, and size the DUST fee — all without real proving. The returned [`BalancedPlan`] carries no
 /// bearer instrument; the authorizing `spend()`/`prove()` happen later, in the signer, past the seam.
 #[allow(clippy::too_many_arguments)]
+/// Reject a transaction whose ledger network id does not match the chain we're signing for, so a
+/// mainnet tx can never be balanced/signed while pointed at a testnet (or an ad-hoc feature testnet
+/// at another). Matched case-insensitively: a Midnight tx body may carry a capitalized network name.
+fn ensure_tx_network_id_matches_chain(
+    chain_id: &str,
+    tx_network_id: &str,
+) -> Result<(), std::io::Error> {
+    let expected = MidnightNetwork::from_chain_id(chain_id);
+    let expected = expected.ledger_network_id();
+    if !tx_network_id.eq_ignore_ascii_case(expected) {
+        return Err(err(format!(
+            "transaction network id {tx_network_id:?} does not match chain {chain_id} \
+             (expected {expected:?})"
+        )));
+    }
+    Ok(())
+}
+
 fn plan_unsealed_proven_standard_tx(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
@@ -688,6 +742,10 @@ fn plan_unsealed_proven_standard_tx(
              is not a balancing target",
         ));
     };
+
+    if let Some(chain_id) = scope.chain_id.as_deref() {
+        ensure_tx_network_id_matches_chain(chain_id, &base.network_id)?;
+    }
 
     // Plan a shielded deficit (e.g. a contract deposit) against the wallet's own shielded coins — a
     // no-op when the tx has no shielded shortfall. Pure selection: no spend, no prove.
@@ -795,19 +853,11 @@ fn plan_unsealed_proven_standard_tx(
         }
     }
 
-    // Where the wallet folds its balancing inputs + dust. Normally it merges into an existing intent,
-    // re-emitting that intent's own guaranteed outputs. But when the tx already carries a dust section,
-    // the wallet's dust needs its own timestamp — an intent holds only one dust section — so it rides a
-    // brand-new intent at a fresh segment with an empty skeleton (no outputs to re-emit: every existing
-    // intent keeps its guaranteed offer, so its outputs stay put) per spec §L961-967.
-    let (seg_id, intent_in, outputs_in) = if adding_dust && has_preexisting_dust {
-        (fresh_segment_id(&base), empty_intent_skeleton(), Vec::new())
-    } else {
-        let (seg_id, intent_in) =
-            chosen.ok_or_else(|| err("expected at least one intent segment"))?;
-        let outputs_in = guaranteed_outputs_of(&intent_in);
-        (seg_id, intent_in, outputs_in)
-    };
+    // Where the wallet folds its balancing inputs + dust: an existing intent when there is one to reuse,
+    // else a fresh skeleton — a pure-shielded zswap offer (MIP-0005/0006) has empty intents, and a
+    // preexisting dust section blocks reuse (see `balancing_intent`).
+    let (seg_id, intent_in, outputs_in) =
+        balancing_intent(&base, chosen, adding_dust, has_preexisting_dust);
 
     // Fetch the wallet's UTXOs once; the guaranteed offer and each per-segment fallible offer draw
     // disjoint coins from this pool so no coin is spent twice.
@@ -1428,6 +1478,58 @@ mod tests {
         assert_eq!(s.actions.len(), 0);
     }
 
+    /// A pure-shielded tx (a MIP-0005/0006 `zswapoffer` wraps into a Standard tx with an **empty**
+    /// `intents` map) has no intent to fold the taker's dust fee into. The balancer must synthesize a
+    /// fresh binding-neutral skeleton at segment 1 rather than error "expected at least one intent
+    /// segment" — this is the fix for balancing a bare zswap offer.
+    #[test]
+    fn empty_intents_get_a_fresh_balancing_skeleton() {
+        let base = base_with_intents(vec![]);
+        let (seg_id, intent_in, outputs_in) = balancing_intent(&base, None, true, false);
+        assert_eq!(
+            seg_id, 1,
+            "first fresh segment, never the guaranteed section 0"
+        );
+        assert!(intent_in.guaranteed_unshielded_offer.is_none());
+        assert!(intent_in.dust_actions.is_none());
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(0),
+            "a synthesized skeleton is binding-neutral"
+        );
+        assert!(outputs_in.is_empty());
+    }
+
+    /// With a reusable intent and no preexisting dust, the wallet folds into that intent (keeping its
+    /// segment and re-emitting its outputs) instead of synthesizing a new one.
+    #[test]
+    fn balancing_intent_reuses_an_existing_intent() {
+        let base = base_with_intents(vec![(3, intent_with(None, None))]);
+        let (seg_id, intent_in, _outputs) =
+            balancing_intent(&base, Some((3, intent_with(None, None))), true, false);
+        assert_eq!(seg_id, 3, "reused, not a fresh segment");
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(7),
+            "the existing intent, not a fresh skeleton"
+        );
+    }
+
+    /// A preexisting dust section forces a fresh skeleton even when a reusable intent exists, because an
+    /// intent holds only one dust section and the wallet's dust needs its own timestamp.
+    #[test]
+    fn preexisting_dust_forces_a_fresh_skeleton() {
+        let base = base_with_intents(vec![(3, intent_with(None, None))]);
+        let (seg_id, intent_in, _outputs) =
+            balancing_intent(&base, Some((3, intent_with(None, None))), true, true);
+        assert_eq!(seg_id, 4, "fresh, one past the existing max segment (3)");
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(0),
+            "a fresh skeleton, not the existing intent"
+        );
+    }
+
     /// Merging into a dapp intent that already carries its own dust must not drop it when the wallet
     /// supplies no dust of its own; the wallet's dust wins when it does.
     #[test]
@@ -1783,5 +1885,20 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(g_sigs, 1, "guaranteed input must be signed");
         assert_eq!(f_sigs, 1, "fallible input must be signed");
+    }
+
+    #[test]
+    fn tx_network_id_must_match_chain() {
+        // Exact and case-insensitive matches pass; a custom feature testnet matches its reference.
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "preview").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "Preview").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:mainnet", "mainnet").is_ok());
+        assert!(ensure_tx_network_id_matches_chain("midnight:feature-x", "feature-x").is_ok());
+
+        // Mismatches are rejected — never balance a mainnet tx while pointed at a testnet, or a
+        // tx built for one custom net while signing for another.
+        assert!(ensure_tx_network_id_matches_chain("midnight:preview", "mainnet").is_err());
+        assert!(ensure_tx_network_id_matches_chain("midnight:mainnet", "preview").is_err());
+        assert!(ensure_tx_network_id_matches_chain("midnight:feature-x", "preview").is_err());
     }
 }
