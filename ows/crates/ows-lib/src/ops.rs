@@ -104,6 +104,21 @@ fn validate_ed25519_bip32_key(bytes: &[u8]) -> Result<(), OwsLibError> {
     Ok(())
 }
 
+/// The on-disk (encrypted) form of a `KeyPair`: one hex string per curve.
+///
+/// The hex sits in `Zeroizing` so that every plaintext copy the serializer
+/// produces or the parser hands back is wiped, including the ones dropped when
+/// deserialization fails on a later field.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeyPairJson {
+    secp256k1: Zeroizing<String>,
+    ed25519: Zeroizing<String>,
+    // defaults to empty for wallets imported before Ed25519-BIP32 support,
+    // which stored only the secp256k1 and ed25519 private keys
+    #[serde(default)]
+    ed25519_bip32: Zeroizing<String>,
+}
+
 /// A key pair: one key per curve.
 /// Private key material is zeroized on drop.
 struct KeyPair {
@@ -124,39 +139,44 @@ impl KeyPair {
 
     /// Serialize to JSON bytes for encryption.
     fn to_json_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let obj = serde_json::json!({
-            "secp256k1": hex::encode(&*self.secp256k1),
-            "ed25519": hex::encode(&*self.ed25519),
-            "ed25519_bip32": hex::encode(&*self.ed25519_bip32),
-        });
-        Zeroizing::new(obj.to_string().into_bytes())
+        let json = KeyPairJson {
+            secp256k1: Zeroizing::new(hex::encode(&*self.secp256k1)),
+            ed25519: Zeroizing::new(hex::encode(&*self.ed25519)),
+            ed25519_bip32: Zeroizing::new(hex::encode(&*self.ed25519_bip32)),
+        };
+
+        // Sized up front for the field names, punctuation and hex: growing the
+        // buffer mid-write would leave an unwiped partial copy of the keys in
+        // the old allocation. The assertion below keeps that true if the shape
+        // of KeyPairJson changes.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(
+            64 + json.secp256k1.len() + json.ed25519.len() + json.ed25519_bip32.len(),
+        ));
+        let capacity = bytes.capacity();
+        serde_json::to_writer(&mut *bytes, &json).expect("writing JSON to a Vec cannot fail");
+        debug_assert_eq!(
+            bytes.capacity(),
+            capacity,
+            "serialized key pair outgrew its buffer"
+        );
+        bytes
     }
 
     /// Deserialize from JSON bytes after decryption.
     fn from_json_bytes(bytes: &[u8]) -> Result<Self, OwsLibError> {
-        let s = String::from_utf8(bytes.to_vec())
-            .map_err(|_| OwsLibError::InvalidInput("invalid key pair data".into()))?;
-        let obj: serde_json::Value = serde_json::from_str(&s)?;
-        let secp = obj["secp256k1"]
-            .as_str()
-            .ok_or_else(|| OwsLibError::InvalidInput("missing secp256k1 key".into()))?;
-        let ed = obj["ed25519"]
-            .as_str()
-            .ok_or_else(|| OwsLibError::InvalidInput("missing ed25519 key".into()))?;
-        // using an empty string as the default value for backwards compatibility with wallets that were imported with only secp256k1 and ed25519 private keys
-        let ed_bip32 = obj["ed25519_bip32"].as_str().unwrap_or("");
+        let json: KeyPairJson = serde_json::from_slice(bytes)?;
 
         Ok(KeyPair {
             secp256k1: Zeroizing::new(
-                hex::decode(secp).map_err(|e| {
+                hex::decode(&*json.secp256k1).map_err(|e| {
                     OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}"))
                 })?,
             ),
             ed25519: Zeroizing::new(
-                hex::decode(ed)
+                hex::decode(&*json.ed25519)
                     .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
             ),
-            ed25519_bip32: Zeroizing::new(hex::decode(ed_bip32).map_err(|e| {
+            ed25519_bip32: Zeroizing::new(hex::decode(&*json.ed25519_bip32).map_err(|e| {
                 OwsLibError::InvalidInput(format!("invalid ed25519_bip32 hex: {e}"))
             })?),
         })
@@ -1608,6 +1628,43 @@ mod tests {
         let tx = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
         let sig = sign_transaction("pk-tx", "evm", tx, None, None, Some(dir.path())).unwrap();
         assert!(!sig.signature.is_empty());
+    }
+
+    #[test]
+    fn key_pair_json_round_trips() {
+        let keys = KeyPair {
+            secp256k1: Zeroizing::new(vec![0x11; 32]),
+            ed25519: Zeroizing::new(vec![0x22; 32]),
+            ed25519_bip32: Zeroizing::new(vec![0x33; 192]),
+        };
+
+        let bytes = keys.to_json_bytes();
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["secp256k1"].as_str().unwrap(), hex::encode([0x11; 32]));
+        assert_eq!(obj["ed25519"].as_str().unwrap(), hex::encode([0x22; 32]));
+        assert_eq!(
+            obj["ed25519_bip32"].as_str().unwrap(),
+            hex::encode([0x33; 192])
+        );
+
+        let parsed = KeyPair::from_json_bytes(&bytes).unwrap();
+        assert_eq!(&*parsed.secp256k1, &*keys.secp256k1);
+        assert_eq!(&*parsed.ed25519, &*keys.ed25519);
+        assert_eq!(&*parsed.ed25519_bip32, &*keys.ed25519_bip32);
+    }
+
+    #[test]
+    fn key_pair_json_accepts_payload_without_ed25519_bip32() {
+        let legacy = format!(
+            r#"{{"secp256k1":"{}","ed25519":"{}"}}"#,
+            hex::encode([0x11; 32]),
+            hex::encode([0x22; 32])
+        );
+
+        let parsed = KeyPair::from_json_bytes(legacy.as_bytes()).unwrap();
+        assert_eq!(&*parsed.secp256k1, &[0x11; 32]);
+        assert_eq!(&*parsed.ed25519, &[0x22; 32]);
+        assert!(parsed.ed25519_bip32.is_empty());
     }
 
     #[test]
