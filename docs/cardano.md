@@ -1003,6 +1003,53 @@ providers (e.g. Blockfrost).
   (`asset_list`, `asset_name`, token-registry `decimals`) are modelled as optional
   and default to empty/`0`, because their absence is a normal response shape rather
   than corrupt data.
+- **What the RPC provider learns.** Building the policy context is the first thing in
+  OWS that makes a network call from `ows-signer`, so it is worth being exact about
+  what leaves the machine. **The transaction being signed is never sent.**
+  `make_transaction_context` asks Koios for the CBOR of transactions that are
+  *already on chain*, by hash — the hashes the unsigned transaction's inputs and
+  collateral reference (`POST {rpc}/tx_cbor`). Signing itself is local; no key
+  material, and no part of the transaction under construction, is transmitted.
+  What the provider (and anything on the network path) can observe is the set of
+  source transaction hashes and the requester's IP, from which it can infer which
+  UTxOs the wallet is about to spend and correlate requests over time. Broadcast is
+  the separate step that does transmit the finished transaction
+  (`POST {rpc}/submittx`), as any submission path must. A deployment that treats
+  that inference as sensitive should point `rpc` config at a provider it operates
+  (see [§1.4](#14-rpc-configuration-koios-keyless)); the keyless Koios default
+  trades this for needing no account and storing no credential.
+- **Unmaintained transitive dependencies.** The two Emurgo crates bring in five
+  crates carrying RUSTSEC *unmaintained* advisories. Four come from
+  `cardano-serialization-lib`: `clear_on_drop`, and `rand_os` with `cloudabi` and
+  `fuchsia-cprng` under it. The fifth, `nodrop`, comes from
+  `emurgo-cardano-message-signing` instead, four levels down
+  (`pruefung` → `digest 0.6` → `generic-array 0.8` → `nodrop`); CSL does not depend
+  on `generic-array` at all. These are warn-level "no longer maintained" notices,
+  not known vulnerabilities, and OWS accepts them knowingly rather than silently,
+  since CSL is the only maintained Rust implementation of Cardano's wire formats.
+  None of the five is reachable from OWS:
+  - `rand_os`, and `cloudabi`/`fuchsia-cprng` under it, back CSL's *key generation*
+    (`Bip32PrivateKey::generate_ed25519_bip32`, `PrivateKey::generate_*`), which OWS
+    never calls — the signer only ever uses `Bip32PrivateKey::from_bytes`, and every
+    OWS key comes from `ed25519-bip32` and `rand` in `ows-signer` (see
+    [§2.2](#22-master-key-generation-icarus)). `cloudabi` and `fuchsia-cprng` are in
+    the lockfile but do not build on any target OWS ships: they are `rand_os`'s
+    per-OS backends for CloudABI and Fuchsia.
+  - `clear_on_drop` is declared by CSL but never referenced anywhere in its source,
+    so it is compiled and never runs. The consequence is worth stating plainly, since
+    it is the opposite of what the dependency name suggests: CSL does **not** zeroize
+    the `Bip32PrivateKey` it holds, so the copy `Bip32PrivateKey::from_bytes` makes of
+    the key material outlives its buffer. OWS zeroizes what it owns — the
+    `SecretBytes`/`Zeroizing` buffer it decodes from is wiped on drop (see
+    [§2.6](#26-multi-credential-key-storage)) — but it cannot reach inside CSL's copy.
+  - `nodrop` is a pre-1.0 `ManuallyDrop` polyfill under `generic-array 0.8`, which
+    `pruefung` needs for the FNV-32a checksum in `emurgo-cardano-message-signing`.
+    That checksum only serves `SignedMessage::{to,from}_user_facing_encoding` (the
+    `cms_…` string format); OWS signs through `COSESign1Builder` and never calls
+    either, so the code path is not reached.
+
+  The revisit trigger is a CSL or message-signing release that drops them, or a
+  maintained fork; that would be a dependency bump with no change to OWS code.
 
 ## Implementation
 
@@ -1069,7 +1116,9 @@ Dependencies added:
   (`ows/crates/ows-signer/Cargo.toml`).
 - `reqwest = "0.12"` (blocking, `json`, `rustls-tls`, no default features) — Koios
   `tx_cbor` HTTP client used to resolve transaction inputs for the policy context
-  (`ows/crates/ows-signer/Cargo.toml`).
+  (`ows/crates/ows-signer/Cargo.toml`). This is the first network dependency in
+  `ows-signer`, the crate that holds key material; what it does and does not send is
+  spelled out under "What the RPC provider learns" in Security considerations.
 - `mockito = "1"` (dev-dependency) — mocks the Koios endpoints in the
   `make_transaction_context` and balance tests
   (`ows/crates/ows-signer/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`).
