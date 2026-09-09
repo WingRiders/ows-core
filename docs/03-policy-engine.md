@@ -222,14 +222,15 @@ The base JSON object available to policy evaluation:
 
 ```json
 {
-  "chain_id": "eip155:8453",
+  "chain_id": "cip34:1-764824073",
   "wallet_id": "3198bc9c-6672-5ab3-d995-4942343ae5b6",
   "api_key_id": "7a2f1b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
   "transaction": {
-    "to": "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C",
-    "value": "100000000000000000",
-    "raw_hex": "0x02f8...",
-    "data": "0x"
+    "effects": [
+      { "address": "addr1qx2f...", "diff": [["lovelace", "-4200000"]] },
+      { "address": "addr1v9zk...", "diff": [["lovelace", "3000000"]] }
+    ],
+    "raw_hex": "84a400d9010281825820..."
   },
   "spending": {
     "daily_total": "50000000000000000",
@@ -244,11 +245,26 @@ The base JSON object available to policy evaluation:
 | `chain_id` | string | yes | CAIP-2 chain identifier |
 | `wallet_id` | string | yes | Wallet ID in scope for this request |
 | `api_key_id` | string | yes | The ID of the API key making this request |
-| `transaction` | object | no | Present for `sign_transaction`, `sign_message`, and `sign_hash` (the latter two surface their payload through `raw_hex`). Omitted for `sign_typed_data`, which exposes its payload via `typed_data.raw_json` instead. EVM tx flows include parsed `to`, `value`, and `data` when available. |
+| `transaction` | object | no | The signing payload. Present for `sign_transaction`, `sign_message`, and `sign_hash`; omitted for `sign_typed_data`, which exposes its payload via `typed_data.raw_json` instead. See below. |
 | `spending` | object | yes | Lightweight spending metadata currently exposed by the engine |
 | `timestamp` | string | yes | ISO 8601 timestamp of the signing request |
 
 For executable policies, the engine injects `policy_config` into the JSON payload when the policy file includes a `config` object.
+
+### `transaction` (optional)
+
+| Field | Type | Always Present | Description |
+|---|---|---|---|
+| `effects` | array | yes | Per-address asset movement the transaction causes. Empty on chains whose signer does not implement flow analysis. |
+| `effects[].address` | string | yes | The address whose balance changes |
+| `effects[].diff` | array | yes | `[asset, amount]` pairs. `amount` is a **signed decimal string** in the asset's smallest unit, so it has no upper bound — parse it with `int()` / `BigInt()`, never as a JSON number. The reserved asset id `"lovelace"` denotes ADA; a Cardano native asset is keyed by its hex policy id concatenated with its hex asset name. |
+| `raw_hex` | string | yes | The raw unsigned payload: the transaction bytes for `sign_transaction`, the message bytes for `sign_message`, the pre-image for `sign_hash` |
+| `chain_extra` | object | no | Chain-specific detail that `effects` cannot carry. Present only when a chain populates it; see the chain's own document (Cardano puts contingent collateral loss in `chain_extra.collateral_effects`). |
+| `data` | string | no | Reserved for calldata. Not populated by any chain in the reference implementation. |
+
+Only chains whose signer overrides `make_transaction_context` fill `effects`; today that is Cardano. Everywhere else — EVM included — `effects` is empty and `raw_hex` is the whole payload, so a policy that needs parsed transaction fields has to decode `raw_hex` itself.
+
+> **Earlier versions documented `transaction.to` and `transaction.value`.** Both fields existed on the struct but were never populated by any chain, on any code path, so a policy reading them always saw `null`. They are removed in favour of `effects`; nothing that worked has stopped working.
 
 ### `typed_data` (optional)
 
@@ -320,50 +336,71 @@ ows key create --name "claude-agent" --wallet agent-treasury --policy base-agent
 
 An API key can have multiple policies attached. All attached policies are evaluated — every policy must allow the transaction for it to proceed (AND semantics). Evaluation short-circuits on the first denial.
 
-## Example: Custom Simulation Policy
+## Example: Custom Spending Cap
+
+Per-transaction value caps are not a declarative rule, so a cap is an executable policy over `transaction.effects`.
 
 ```python
 #!/usr/bin/env python3
-"""Simulate transaction via eth_call before allowing."""
-import json, sys, urllib.request
+"""Cap the ADA one transaction may move out of the wallet's own addresses."""
+import json, sys
 
 ctx = json.load(sys.stdin)
-tx = ctx["transaction"]
-rpc = {"eip155:8453": "https://mainnet.base.org"}.get(ctx["chain_id"])
-if not rpc:
-    json.dump({"allow": False, "reason": f"No RPC for {ctx['chain_id']}"}, sys.stdout)
+config = ctx.get("policy_config") or {}
+owned = set(config.get("addresses", []))
+limit = int(config.get("max_lovelace_out", "0"))
+
+tx = ctx.get("transaction")
+if tx is None:
+    # No transaction context: this is a sign_typed_data request, which this policy
+    # has nothing to say about. Denying is the safe default for a spending cap.
+    json.dump({"allow": False, "reason": "no transaction context to evaluate"}, sys.stdout)
     sys.exit(0)
 
-payload = json.dumps({
-    "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-    "params": [{"to": tx["to"], "value": hex(int(tx["value"])), "data": tx["data"]}, "latest"]
-}).encode()
-try:
-    resp = json.load(urllib.request.urlopen(
-        urllib.request.Request(rpc, data=payload, headers={"Content-Type": "application/json"}), timeout=4))
-    if "error" in resp:
-        json.dump({"allow": False, "reason": f"Reverted: {resp['error']['message']}"}, sys.stdout)
-    else:
-        json.dump({"allow": True}, sys.stdout)
-except Exception as e:
-    json.dump({"allow": False, "reason": str(e)}, sys.stdout)
+def outflow(effects):
+    total = 0
+    for effect in effects:
+        if effect["address"] not in owned:
+            continue
+        for asset, amount in effect["diff"]:
+            # amount is a signed decimal string, not a number
+            if asset == "lovelace" and int(amount) < 0:
+                total -= int(amount)
+    return total
+
+spent = outflow(tx["effects"])
+# Collateral is consumed only if the transaction's scripts fail, and it never reduces
+# the change output, so effects does not account for it. Count it against the cap.
+at_risk = outflow((tx.get("chain_extra") or {}).get("collateral_effects", []))
+
+if spent + at_risk > limit:
+    json.dump({"allow": False,
+               "reason": f"{spent + at_risk} lovelace out, cap is {limit}"}, sys.stdout)
+else:
+    json.dump({"allow": True}, sys.stdout)
 ```
 
 The corresponding policy file:
 
 ```json
 {
-  "id": "simulate-tx",
-  "name": "EVM Transaction Simulation",
+  "id": "ada-spend-cap",
+  "name": "Max 5 ADA out per transaction",
   "version": 1,
   "created_at": "2026-03-22T10:00:00Z",
   "rules": [
-    { "type": "allowed_chains", "chain_ids": ["eip155:8453"] }
+    { "type": "allowed_chains", "chain_ids": ["cip34:1-764824073"] }
   ],
-  "executable": "/home/user/.ows/plugins/policies/simulate.py",
+  "executable": "/home/user/.ows/plugins/policies/ada-spend-cap.py",
+  "config": {
+    "addresses": ["addr1qx2f..."],
+    "max_lovelace_out": "5000000"
+  },
   "action": "deny"
 }
 ```
+
+On a chain whose signer does not fill `effects`, the same policy has to decode `transaction.raw_hex` itself before it can decide anything about value.
 
 ## References
 

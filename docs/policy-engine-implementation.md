@@ -66,13 +66,23 @@ All attached policies must allow (AND semantics):
 Use executables for spending limits, on-chain simulation, or external API calls.
 The executable receives PolicyContext JSON on stdin and must write PolicyResult to stdout.
 
-Minimal Python example:
+Minimal Python example — cap the ADA one transaction moves out of the wallet's own
+addresses:
 
     import json, sys
     ctx = json.load(sys.stdin)
-    value = int(ctx["transaction"].get("value", "0"))
-    limit = 10_000_000_000_000_000  # 0.01 ETH
-    if value > limit:
+    tx = ctx.get("transaction")
+    if tx is None:  # sign_typed_data: no transaction to cap
+        json.dump({"allow": False, "reason": "no transaction context"}, sys.stdout)
+        sys.exit(0)
+
+    owned = {"addr1qx2f..."}
+    limit = 5_000_000  # 5 ADA
+    out = -sum(int(amount)
+               for effect in tx["effects"] if effect["address"] in owned
+               for asset, amount in effect["diff"]
+               if asset == "lovelace" and int(amount) < 0)
+    if out > limit:
         json.dump({"allow": False, "reason": "Value exceeds limit"}, sys.stdout)
     else:
         json.dump({"allow": True}, sys.stdout)
@@ -81,10 +91,10 @@ Reference it in the policy file:
 
     {
       "id": "value-limit",
-      "name": "Max 0.01 ETH per transaction",
+      "name": "Max 5 ADA per transaction",
       "version": 1,
       "created_at": "2026-01-01T00:00:00Z",
-      "rules": [{ "type": "allowed_chains", "chain_ids": ["eip155:8453"] }],
+      "rules": [{ "type": "allowed_chains", "chain_ids": ["cip34:1-764824073"] }],
       "executable": "/home/user/.ows/plugins/policies/value-limit.py",
       "action": "deny"
     }
@@ -96,20 +106,25 @@ Reference it in the policy file:
 | chain_id | CAIP-2 chain ID (e.g. eip155:8453) |
 | wallet_id | Wallet UUID |
 | api_key_id | API key UUID |
-| transaction.to | Recipient address (EVM) |
-| transaction.value | Value in wei as string |
-| transaction.data | Calldata hex |
-| transaction.raw_hex | Raw unsigned transaction hex |
+| transaction | Absent for sign_typed_data; see 03-policy-engine.md |
+| transaction.effects | Per-address asset movement; empty unless the chain's signer implements flow analysis (Cardano today) |
+| transaction.effects[].diff | [asset, amount] pairs; amount is a signed decimal string in the smallest unit |
+| transaction.chain_extra | Chain-specific detail effects cannot carry; present only when a chain fills it |
+| transaction.raw_hex | Raw unsigned payload hex |
 | spending.daily_total | Cumulative value signed today (wei) |
 | timestamp | ISO-8601 signing request time |
+
+`transaction.to` and `transaction.value` were documented here previously. Neither was
+ever populated by any chain, so a policy reading them always saw `null`; `effects`
+replaces them.
 
 ## 6. Testing Policies
 
 Test executable policies without real signing:
 
-    echo '{"chain_id": "eip155:8453", "wallet_id": "test", "api_key_id": "test",
-      "transaction": {"to": "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C",
-        "value": "5000000000000000", "raw_hex": "0x", "data": "0x"},
+    echo '{"chain_id": "cip34:1-764824073", "wallet_id": "test", "api_key_id": "test",
+      "transaction": {"raw_hex": "84a4",
+        "effects": [{"address": "addr1qx2f...", "diff": [["lovelace", "-6000000"]]}]},
       "spending": {"daily_total": "0", "date": "2026-01-01"},
       "timestamp": "2026-01-01T00:00:00Z"}' | python3 value-limit.py
 
