@@ -133,9 +133,10 @@ drove a specific design decision later in this document:
    one.
 2. **Master key from entropy, not seed.** Most chains derive from the BIP-39
    *seed* (PBKDF2 over the mnemonic phrase). Cardano's Icarus scheme derives the
-   root key from the raw BIP-39 **entropy** (PBKDF2-HMAC-SHA512, empty password,
-   entropy as salt, 4096 iterations). Reusing the seed would yield addresses no
-   other Cardano wallet could reproduce.
+   root key from the raw BIP-39 **entropy** (PBKDF2-HMAC-SHA512, entropy as salt,
+   4096 iterations, and a password slot that OWS leaves empty — see
+   [§2.2](#22-master-key-generation-icarus)). Reusing the seed would yield
+   addresses no Icarus-scheme wallet could reproduce.
 3. **Two credentials per address.** A Shelley **base** address combines a payment
    credential (CIP-1852 `role = 0`) and a stake credential (`role = 2`), each at
    its own derivation path. OWS's "one path → one address" assumption does not
@@ -254,11 +255,17 @@ BIP-39 seed. Instead it follows the Cardano Icarus scheme
 1. Extract the raw BIP-39 **entropy** (checksum bits excluded) from the mnemonic.
    `Mnemonic::entropy()` was added for this purpose.
 2. `PBKDF2-HMAC-SHA512` with an **empty password**, the entropy as the **salt**,
-   `4096` iterations, producing a 96-byte output. The password slot is left empty
-   on purpose: Cardano software wallets (Eternl, Yoroi, …) pass no
-   spending password into this step, so filling it — for example with the BIP-39
-   passphrase — would derive a different root key and produce addresses no other
-   Cardano wallet could reproduce from the same mnemonic.
+   `4096` iterations, producing a 96-byte output. CIP-3 specifies the step as
+   `generateMasterKey(seed, password)` and publishes vectors for the same recovery
+   phrase both with no passphrase and with the passphrase `foo`, so the empty slot
+   is a choice rather than something the spec requires. OWS has nothing to put
+   there: it never accepts a BIP-39 passphrase (the `passphrase` it exposes is the
+   vault's encryption passphrase), and every derivation call site passes `""`. The
+   empty-password form is the one the published CIP-3 vector in the tests uses and
+   the one a wallet holding only the mnemonic reproduces. A non-empty password
+   derives a different root key and therefore a different set of addresses, so
+   supporting one would mean adding a parameter here and surfacing it as an
+   explicit choice — not changing this step.
 3. Normalize the result with `XPrv::normalize_bytes_force3rd` to obtain a valid
    master extended private key.
 
@@ -936,10 +943,14 @@ providers (e.g. Blockfrost).
   shape- and clamping-checked at import (see
   [§2.6](#26-multi-credential-key-storage)), so an unusable key surfaces at import
   time rather than as an opaque failure on first use.
-- **Icarus master key.** Uses the standard PBKDF2-HMAC-SHA512 (4096 iterations,
-  empty password, entropy as salt) and `normalize_bytes_force3rd`, matching
-  ecosystem wallets; deviating would produce incompatible (and potentially
-  unrecoverable-by-other-wallets) addresses.
+- **Icarus master key.** Uses PBKDF2-HMAC-SHA512 (4096 iterations, entropy as
+  salt) with an empty password, and `normalize_bytes_force3rd`. CIP-3 permits a
+  non-empty password and publishes a vector for one; OWS has no BIP-39 passphrase
+  to supply, so it uses the empty form — the one the published vector in the tests
+  pins, and the one a wallet holding only the mnemonic can reproduce. Any other
+  password, or deriving from the BIP-39 seed instead of the entropy, yields a
+  different root key and a different set of addresses, so it would have to be an
+  explicit and visible choice rather than a silent one.
 - **Non-hardened derivation.** BIP32-Ed25519 V2 permits non-hardened child keys.
   This is required for Cardano interoperability, but callers should remain aware
   that a non-hardened branch's xpub + a single child xprv can expose sibling keys;

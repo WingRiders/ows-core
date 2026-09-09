@@ -275,7 +275,11 @@ impl HdDeriver {
         entropy: &[u8],
     ) -> Zeroizing<[u8; ed25519_bip32::XPRV_SIZE]> {
         let mut out = Zeroizing::new([0u8; ed25519_bip32::XPRV_SIZE]);
-        // password slot stays empty on purpose to keep compatibility with Cardano software wallets
+        // CIP-3 defines this as PBKDF2 over (password, entropy) and publishes vectors for both an
+        // empty password and a non-empty one, so the empty slot is a choice, not a requirement.
+        // OWS has no BIP-39 passphrase to put there — the passphrase it exposes is the vault's
+        // encryption passphrase — and the empty-password form is what the published vector in the
+        // tests pins. Accepting one later adds a parameter here rather than changing this call.
         pbkdf2::pbkdf2_hmac::<sha2::Sha512>("".as_bytes(), entropy, 4096, out.as_mut());
         Zeroizing::new(ed25519_bip32::XPrv::normalize_bytes_force3rd(*out).into())
     }
