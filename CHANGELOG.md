@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Cardano support across mainnet, preprod and preview (`cip34:` CAIP-2 namespace):
+  Ed25519-BIP32 curve with CIP-3 Icarus master-key derivation, CIP-1852 payment and
+  stake paths, Shelley base/enterprise/reward addresses, CIP-8 COSE message signing,
+  CBOR transaction signing and submission, and ADA/native-asset balance queries via
+  Koios
+- `PolicyContext.request_type` names the operation being authorized
+  (`sign_transaction`, `sign_message`, `sign_hash`, `sign_typed_data`)
+- `TransactionContext.effects`: per-address, per-asset movement a transaction causes,
+  populated by chains whose signer implements flow analysis (Cardano today)
+- `TransactionContext.chain_extra`: opaque per-chain JSON for detail `effects` cannot
+  carry. Cardano reports contingent collateral loss in `chain_extra.collateral_effects`
+- `ChainSigner`: `make_transaction_context`, `default_derivation_paths`, `encode_keys`,
+  `verify_sign_message_address` and `transaction_context_needs_rpc`, all defaulted
+- Optional `address` argument on `sign_message` / `sign_typed_data`, which refuses to
+  sign for an address the key does not derive (`AddressMismatch`)
+
+### Breaking
+
+These are contract changes and warrant a major version; the number itself is set by
+the release tag (`.github/workflows/version-bump.yml`).
+
+Policy contract, as executable policies see it on stdin:
+
+- `PolicyContext.transaction` is now **optional** and is omitted for `sign_typed_data`,
+  which previously carried a `TransactionContext` with `raw_hex: ""`. **A policy that
+  detected typed data by that empty string can fail open**: written as
+  `tx = payload.get("transaction") or {}`, the `raw_hex == ""` test becomes false, so a
+  policy that denied typed data signing now allows it, with no error and no log entry.
+  Branch on `request_type == "sign_typed_data"` instead. See `docs/03-policy-engine.md`
+  for the failure direction of each policy style. Rust consumers break at compile time.
+- `TransactionContext.to` and `.value` are removed in favour of `effects`. Neither was
+  ever populated by any chain, so a policy reading them always saw `null`.
+- `TransactionEffect.diff` amounts are signed decimal **strings**, not integers: wei
+  overflows an `i64` above ~9.22 ETH, and a JSON integer above 2^53 does not survive
+  `JSON.parse`. Parse with `int()` / `BigInt()`.
+
+Rust API:
+
+- `ChainSigner::sign_message` gains an `address: Option<&str>` parameter
+- `ows_pay::fund::get_balances` gains an `rpc_url` parameter (required for Cardano)
+- `BalanceInfo.value` and `.price` are `Option<f64>`, absent on chains without pricing
+- `enforce_policy_and_decrypt_key` is split into `load_authorized_wallet` and
+  `enforce_policies_and_decrypt_key`
+
+Node and Python SDKs — arity changes only. Every new parameter is at the **end** of
+the list, so existing positional calls are unaffected:
+
+- `sign_message(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?, address?)`
+- `sign_typed_data(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?, address?)`
+- `import_wallet_private_key(…, secp256k1Key?, ed25519Key?, ed25519Bip32Key?)`
+
 ## [0.2.18] - 2026-03-09
 
 ### Fixed
