@@ -805,17 +805,18 @@ impl ChainSigner for CardanoSigner {
                 asset_ids.insert(k);
             }
 
-            let mut diff: Vec<(String, i64)> = Vec::new();
+            let mut diff: Vec<(String, String)> = Vec::new();
             for asset_id in asset_ids {
                 let input_balance = *input_balances.get(asset_id).unwrap_or(&0);
                 let output_balance = *output_balances.get(asset_id).unwrap_or(&0);
 
-                let asset_diff = (output_balance as i64) - (input_balance as i64);
+                // i128 keeps the subtraction exact: a native-asset quantity can reach u64::MAX
+                let asset_diff = i128::from(output_balance) - i128::from(input_balance);
                 if asset_diff == 0 {
                     continue;
                 }
 
-                diff.push((asset_id.clone(), asset_diff));
+                diff.push((asset_id.clone(), asset_diff.to_string()));
             }
 
             if diff.is_empty() {
@@ -1350,7 +1351,7 @@ mod tests {
             ctx.effects,
             vec![TransactionEffect {
                 address,
-                diff: vec![("lovelace".into(), -(TX_FEE as i64))],
+                diff: vec![("lovelace".into(), format!("-{TX_FEE}"))],
             }]
         );
     }
@@ -1397,11 +1398,11 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: my_address,
-                    diff: vec![("lovelace".into(), -4_000_000)],
+                    diff: vec![("lovelace".into(), "-4000000".into())],
                 },
                 TransactionEffect {
                     address: external_address,
-                    diff: vec![("lovelace".into(), 3_000_000)],
+                    diff: vec![("lovelace".into(), "3000000".into())],
                 },
             ]
         );
@@ -1461,11 +1462,17 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: my_address,
-                    diff: vec![(asset_id.clone(), -30), ("lovelace".into(), -4_000_000)],
+                    diff: vec![
+                        (asset_id.clone(), "-30".into()),
+                        ("lovelace".into(), "-4000000".into())
+                    ],
                 },
                 TransactionEffect {
                     address: external_address,
-                    diff: vec![(asset_id, 30), ("lovelace".into(), 3_000_000)],
+                    diff: vec![
+                        (asset_id, "30".into()),
+                        ("lovelace".into(), "3000000".into())
+                    ],
                 },
             ]
         );
@@ -1524,11 +1531,11 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: address_a,
-                    diff: vec![("lovelace".into(), -3_000_000)],
+                    diff: vec![("lovelace".into(), "-3000000".into())],
                 },
                 TransactionEffect {
                     address: address_b,
-                    diff: vec![("lovelace".into(), 2_000_000)],
+                    diff: vec![("lovelace".into(), "2000000".into())],
                 },
             ]
         );
@@ -1589,15 +1596,15 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: address_a,
-                    diff: vec![("lovelace".into(), -4_000_000)],
+                    diff: vec![("lovelace".into(), "-4000000".into())],
                 },
                 TransactionEffect {
                     address: address_b,
-                    diff: vec![("lovelace".into(), -7_000_000)],
+                    diff: vec![("lovelace".into(), "-7000000".into())],
                 },
                 TransactionEffect {
                     address: address_c,
-                    diff: vec![("lovelace".into(), 10_000_000)],
+                    diff: vec![("lovelace".into(), "10000000".into())],
                 },
             ]
         );
@@ -1648,11 +1655,11 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: payment_address,
-                    diff: vec![("lovelace".into(), (withdrawal - TX_FEE) as i64)],
+                    diff: vec![("lovelace".into(), (withdrawal - TX_FEE).to_string())],
                 },
                 TransactionEffect {
                     address: reward_address_bech32,
-                    diff: vec![("lovelace".into(), -(withdrawal as i64))],
+                    diff: vec![("lovelace".into(), format!("-{withdrawal}"))],
                 },
             ]
         );
@@ -1704,12 +1711,12 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: payment_address,
-                    diff: vec![("lovelace".into(), -((deposit + TX_FEE) as i64))],
+                    diff: vec![("lovelace".into(), format!("-{}", deposit + TX_FEE))],
                 },
                 TransactionEffect {
                     // Deposit is locked under the stake credential.
                     address: reward_address_bech32,
-                    diff: vec![("lovelace".into(), deposit as i64)],
+                    diff: vec![("lovelace".into(), deposit.to_string())],
                 },
             ]
         );
@@ -1761,12 +1768,12 @@ mod tests {
             vec![
                 TransactionEffect {
                     address: payment_address,
-                    diff: vec![("lovelace".into(), (refund - TX_FEE) as i64)],
+                    diff: vec![("lovelace".into(), (refund - TX_FEE).to_string())],
                 },
                 TransactionEffect {
                     // Locked deposit is released from the stake credential.
                     address: reward_address_bech32,
-                    diff: vec![("lovelace".into(), -(refund as i64))],
+                    diff: vec![("lovelace".into(), format!("-{refund}"))],
                 },
             ]
         );

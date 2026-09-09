@@ -241,7 +241,7 @@ mod tests {
             transaction: Some(TransactionContext {
                 effects: vec![TransactionEffect {
                     address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
-                    diff: vec![("ETH".into(), 100000000000000000)], // 0.1 ETH
+                    diff: vec![("ETH".into(), "100000000000000000".into())], // 0.1 ETH
                 }],
                 raw_hex: "0x02f8...".to_string(),
                 data: None,

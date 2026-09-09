@@ -533,7 +533,7 @@ deltas:
 ```rust
 pub struct TransactionEffect {
     pub address: String,
-    pub diff: Vec<(String, i64)>, // (asset_id, signed change)
+    pub diff: Vec<(String, String)>, // (asset_id, signed decimal change)
 }
 
 pub struct TransactionContext {
@@ -623,7 +623,8 @@ The signer builds two `address → (asset_id → amount)` maps and diffs them:
   same token nets out across inputs and outputs.
 
 For every address touched by either side, and every asset id it involves, the
-effect is `output_balance − input_balance` as a signed `i64`. Zero-diff assets and
+effect is `output_balance − input_balance`, computed in `i128` and rendered as a
+signed decimal string (see [§4.4](#44-why-amounts-are-strings)). Zero-diff assets and
 zero-diff addresses are dropped; the remaining `diff` entries are sorted by asset
 id and the `effects` list is sorted by address, so the context is deterministic
 (important for reproducible policy decisions and stable test vectors). A pure
@@ -633,6 +634,21 @@ negative fee.
 The result is returned as `TransactionContext { effects, raw_hex, data: None }` and
 handed to the policy engine, which passes it (as part of `PolicyContext`) to
 built-in rules and to executable policies over stdin.
+
+#### 4.4 Why amounts are strings
+
+`TransactionEffect.diff` carries each amount as a signed decimal **string**, not an
+integer. `TransactionEffect` lives in `ows-core` and is shared by every chain, so
+the type has to hold the widest smallest-unit any chain uses: lovelace fits an
+`i64` with room to spare, but wei overflows one above roughly 9.22 ETH, and a JSON
+integer above 2^53 does not survive `JSON.parse` in a policy written in
+JavaScript. A string has no ceiling in either place, and it matches the
+`String`-typed amounts already in the context (`spending.daily_total`, and the
+`value` field this replaced).
+
+Consumers parse it themselves: `int(...)` in Python, `BigInt(...)` in JavaScript.
+The subtraction that produces it runs in `i128`, so a native-asset quantity at the
+top of `u64` cannot wrap on the way out.
 
 ### 5. Address balance fetching
 

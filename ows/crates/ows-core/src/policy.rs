@@ -61,7 +61,11 @@ pub struct PolicyContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransactionEffect {
     pub address: String,
-    pub diff: Vec<(String, i64)>, // (asset, diff)
+    /// Per-asset balance change for `address`, as `(asset, signed decimal amount)`
+    /// in the asset's smallest unit. The amount is a string because it has no
+    /// domain ceiling — wei exceeds `i64` above ~9.22 ETH, and a JSON number
+    /// above 2^53 does not survive a policy written in JavaScript.
+    pub diff: Vec<(String, String)>,
 }
 
 /// Signing-request fields available for policy evaluation.
@@ -217,7 +221,7 @@ mod tests {
             transaction: Some(TransactionContext {
                 effects: vec![TransactionEffect {
                     address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
-                    diff: vec![("ETH".into(), 100000000000000000)],
+                    diff: vec![("ETH".into(), "100000000000000000".into())],
                 }],
                 raw_hex: "0x02f8...".into(),
                 data: None,
@@ -237,7 +241,7 @@ mod tests {
             deserialized.transaction.unwrap().effects.first().unwrap(),
             &TransactionEffect {
                 address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
-                diff: vec![("ETH".into(), 100000000000000000)],
+                diff: vec![("ETH".into(), "100000000000000000".into())],
             }
         );
         // data was None, should be absent from serialized form
