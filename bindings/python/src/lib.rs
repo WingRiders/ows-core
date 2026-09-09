@@ -178,7 +178,7 @@ fn sign_transaction(
 
 /// Sign a message.
 #[pyfunction]
-#[pyo3(signature = (wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path_opt=None))]
+#[pyo3(signature = (wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path_opt=None, address=None))]
 fn sign_message(
     wallet: &str,
     chain: &str,
@@ -186,8 +186,8 @@ fn sign_message(
     passphrase: Option<&str>,
     encoding: Option<&str>,
     index: Option<u32>,
-    address: Option<&str>,
     vault_path_opt: Option<String>,
+    address: Option<&str>,
 ) -> PyResult<PyObject> {
     let result = ows_lib::sign_message(
         wallet,
@@ -211,15 +211,15 @@ fn sign_message(
 
 /// Sign EIP-712 typed structured data (EVM only).
 #[pyfunction]
-#[pyo3(signature = (wallet, chain, typed_data_json, passphrase=None, index=None, address=None, vault_path_opt=None))]
+#[pyo3(signature = (wallet, chain, typed_data_json, passphrase=None, index=None, vault_path_opt=None, address=None))]
 fn sign_typed_data(
     wallet: &str,
     chain: &str,
     typed_data_json: &str,
     passphrase: Option<&str>,
     index: Option<u32>,
-    address: Option<&str>,
     vault_path_opt: Option<String>,
+    address: Option<&str>,
 ) -> PyResult<PyObject> {
     let result = ows_lib::sign_typed_data(
         wallet,

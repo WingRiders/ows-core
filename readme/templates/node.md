@@ -57,8 +57,8 @@ ows sign tx --wallet agent-treasury --chain evm --tx "deadbeef..."
 | `deleteWallet(nameOrId, vaultPath?)` | Delete a wallet |
 | `exportWallet(nameOrId, passphrase?, vaultPath?)` | Export a wallet's mnemonic or keys |
 | `renameWallet(nameOrId, newName, vaultPath?)` | Rename a wallet |
-| `signMessage(wallet, chain, message, passphrase?, encoding?, index?, address?, vaultPath?)` | Sign a message with chain-specific formatting |
-| `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, address?, vaultPath?)` | Sign EIP-712 typed data (EVM only) |
+| `signMessage(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?, address?)` | Sign a message with chain-specific formatting |
+| `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?, address?)` | Sign EIP-712 typed data (EVM only) |
 | `signTransaction(wallet, chain, txHex, passphrase?, index?, vaultPath?)` | Sign a raw transaction |
 | `signAndSend(wallet, chain, txHex, passphrase?, index?, rpcUrl?, vaultPath?)` | Sign and broadcast a transaction |
 | `generateMnemonic(words?)` | Generate a BIP-39 mnemonic phrase |

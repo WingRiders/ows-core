@@ -212,7 +212,7 @@ print(len(wallet["accounts"]))  # => 15
 
 ### Signing
 
-#### `sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path=None)`
+#### `sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path=None, address=None)`
 
 Sign a message with chain-specific formatting.
 
@@ -253,7 +253,7 @@ print(result["signature"])
 print(result["recovery_id"])  # 0 or 1
 ```
 
-#### `sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, address=None, vault_path=None)`
+#### `sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, vault_path=None, address=None)`
 
 Sign EIP-712 typed structured data (EVM only).
 

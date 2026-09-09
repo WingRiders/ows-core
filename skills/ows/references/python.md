@@ -96,7 +96,7 @@ from open_wallet_standard import sign_message, sign_transaction, sign_and_send
 sig = sign_message("my-wallet", "evm", "hello world")
 # sig["signature"] => hex string
 # sig["recovery_id"] => 0 or 1 (EVM/Tron only)
-# sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path=None)
+# sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path=None, address=None)
 
 # Sign transaction
 tx_sig = sign_transaction("my-wallet", "evm", "02f8...")
@@ -116,7 +116,7 @@ from open_wallet_standard import sign_typed_data
 sig = sign_typed_data("my-wallet", "evm", '{"types":...}')
 # sig["signature"] => hex string
 # sig["recovery_id"] => 0 or 1
-# sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, vault_path=None)
+# sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, vault_path=None, address=None)
 ```
 
 ## Policy Management
