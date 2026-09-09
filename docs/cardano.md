@@ -109,10 +109,13 @@ Cardano introduces two additional, Cardano-specific dependencies:
   a full chain SDK into the key path.
 - **`cardano-serialization-lib` (CSL, 14.1.1)** — the canonical Cardano library
   for network parameters (`NetworkInfo`), address construction
-  (`BaseAddress`/`EnterpriseAddress`/`RewardAddress`, `Credential`), extended-key
-  helpers (`Bip32PrivateKey`), and CBOR transaction (de)serialization
-  (`FixedTransaction`, `make_vkey_witness`, `Vkeywitness`). It is used for network
-  parameters, Shelley address encoding, and transaction signing/witness encoding.
+  (`BaseAddress`/`EnterpriseAddress`/`RewardAddress`, `Credential`), public-key
+  hashing (`PublicKey`), witness construction (`Vkey`, `Ed25519Signature`,
+  `Vkeywitness`), and CBOR transaction (de)serialization (`FixedTransaction`). It
+  is used for network parameters, Shelley address encoding, and transaction
+  signing/witness encoding. Only public halves are handed to CSL: the secret stays
+  in `ed25519-bip32`'s `XPrv`, so CSL's private-key types are not used at all (see
+  [Security Considerations](#security-considerations)).
   Note CSL also pulls in `pbkdf2`, which we use directly for the Icarus master-key
   step.
 - **`emurgo-cardano-message-signing` (1.1.0)** — Emurgo's COSE companion to CSL,
@@ -380,13 +383,12 @@ Emurgo's `cardano-message-signing` companion crate.
 
 All signer methods accept the **key material** layout described in
 [§2.5](#25-chainsigner-integration): either a 192-byte payment `XPrv` ‖ stake
-`XPrv`, or a bare 96-byte payment `XPrv`. Two small private helpers slice this
+`XPrv`, or a bare 96-byte payment `XPrv`. One small private helper slices this
 buffer:
 
-- `payment_bip32(key_material)` → payment `Bip32PrivateKey` (accepts 96 or 192
-  bytes; anything else is a clear `InvalidPrivateKey` error).
-- `stake_bip32(key_material)` → `Some(stake)` when 192 bytes are supplied, `None`
-  for the 96-byte payment-only case.
+- `decode_keys(key_material)` → `(payment XPrv, Option<stake XPrv>)`. It accepts 96
+  or 192 bytes — anything else is a clear `InvalidPrivateKey` error — and yields
+  `Some(stake)` only for the 192-byte layout.
 
 #### 3.1 Shelley address encoding
 
@@ -398,7 +400,7 @@ buffer:
 | payment only (96 B)     | enterprise   | `enterprise_address_bech32`     | `addr1v…`      |
 | stake only (signing)    | reward       | `reward_address_bech32`         | `stake1…`      |
 
-Each helper hashes the relevant public key (`to_public().to_raw_key().hash()`),
+Each helper hashes the relevant public key (`public_key(xprv)?.hash()`),
 wraps it in a `Credential::from_keyhash`, builds the matching CSL address type
 (`BaseAddress` / `EnterpriseAddress` / `RewardAddress`) bound to the signer's
 `network_id`, and bech32-encodes it. The reward address is not produced by
@@ -454,7 +456,7 @@ COSE `Sig_structure`, not the raw message. The flow:
 transactions — input selection, fees, and change are the caller's responsibility):
 
 1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure).
-2. Always create a payment witness with `make_vkey_witness(tx_hash, payment_raw_key)`.
+2. Always create a payment witness with `vkey_witness(tx_hash, payment_xprv)`.
 3. Determine whether the body needs a **stake** signature. Two independent sources
    are consulted:
    - **Structural requirements** (`stake_key_hashes_required_by_body`) — the key
@@ -942,7 +944,20 @@ providers (e.g. Blockfrost).
   the decoded hex of an explicitly supplied key, the `KeyPair` fields and the JSON
   blob they are serialized into, and the bit accumulator and phrase copy inside
   `Mnemonic::entropy()` — all are `Zeroizing`/explicitly wiped rather than left to
-  the allocator.
+  the allocator. The Cardano signer also keeps the secret out of CSL entirely: it
+  holds an `ed25519-bip32` `XPrv`, which zeroizes in its own `Drop` and signs out of
+  that buffer, because CSL's `PrivateKey` would copy the extended secret into an
+  allocation nothing wipes (see the `clear_on_drop` note under *Unmaintained
+  transitive dependencies* below). What the `XPrv` does not wipe is the stack: the
+  copies `from_slice_verified` makes on the way in, and the moved-from slot left
+  when an `XPrv` is returned by value, run no `Drop`. Wiping those would take a
+  by-reference constructor `ed25519-bip32` does not offer.
+- **Never format an `XPrv`.** Unlike CSL's key types — `Bip32PrivateKey` has no
+  `Debug`, and `chain_crypto::SecretKey`'s is `#[cfg(test)]`-gated — `XPrv`
+  implements both `Debug` and `Display` unconditionally, and both `hex::encode` the
+  full 96 bytes into a `String` nothing zeroizes. No code formats one today; a
+  `{:?}` added to a log line or an error message later is all it would take, so
+  treat the two impls as unusable.
 - **Malformed imported keys are rejected.** A user-supplied `ed25519_bip32` key is
   shape- and clamping-checked at import (see
   [§2.6](#26-multi-credential-key-storage)), so an unusable key surfaces at import
@@ -1030,18 +1045,27 @@ providers (e.g. Blockfrost).
   None of the five is reachable from OWS:
   - `rand_os`, and `cloudabi`/`fuchsia-cprng` under it, back CSL's *key generation*
     (`Bip32PrivateKey::generate_ed25519_bip32`, `PrivateKey::generate_*`), which OWS
-    never calls — the signer only ever uses `Bip32PrivateKey::from_bytes`, and every
+    never calls — the signer constructs no CSL private key at all, and every
     OWS key comes from `ed25519-bip32` and `rand` in `ows-signer` (see
     [§2.2](#22-master-key-generation-icarus)). `cloudabi` and `fuchsia-cprng` are in
     the lockfile but do not build on any target OWS ships: they are `rand_os`'s
     per-OS backends for CloudABI and Fuchsia.
   - `clear_on_drop` is declared by CSL but never referenced anywhere in its source,
     so it is compiled and never runs. The consequence is worth stating plainly, since
-    it is the opposite of what the dependency name suggests: CSL does **not** zeroize
-    the `Bip32PrivateKey` it holds, so the copy `Bip32PrivateKey::from_bytes` makes of
-    the key material outlives its buffer. OWS zeroizes what it owns — the
+    it is the opposite of what the dependency name suggests: CSL zeroizes none of its
+    own key types. `Bip32PrivateKey` escapes the consequence only because the `XPrv`
+    it wraps wipes itself (`ed25519-bip32`'s `Drop` calls `securemem::zero`), but
+    `PrivateKey` — what `Bip32PrivateKey::to_raw_key` returns, and what CSL's signing
+    helpers take — holds an `ExtendedPriv([u8; 64])` with no `Drop` at all. Signing
+    through CSL would therefore leave a copy of the 64-byte extended secret in freed
+    memory on every call. Key *hashing* never had this problem: it goes through
+    `Bip32PublicKey::to_raw_key`, which yields a `PublicKey` and touches no secret.
+    OWS never constructs a CSL private key: `decode_keys` keeps the secret in an
+    `XPrv`, `XPrv::sign` signs out of that buffer, and only the 32-byte public key is
+    handed to CSL (see
+    [§3](#3-transaction-and-message-signing-chain-plugin-interface)). The
     `SecretBytes`/`Zeroizing` buffer it decodes from is wiped on drop (see
-    [§2.6](#26-multi-credential-key-storage)) — but it cannot reach inside CSL's copy.
+    [§2.6](#26-multi-credential-key-storage)).
   - `nodrop` is a pre-1.0 `ManuallyDrop` polyfill under `generic-array 0.8`, which
     `pruefung` needs for the FNV-32a checksum in `emurgo-cardano-message-signing`.
     That checksum only serves `SignedMessage::{to,from}_user_facing_encoding` (the

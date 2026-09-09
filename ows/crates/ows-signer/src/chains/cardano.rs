@@ -2,10 +2,11 @@ use crate::curve::Curve;
 use crate::traits::{ChainSigner, SignOutput, SignerError};
 use crate::{DerivedKey, SecretBytes};
 use cardano_serialization_lib::{
-    make_vkey_witness, Address, AddressKind, BaseAddress, Bip32PrivateKey, Certificate,
-    CertificateKind, Credential, Ed25519KeyHashes, EnterpriseAddress, FixedTransaction,
-    NetworkInfo, RewardAddress, TransactionBody, TransactionOutput, Vkeywitnesses,
+    Address, AddressKind, BaseAddress, Certificate, CertificateKind, Credential, Ed25519KeyHashes,
+    Ed25519Signature, EnterpriseAddress, FixedTransaction, NetworkInfo, PublicKey, RewardAddress,
+    TransactionBody, TransactionHash, TransactionOutput, Vkey, Vkeywitness, Vkeywitnesses,
 };
+use ed25519_bip32::XPrv;
 use emurgo_cardano_message_signing::builders::{AlgorithmId, COSESign1Builder, EdDSA25519Key};
 use emurgo_cardano_message_signing::cbor::CBORValue;
 use emurgo_cardano_message_signing::utils::ToBytes as EmurgoToBytes;
@@ -87,19 +88,23 @@ impl CardanoSigner {
         format!("m/1852'/1815'/{index}'/2/0")
     }
 
-    fn decode_keys(
-        key_material: &[u8],
-    ) -> Result<(Bip32PrivateKey, Option<Bip32PrivateKey>), SignerError> {
+    /// Holds the secret in `ed25519_bip32::XPrv`, not CSL's `Bip32PrivateKey`. CSL
+    /// signs through `Bip32PrivateKey::to_raw_key`, which copies the 64-byte extended
+    /// secret into an `ExtendedPriv` that has no `Drop`, so each call leaves an
+    /// unwiped copy behind. `XPrv` zeroizes on drop and signs out of its own buffer,
+    /// so no heap allocation OWS cannot wipe ever holds the secret. Never `{:?}` or
+    /// `{}` an `XPrv`: both impls hex-encode all 96 bytes into a `String`.
+    fn decode_keys(key_material: &[u8]) -> Result<(XPrv, Option<XPrv>), SignerError> {
         match key_material.len() {
             ed25519_bip32::XPRV_SIZE => {
-                let pay = Bip32PrivateKey::from_bytes(key_material)
+                let pay = XPrv::from_slice_verified(key_material)
                     .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))?;
                 Ok((pay, None))
             }
             len if len == ed25519_bip32::XPRV_SIZE * 2 => {
-                let pay = Bip32PrivateKey::from_bytes(&key_material[..ed25519_bip32::XPRV_SIZE])
+                let pay = XPrv::from_slice_verified(&key_material[..ed25519_bip32::XPRV_SIZE])
                     .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))?;
-                let stake = Bip32PrivateKey::from_bytes(&key_material[ed25519_bip32::XPRV_SIZE..])
+                let stake = XPrv::from_slice_verified(&key_material[ed25519_bip32::XPRV_SIZE..])
                     .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))?;
                 Ok((pay, Some(stake)))
             }
@@ -110,23 +115,40 @@ impl CardanoSigner {
         }
     }
 
-    fn base_address_bech32(
-        &self,
-        pay: &Bip32PrivateKey,
-        stake: &Bip32PrivateKey,
-    ) -> Result<String, SignerError> {
+    fn public_key(xprv: &XPrv) -> Result<PublicKey, SignerError> {
+        PublicKey::from_bytes(xprv.public().public_key_slice())
+            .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))
+    }
+
+    /// Replaces CSL's `make_vkey_witness`, which would need a `PrivateKey` (see
+    /// `decode_keys`); the witness it builds is identical.
+    fn vkey_witness(tx_hash: &TransactionHash, xprv: &XPrv) -> Result<Vkeywitness, SignerError> {
+        let signature = Ed25519Signature::from_bytes(
+            xprv.sign::<Vec<u8>>(&tx_hash.to_bytes())
+                .to_bytes()
+                .to_vec(),
+        )
+        .map_err(|e| SignerError::SigningFailed(e.to_string()))?;
+
+        Ok(Vkeywitness::new(
+            &Vkey::new(&Self::public_key(xprv)?),
+            &signature,
+        ))
+    }
+
+    fn base_address_bech32(&self, pay: &XPrv, stake: &XPrv) -> Result<String, SignerError> {
         let network_id = self.network_id;
-        let pay_cred = Credential::from_keyhash(&pay.to_public().to_raw_key().hash());
-        let stake_cred = Credential::from_keyhash(&stake.to_public().to_raw_key().hash());
+        let pay_cred = Credential::from_keyhash(&Self::public_key(pay)?.hash());
+        let stake_cred = Credential::from_keyhash(&Self::public_key(stake)?.hash());
         let base = BaseAddress::new(network_id, &pay_cred, &stake_cred);
         base.to_address()
             .to_bech32(None)
             .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))
     }
 
-    fn enterprise_address_bech32(&self, pay: &Bip32PrivateKey) -> Result<String, SignerError> {
+    fn enterprise_address_bech32(&self, pay: &XPrv) -> Result<String, SignerError> {
         let network_id = self.network_id;
-        let pay_cred = Credential::from_keyhash(&pay.to_public().to_raw_key().hash());
+        let pay_cred = Credential::from_keyhash(&Self::public_key(pay)?.hash());
         let ent = EnterpriseAddress::new(network_id, &pay_cred);
         ent.to_address()
             .to_bech32(None)
@@ -220,9 +242,9 @@ impl CardanoSigner {
         hashes
     }
 
-    fn reward_address_bech32(&self, stake: &Bip32PrivateKey) -> Result<String, SignerError> {
+    fn reward_address_bech32(&self, stake: &XPrv) -> Result<String, SignerError> {
         let network_id = self.network_id;
-        let stake_cred = Credential::from_keyhash(&stake.to_public().to_raw_key().hash());
+        let stake_cred = Credential::from_keyhash(&Self::public_key(stake)?.hash());
         let rew = RewardAddress::new(network_id, &stake_cred);
         rew.to_address()
             .to_bech32(None)
@@ -577,9 +599,9 @@ impl ChainSigner for CardanoSigner {
 
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
         let (pay, _) = Self::decode_keys(private_key)?;
-        let public_key = pay.to_public().to_raw_key().as_bytes();
+        let public_key = pay.public().public_key_slice().to_vec();
 
-        let signature = pay.to_raw_key().sign(message).to_bytes();
+        let signature = pay.sign::<Vec<u8>>(message).to_bytes().to_vec();
 
         Ok(SignOutput {
             signature,
@@ -676,12 +698,12 @@ impl ChainSigner for CardanoSigner {
         let sig_structure = builder.make_data_to_sign();
         let sig_bytes = EmurgoToBytes::to_bytes(&sig_structure);
 
-        let sig = sk.to_raw_key().sign(&sig_bytes);
+        let sig = sk.sign::<Vec<u8>>(&sig_bytes);
 
-        let cose = builder.build(sig.to_bytes());
+        let cose = builder.build(sig.to_bytes().to_vec());
         let signed = SignedMessage::new_cose_sign1(&cose);
         let signature = EmurgoToBytes::to_bytes(&signed);
-        let cose_key = EdDSA25519Key::new(sk.to_public().to_raw_key().as_bytes()).build();
+        let cose_key = EdDSA25519Key::new(sk.public().public_key_slice().to_vec()).build();
 
         Ok(SignOutput {
             signature,
@@ -704,14 +726,14 @@ impl ChainSigner for CardanoSigner {
         let body = tx.body();
         let stake_hashes = Self::stake_key_hashes_required_by_body(&body);
 
-        let pay_witness = make_vkey_witness(&tx_hash, &pay.to_raw_key());
+        let pay_witness = Self::vkey_witness(&tx_hash, &pay)?;
 
         let mut witnesses = Vkeywitnesses::new();
         witnesses.add(&pay_witness);
 
         match stake {
             Some(stake) => {
-                let stake_hash = stake.to_public().to_raw_key().hash();
+                let stake_hash = Self::public_key(&stake)?.hash();
                 let needs_stake_signature = stake_hashes.contains(&stake_hash)
                     || body
                         .required_signers()
@@ -719,14 +741,14 @@ impl ChainSigner for CardanoSigner {
                         .unwrap_or(false);
 
                 if needs_stake_signature {
-                    witnesses.add(&make_vkey_witness(&tx_hash, &stake.to_raw_key()));
+                    witnesses.add(&Self::vkey_witness(&tx_hash, &stake)?);
                 }
             }
             None => {
                 // No stake key to offer. If the body needs one for anything other than
                 // the payment credential, refuse rather than hand back a transaction
                 // that fails phase-1 validation.
-                let pay_hash = pay.to_public().to_raw_key().hash();
+                let pay_hash = Self::public_key(&pay)?.hash();
                 let unsatisfied = (0..stake_hashes.len())
                     .map(|i| stake_hashes.get(i))
                     .any(|hash| hash != pay_hash);
@@ -1241,7 +1263,7 @@ mod tests {
             &[(&output_address, 3_000_000, None)],
             |body| {
                 let mut signers = Ed25519KeyHashes::new();
-                signers.add(&stake_key.to_public().to_raw_key().hash());
+                signers.add(&CardanoSigner::public_key(&stake_key).unwrap().hash());
                 body.set_required_signers(&signers);
             },
         );
@@ -1268,6 +1290,7 @@ mod tests {
         .unwrap();
         let key = derive_key_material(&signer, &m, 0);
         let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
 
         let address = signer.derive_address(key.expose()).unwrap();
 
@@ -1280,7 +1303,9 @@ mod tests {
             |body| {
                 let mut certs = Certificates::new();
                 let cert = Certificate::new_stake_delegation(&StakeDelegation::new(
-                    &Credential::from_keyhash(&stake_key.unwrap().to_public().to_raw_key().hash()),
+                    &Credential::from_keyhash(
+                        &CardanoSigner::public_key(&stake_key).unwrap().hash(),
+                    ),
                     &Ed25519KeyHash::from_bytes(vec![0xcd; 28]).unwrap(), // dummy pool keyhash
                 ));
                 certs.add(&cert);
@@ -1317,7 +1342,7 @@ mod tests {
         let address = signer.derive_address(key.expose()).unwrap();
         let reward_address = RewardAddress::new(
             signer.network_id,
-            &Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash()),
+            &Credential::from_keyhash(&CardanoSigner::public_key(&stake_key).unwrap().hash()),
         );
 
         let tx_cbor = build_test_tx_cbor(
@@ -1688,7 +1713,7 @@ mod tests {
         let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
         let reward_address = RewardAddress::new(
             signer.network_id,
-            &Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash()),
+            &Credential::from_keyhash(&CardanoSigner::public_key(&stake_key).unwrap().hash()),
         );
 
         let input_value = 10_000_000u64;
@@ -1741,7 +1766,8 @@ mod tests {
         let stake_key = stake_key.unwrap();
         let payment_address = signer.derive_address(key.expose()).unwrap();
         let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
-        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+        let stake_cred =
+            Credential::from_keyhash(&CardanoSigner::public_key(&stake_key).unwrap().hash());
 
         let deposit = 2_000_000u64;
         let input_value = 10_000_000u64;
@@ -1798,7 +1824,8 @@ mod tests {
         let stake_key = stake_key.unwrap();
         let payment_address = signer.derive_address(key.expose()).unwrap();
         let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
-        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+        let stake_cred =
+            Credential::from_keyhash(&CardanoSigner::public_key(&stake_key).unwrap().hash());
 
         let refund = 2_000_000u64;
         let input_value = 10_000_000u64;
