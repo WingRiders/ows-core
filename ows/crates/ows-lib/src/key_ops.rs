@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ows_core::ChainType;
-use ows_core::{ApiKeyFile, EncryptedWallet, OwsError};
+use ows_core::{ApiKeyFile, EncryptedWallet, OwsError, PolicyRequestType};
 use ows_signer::{
     decrypt, eip712, encrypt_with_hkdf, signer_for_chain, ChainSigner, CryptoEnvelope, SecretBytes,
 };
@@ -107,6 +107,7 @@ pub fn sign_with_api_key(
         key_file,
         wallet,
         chain,
+        PolicyRequestType::SignTransaction,
         Some(transaction),
         None,
         index,
@@ -145,6 +146,7 @@ pub fn sign_message_with_api_key(
         key_file,
         wallet,
         chain,
+        PolicyRequestType::SignMessage,
         Some(transaction),
         None,
         index,
@@ -181,6 +183,7 @@ pub fn sign_hash_with_api_key(
         key_file,
         wallet,
         chain,
+        PolicyRequestType::SignHash,
         Some(transaction),
         None,
         index,
@@ -265,6 +268,7 @@ pub fn sign_typed_data_with_api_key(
         key_file,
         wallet,
         chain,
+        PolicyRequestType::SignTypedData,
         None,
         Some(typed_data_ctx),
         index,
@@ -307,13 +311,16 @@ pub fn load_authorized_wallet(
 /// (and optional `TypedDataContext`), run the policy engine, and decrypt
 /// the signing key on allow. `transaction` is `None` for `sign_typed_data`
 /// (the payload is surfaced via `typed_data.raw_json` instead); other
-/// flows pass `Some(...)` with at least `raw_hex` populated.
+/// flows pass `Some(...)` with at least `raw_hex` populated. `request_type`
+/// is what a policy branches on, so every call path has to name its
+/// operation rather than leave it to be inferred.
 #[allow(clippy::too_many_arguments)]
 pub fn enforce_policies_and_decrypt_key(
     token: &str,
     key_file: ApiKeyFile,
     wallet: EncryptedWallet,
     chain: &ows_core::Chain,
+    request_type: PolicyRequestType,
     transaction: Option<ows_core::policy::TransactionContext>,
     typed_data: Option<ows_core::policy::TypedDataContext>,
     index: Option<u32>,
@@ -327,6 +334,7 @@ pub fn enforce_policies_and_decrypt_key(
         chain_id: chain.chain_id.to_string(),
         wallet_id: wallet.id.clone(),
         api_key_id: key_file.id.clone(),
+        request_type,
         transaction,
         spending: noop_spending_context(&date),
         timestamp: now.to_rfc3339(),
@@ -1222,10 +1230,12 @@ import sys
 payload = json.load(sys.stdin)
 typed_data = payload.get("typed_data") or {{}}
 
-if typed_data.get("raw_json") == {typed_data_json:?} and "transaction" not in payload:
+if (typed_data.get("raw_json") == {typed_data_json:?}
+        and "transaction" not in payload
+        and payload.get("request_type") == "sign_typed_data"):
     print('{{"allow": true}}')
 else:
-    print(json.dumps({{"allow": False, "reason": f"transaction={{payload.get('transaction')!r}} raw_json={{typed_data.get('raw_json')}}"}}))
+    print(json.dumps({{"allow": False, "reason": f"request_type={{payload.get('request_type')!r}} transaction={{payload.get('transaction')!r}} raw_json={{typed_data.get('raw_json')}}"}}))
 "#
             ),
         )
@@ -1269,6 +1279,95 @@ else:
             result.is_ok(),
             "typed-data executable policy rejected context: {:?}",
             result.err()
+        );
+    }
+
+    /// A policy that reads the transaction context defensively (`or {}`) cannot tell an
+    /// absent `transaction` from an empty one, so it cannot recognize a typed-data
+    /// request that way. `request_type` is what lets it deny one, and it must not deny
+    /// the other operations along with it.
+    #[cfg(unix)]
+    #[test]
+    fn executable_policy_denies_typed_data_by_request_type_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().to_path_buf();
+        let passphrase = "test-pass";
+        let wallet_id = setup_test_wallet(&vault, passphrase);
+
+        let script = vault.join("no-typed-data.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+payload = json.load(sys.stdin)
+tx = payload.get("transaction") or {}
+if payload["request_type"] == "sign_typed_data":
+    print(json.dumps({"allow": False, "reason": "typed data signing is not permitted"}))
+else:
+    print(json.dumps({"allow": True, "reason": tx.get("raw_hex")}))
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy = ows_core::Policy {
+            id: "no-typed-data".to_string(),
+            name: "no typed data".to_string(),
+            version: 1,
+            created_at: "2026-03-22T10:00:00Z".to_string(),
+            rules: vec![],
+            executable: Some(script.display().to_string()),
+            config: None,
+            action: ows_core::PolicyAction::Deny,
+        };
+        policy_store::save_policy(&policy, Some(&vault)).unwrap();
+
+        let (token, _) = create_api_key(
+            "no-td-agent",
+            &[wallet_id],
+            &["no-typed-data".to_string()],
+            passphrase,
+            None,
+            Some(&vault),
+        )
+        .unwrap();
+
+        let chain = ows_core::parse_chain("base").unwrap();
+
+        let denied = sign_typed_data_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            &test_typed_data_json(),
+            None,
+            None,
+            Some(&vault),
+        );
+        assert!(
+            matches!(
+                denied,
+                Err(OwsLibError::Core(OwsError::PolicyDenied { .. }))
+            ),
+            "typed data should be denied, got {denied:?}"
+        );
+
+        let allowed = sign_message_with_api_key(
+            &token,
+            "test-wallet",
+            &chain,
+            b"hello",
+            None,
+            None,
+            Some(&vault),
+        );
+        assert!(
+            allowed.is_ok(),
+            "message signing should still be allowed: {:?}",
+            allowed.err()
         );
     }
 }

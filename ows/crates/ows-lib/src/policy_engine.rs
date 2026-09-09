@@ -231,13 +231,14 @@ mod tests {
     use ows_core::policy::{
         SpendingContext, TransactionContext, TransactionEffect, TypedDataContext,
     };
-    use ows_core::PolicyAction;
+    use ows_core::{PolicyAction, PolicyRequestType};
 
     fn base_context() -> PolicyContext {
         PolicyContext {
             chain_id: "eip155:8453".to_string(),
             wallet_id: "wallet-1".to_string(),
             api_key_id: "key-1".to_string(),
+            request_type: PolicyRequestType::SignTransaction,
             transaction: Some(TransactionContext {
                 effects: vec![TransactionEffect {
                     address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),

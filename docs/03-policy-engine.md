@@ -225,6 +225,7 @@ The base JSON object available to policy evaluation:
   "chain_id": "cip34:1-764824073",
   "wallet_id": "3198bc9c-6672-5ab3-d995-4942343ae5b6",
   "api_key_id": "7a2f1b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+  "request_type": "sign_transaction",
   "transaction": {
     "effects": [
       { "address": "addr1qx2f...", "diff": [["lovelace", "-4200000"]] },
@@ -245,6 +246,7 @@ The base JSON object available to policy evaluation:
 | `chain_id` | string | yes | CAIP-2 chain identifier |
 | `wallet_id` | string | yes | Wallet ID in scope for this request |
 | `api_key_id` | string | yes | The ID of the API key making this request |
+| `request_type` | string | yes | Which operation is being authorized: `sign_transaction`, `sign_message`, `sign_hash`, or `sign_typed_data`. **Branch on this**, not on which optional fields are populated. |
 | `transaction` | object | no | The signing payload. Present for `sign_transaction`, `sign_message`, and `sign_hash`; omitted for `sign_typed_data`, which exposes its payload via `typed_data.raw_json` instead. See below. |
 | `spending` | object | yes | Lightweight spending metadata currently exposed by the engine |
 | `timestamp` | string | yes | ISO 8601 timestamp of the signing request |
@@ -265,6 +267,28 @@ For executable policies, the engine injects `policy_config` into the JSON payloa
 Only chains whose signer overrides `make_transaction_context` fill `effects`; today that is Cardano. Everywhere else — EVM included — `effects` is empty and `raw_hex` is the whole payload, so a policy that needs parsed transaction fields has to decode `raw_hex` itself.
 
 > **Earlier versions documented `transaction.to` and `transaction.value`.** Both fields existed on the struct but were never populated by any chain, on any code path, so a policy reading them always saw `null`. They are removed in favour of `effects`; nothing that worked has stopped working.
+
+### Migrating a policy that detects typed data
+
+`transaction` used to be present on every request, with `raw_hex` set to `""` for `sign_typed_data`. It is now omitted for that operation, and **the direction in which an existing policy breaks depends on how it was written**:
+
+| Policy style | Before | After |
+|---|---|---|
+| `payload["transaction"]["raw_hex"] == ""` | deny | `KeyError`, non-zero exit, **deny** |
+| `payload.get("transaction", {}).get("raw_hex", "")` | deny | deny |
+| `tx = payload.get("transaction") or {}` | deny | `None == ""` is False, **allow** |
+| `const tx = ctx.transaction \|\| {}` | deny | `undefined === ""` is False, **allow** |
+
+The defensively written script is the one that fails **open**. It does not raise, so the engine has nothing to catch, and a policy that blocks typed data signing today silently stops blocking it — with no error and no log entry.
+
+Check `request_type` instead. It is always present, it names the operation directly, and a policy that reads it cannot be fooled by an optional field's absence:
+
+```python
+if ctx["request_type"] == "sign_typed_data":
+    json.dump({"allow": False, "reason": "typed data signing is not permitted"}, sys.stdout)
+```
+
+Rust consumers are unaffected: the type change breaks at compile time.
 
 ### `typed_data` (optional)
 
@@ -350,12 +374,12 @@ config = ctx.get("policy_config") or {}
 owned = set(config.get("addresses", []))
 limit = int(config.get("max_lovelace_out", "0"))
 
-tx = ctx.get("transaction")
-if tx is None:
-    # No transaction context: this is a sign_typed_data request, which this policy
-    # has nothing to say about. Denying is the safe default for a spending cap.
-    json.dump({"allow": False, "reason": "no transaction context to evaluate"}, sys.stdout)
+if ctx["request_type"] == "sign_typed_data":
+    # Typed data carries no transaction context, so a spending cap cannot bound it.
+    json.dump({"allow": False, "reason": "typed data signing is not permitted"}, sys.stdout)
     sys.exit(0)
+
+tx = ctx["transaction"]
 
 def outflow(effects):
     total = 0

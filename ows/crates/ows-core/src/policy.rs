@@ -39,16 +39,32 @@ pub struct Policy {
     pub action: PolicyAction,
 }
 
+/// Which signing operation a [`PolicyContext`] was built for. Always present in the
+/// serialized context, so a policy can branch on the operation rather than infer it
+/// from which optional fields happen to be populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRequestType {
+    SignTransaction,
+    SignMessage,
+    SignHash,
+    SignTypedData,
+}
+
 /// Context passed to policy evaluation (and to executable policies via stdin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyContext {
     pub chain_id: String,
     pub wallet_id: String,
     pub api_key_id: String,
+    pub request_type: PolicyRequestType,
     /// Transaction-shaped context for the signing request. Present for
     /// `sign_transaction`, `sign_message`, and `sign_hash` (the latter two
     /// surface their payload through `raw_hex`). Omitted for `sign_typed_data`,
-    /// which exposes its payload via [`TypedDataContext::raw_json`] instead.
+    /// which exposes its payload via [`TypedDataContext::raw_json`] instead —
+    /// branch on [`PolicyContext::request_type`] rather than on this field's
+    /// absence, which a defensively written policy cannot distinguish from an
+    /// empty transaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction: Option<TransactionContext>,
     pub spending: SpendingContext,
@@ -223,6 +239,7 @@ mod tests {
             chain_id: "eip155:8453".into(),
             wallet_id: "3198bc9c-6672-5ab3-d995-4942343ae5b6".into(),
             api_key_id: "7a2f1b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c".into(),
+            request_type: PolicyRequestType::SignTransaction,
             transaction: Some(TransactionContext {
                 effects: vec![TransactionEffect {
                     address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
@@ -352,6 +369,7 @@ mod tests {
             chain_id: "eip155:8453".into(),
             wallet_id: "w".into(),
             api_key_id: "k".into(),
+            request_type: PolicyRequestType::SignTransaction,
             transaction: Some(TransactionContext {
                 effects: vec![],
                 raw_hex: "0x00".into(),
@@ -376,6 +394,7 @@ mod tests {
             chain_id: "eip155:8453".into(),
             wallet_id: "w".into(),
             api_key_id: "k".into(),
+            request_type: PolicyRequestType::SignTypedData,
             transaction: None,
             spending: SpendingContext {
                 daily_total: "0".into(),
@@ -385,7 +404,25 @@ mod tests {
             typed_data: None,
         };
 
-        let json = serde_json::to_string(&ctx).unwrap();
-        assert!(!json.contains("transaction"));
+        let json: serde_json::Value = serde_json::to_value(&ctx).unwrap();
+        assert!(json.get("transaction").is_none());
+        // The absent key is not what a policy should key off; request_type is.
+        assert_eq!(json["request_type"], "sign_typed_data");
+    }
+
+    #[test]
+    fn test_policy_request_type_serde() {
+        for (variant, expected) in [
+            (PolicyRequestType::SignTransaction, "sign_transaction"),
+            (PolicyRequestType::SignMessage, "sign_message"),
+            (PolicyRequestType::SignHash, "sign_hash"),
+            (PolicyRequestType::SignTypedData, "sign_typed_data"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<PolicyRequestType>(expected.into()).unwrap(),
+                variant
+            );
+        }
     }
 }

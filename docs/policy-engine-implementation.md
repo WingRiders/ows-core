@@ -71,11 +71,11 @@ addresses:
 
     import json, sys
     ctx = json.load(sys.stdin)
-    tx = ctx.get("transaction")
-    if tx is None:  # sign_typed_data: no transaction to cap
-        json.dump({"allow": False, "reason": "no transaction context"}, sys.stdout)
+    if ctx["request_type"] == "sign_typed_data":  # no transaction to cap
+        json.dump({"allow": False, "reason": "typed data not permitted"}, sys.stdout)
         sys.exit(0)
 
+    tx = ctx["transaction"]
     owned = {"addr1qx2f..."}
     limit = 5_000_000  # 5 ADA
     out = -sum(int(amount)
@@ -106,7 +106,8 @@ Reference it in the policy file:
 | chain_id | CAIP-2 chain ID (e.g. eip155:8453) |
 | wallet_id | Wallet UUID |
 | api_key_id | API key UUID |
-| transaction | Absent for sign_typed_data; see 03-policy-engine.md |
+| request_type | sign_transaction, sign_message, sign_hash or sign_typed_data; always present |
+| transaction | Absent for sign_typed_data; branch on request_type, not on this field's absence |
 | transaction.effects | Per-address asset movement; empty unless the chain's signer implements flow analysis (Cardano today) |
 | transaction.effects[].diff | [asset, amount] pairs; amount is a signed decimal string in the smallest unit |
 | transaction.chain_extra | Chain-specific detail effects cannot carry; present only when a chain fills it |
@@ -123,6 +124,7 @@ replaces them.
 Test executable policies without real signing:
 
     echo '{"chain_id": "cip34:1-764824073", "wallet_id": "test", "api_key_id": "test",
+      "request_type": "sign_transaction",
       "transaction": {"raw_hex": "84a4",
         "effects": [{"address": "addr1qx2f...", "diff": [["lovelace", "-6000000"]]}]},
       "spending": {"daily_total": "0", "date": "2026-01-01"},

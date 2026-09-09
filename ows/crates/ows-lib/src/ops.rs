@@ -785,6 +785,7 @@ pub fn sign_and_send(
             key_file,
             wallet_obj,
             &chain_info,
+            ows_core::PolicyRequestType::SignTransaction,
             Some(transaction),
             None,
             index,
