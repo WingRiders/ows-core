@@ -767,10 +767,11 @@ pub fn sign_and_send(
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
         let signer = signer_for_chain(&chain_info);
 
-        // if rpc_url is provided, use it, otherwise, resolve it if the chain is Cardano, because it's needed in make_transaction_context
+        // An explicit URL wins; otherwise resolve the configured one for the chains whose
+        // make_transaction_context cannot build a context without it.
         let resolved_rpc_url = match rpc_url {
             Some(url) => Some(url.to_string()),
-            None if chain_info.chain_type == ChainType::Cardano => Some(resolve_rpc_url(
+            None if signer.transaction_context_needs_rpc() => Some(resolve_rpc_url(
                 chain_info.chain_id,
                 chain_info.chain_type,
                 None,

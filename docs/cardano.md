@@ -571,12 +571,16 @@ to the configured RPC provider (Koios).
 
 Accordingly, `make_transaction_context` takes an `Option<&str>` RPC URL, and the
 `ows-lib` call sites that build the policy context — `sign_and_send`
-(`ops.rs`) and `sign_with_api_key` (`key_ops.rs`) — now resolve the Koios endpoint
-for Cardano and pass it through. Resolution reuses the generic precedence
+(`ops.rs`) and `sign_with_api_key` (`key_ops.rs`) — resolve the endpoint and pass
+it through. Which chains need one is a property of the signer,
+`ChainSigner::transaction_context_needs_rpc` (default `false`, `true` for
+`CardanoSigner`), rather than a `ChainType` match at each call site: the next chain
+whose context depends on network access overrides the method instead of extending
+two conditions. Resolution reuses the generic precedence
 (explicit override → config exact `chain_id` → config namespace → built-in
 default; see [§1.4](#14-rpc-configuration-koios-keyless)); `resolve_rpc_url` was
-made `pub(crate)`-visible for this. For every non-Cardano chain the URL stays
-`None`, so no network call is introduced anywhere else.
+made `pub(crate)`-visible for this. For every chain that does not ask for a URL it
+stays `None`, so no network call is introduced anywhere else.
 
 #### 4.2 Parsing and input resolution (Koios `tx_cbor`)
 
@@ -1024,7 +1028,8 @@ Components modified or added:
   deposits/refunds against the reward address and reports declared collateral under
   `chain_extra.collateral_effects`.
 - `ows/crates/ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
-  default methods `verify_sign_message_address`, `default_derivation_paths`, and
+  default methods `verify_sign_message_address`, `transaction_context_needs_rpc`,
+  `default_derivation_paths`, and
   `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
   (`make_transaction_context` already existed as a default-empty hook; Cardano now
   overrides it.)

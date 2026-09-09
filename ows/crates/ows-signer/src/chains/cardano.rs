@@ -899,6 +899,10 @@ impl ChainSigner for CardanoSigner {
         })
     }
 
+    fn transaction_context_needs_rpc(&self) -> bool {
+        true
+    }
+
     fn default_derivation_path(&self, index: u32) -> String {
         Self::payment_derivation_path(index)
     }

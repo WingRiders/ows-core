@@ -119,6 +119,14 @@ pub trait ChainSigner: Send + Sync {
         })
     }
 
+    /// Whether [`ChainSigner::make_transaction_context`] needs an RPC URL to do its work.
+    /// True for chains that resolve state the transaction only references (Cardano's input
+    /// UTxOs); callers resolve the chain's configured endpoint before the policy pass when
+    /// this is set, instead of matching on the chain type themselves.
+    fn transaction_context_needs_rpc(&self) -> bool {
+        false
+    }
+
     /// Returns the default BIP-44 derivation path template for this chain.
     fn default_derivation_path(&self, index: u32) -> String;
 
