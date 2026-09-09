@@ -4,7 +4,7 @@ use crate::{DerivedKey, SecretBytes};
 use cardano_serialization_lib::{
     make_vkey_witness, Address, AddressKind, BaseAddress, Bip32PrivateKey, Certificate,
     CertificateKind, Credential, Ed25519KeyHashes, EnterpriseAddress, FixedTransaction,
-    NetworkInfo, RewardAddress, TransactionBody, Vkeywitnesses,
+    NetworkInfo, RewardAddress, TransactionBody, TransactionOutput, Vkeywitnesses,
 };
 use emurgo_cardano_message_signing::builders::{AlgorithmId, COSESign1Builder, EdDSA25519Key};
 use emurgo_cardano_message_signing::cbor::CBORValue;
@@ -273,6 +273,136 @@ impl CardanoSigner {
             .or_default()
             .entry(LOVELACE_ASSET_ID.to_string())
             .or_insert(0) += amount;
+    }
+
+    /// Fold a resolved UTxO's lovelace and native-asset amounts into `balances`, under its address.
+    fn add_utxo_balance(
+        balances: &mut BTreeMap<String, AssetBalanceMap>,
+        utxo: &KoiosUtxoInfoRow,
+    ) -> Result<(), SignerError> {
+        let for_address = balances.entry(utxo.address.clone()).or_default();
+
+        *for_address
+            .entry(LOVELACE_ASSET_ID.to_string())
+            .or_insert(0) += utxo.value.parse::<u64>().map_err(|e| {
+            SignerError::InvalidTransaction(format!(
+                "invalid lovelace value for utxo {}#{}: {e}",
+                utxo.tx_hash, utxo.tx_index
+            ))
+        })?;
+
+        for asset in utxo.asset_list.iter().flatten() {
+            *for_address
+                .entry(format!("{}{}", asset.policy_id, asset.asset_name))
+                .or_insert(0) += asset.quantity.parse::<u64>().map_err(|e| {
+                SignerError::InvalidTransaction(format!(
+                    "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
+                    utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Fold a transaction output's lovelace and native-asset amounts into `balances`, under its address.
+    fn add_output_balance(
+        balances: &mut BTreeMap<String, AssetBalanceMap>,
+        output: &TransactionOutput,
+    ) -> Result<(), SignerError> {
+        let dest_address = output
+            .address()
+            .to_bech32(None)
+            .map_err(|e| SignerError::InvalidTransaction(format!("invalid output address: {e}")))?;
+
+        let for_address = balances.entry(dest_address).or_default();
+
+        let lovelace: u64 = output.amount().coin().into();
+        *for_address
+            .entry(LOVELACE_ASSET_ID.to_string())
+            .or_insert(0) += lovelace;
+
+        let Some(ma) = output.amount().multiasset() else {
+            return Ok(());
+        };
+
+        for policy_id_index in 0..ma.keys().len() {
+            let policy_id = ma.keys().get(policy_id_index);
+            let assets = ma.get(&policy_id).unwrap();
+
+            for asset_index in 0..assets.len() {
+                let asset_name = assets.keys().get(asset_index);
+                let asset_quantity: u64 = assets.get(&asset_name).unwrap().into();
+
+                *for_address
+                    .entry(format!(
+                        "{}{}",
+                        policy_id.to_hex(),
+                        hex::encode(asset_name.name())
+                    ))
+                    .or_insert(0) += asset_quantity;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Net `outputs` against `inputs` per address and asset id, dropping zero changes.
+    /// Sorted by address and, within an address, by asset id, so the policy context is
+    /// stable across runs and policy decisions are reproducible.
+    fn effects_from_balances(
+        inputs: &BTreeMap<String, AssetBalanceMap>,
+        outputs: &BTreeMap<String, AssetBalanceMap>,
+    ) -> Vec<TransactionEffect> {
+        let mut all_addresses: BTreeSet<&String> = BTreeSet::new();
+        for c in inputs.keys() {
+            all_addresses.insert(c);
+        }
+        for c in outputs.keys() {
+            all_addresses.insert(c);
+        }
+
+        let empty_balances = AssetBalanceMap::new();
+        let mut effects: Vec<TransactionEffect> = Vec::new();
+        for effect_address in all_addresses {
+            let input_balances = inputs.get(effect_address).unwrap_or(&empty_balances);
+            let output_balances = outputs.get(effect_address).unwrap_or(&empty_balances);
+
+            let mut asset_ids: BTreeSet<&String> = BTreeSet::new();
+            for k in input_balances.keys() {
+                asset_ids.insert(k);
+            }
+            for k in output_balances.keys() {
+                asset_ids.insert(k);
+            }
+
+            let mut diff: Vec<(String, String)> = Vec::new();
+            for asset_id in asset_ids {
+                let input_balance = *input_balances.get(asset_id).unwrap_or(&0);
+                let output_balance = *output_balances.get(asset_id).unwrap_or(&0);
+
+                // i128 keeps the subtraction exact: a native-asset quantity can reach u64::MAX
+                let asset_diff = i128::from(output_balance) - i128::from(input_balance);
+                if asset_diff == 0 {
+                    continue;
+                }
+
+                diff.push((asset_id.clone(), asset_diff.to_string()));
+            }
+
+            if diff.is_empty() {
+                continue;
+            }
+
+            diff.sort_by(|a, b| a.0.cmp(&b.0));
+            effects.push(TransactionEffect {
+                address: effect_address.clone(),
+                diff,
+            });
+        }
+
+        effects.sort_by(|a, b| a.address.cmp(&b.address));
+        effects
     }
 
     fn fetch_txs_cbor(
@@ -656,81 +786,45 @@ impl ChainSigner for CardanoSigner {
             .map(|input| (input.transaction_id().to_hex(), input.index()))
             .collect();
 
+        let collateral_refs: Vec<(String, u32)> = tx
+            .body()
+            .collateral()
+            .map(|collateral| {
+                collateral
+                    .into_iter()
+                    .map(|input| (input.transaction_id().to_hex(), input.index()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut inputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
-        if !tx_input_refs.is_empty() {
+        let mut collateral_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        if !tx_input_refs.is_empty() || !collateral_refs.is_empty() {
             let koios_base_url = rpc_url.ok_or_else(|| {
                 SignerError::InvalidMessage(
                     "Koios RPC URL is required to fetch Cardano transaction inputs".into(),
                 )
             })?;
-            let utxos = Self::fetch_utxos(koios_base_url, &tx_input_refs)?;
 
-            for utxo in utxos {
-                let inputs_balances_for_address =
-                    inputs_balances_by_address.entry(utxo.address).or_default();
+            // Both sets resolve the same way, so they share one round trip. `fetch_utxos`
+            // yields exactly one row per requested ref, in order, so the inputs occupy the
+            // first `tx_input_refs.len()` rows and the collateral the rest.
+            let mut all_refs = tx_input_refs.clone();
+            all_refs.extend(collateral_refs.iter().cloned());
+            let utxos = Self::fetch_utxos(koios_base_url, &all_refs)?;
+            let (input_utxos, collateral_utxos) = utxos.split_at(tx_input_refs.len());
 
-                *inputs_balances_for_address
-                    .entry(LOVELACE_ASSET_ID.to_string())
-                    .or_insert(0) += utxo.value.parse::<u64>().map_err(|e| {
-                    SignerError::InvalidTransaction(format!(
-                        "invalid lovelace value for utxo {}#{}: {e}",
-                        utxo.tx_hash, utxo.tx_index
-                    ))
-                })?;
-
-                for asset in utxo.asset_list.unwrap_or_default() {
-                    *inputs_balances_for_address
-                        .entry(format!("{}{}", asset.policy_id, asset.asset_name))
-                        .or_insert(0) += asset.quantity.parse::<u64>().map_err(|e| {
-                        SignerError::InvalidTransaction(format!(
-                            "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
-                            utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
-                        ))
-                    })?;
-                }
+            for utxo in input_utxos {
+                Self::add_utxo_balance(&mut inputs_balances_by_address, utxo)?;
+            }
+            for utxo in collateral_utxos {
+                Self::add_utxo_balance(&mut collateral_balances_by_address, utxo)?;
             }
         }
 
         let mut outputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
         for output in tx.body().outputs().into_iter() {
-            let dest_address = output.address().to_bech32(None).map_err(|e| {
-                SignerError::InvalidTransaction(format!("invalid output address: {e}"))
-            })?;
-
-            let output_balances_for_address =
-                outputs_balances_by_address.entry(dest_address).or_default();
-
-            let lovelace: u64 = output.amount().coin().into();
-
-            *output_balances_for_address
-                .entry(LOVELACE_ASSET_ID.to_string())
-                .or_insert(0) += lovelace;
-
-            let ma = output.amount().multiasset();
-            if ma.is_none() {
-                continue;
-            }
-
-            let ma = ma.unwrap();
-
-            for policy_id_index in 0..ma.keys().len() {
-                let policy_id = ma.keys().get(policy_id_index);
-                let assets = ma.get(&policy_id).unwrap();
-
-                for asset_index in 0..assets.len() {
-                    let asset_name = assets.keys().get(asset_index);
-                    let asset_quantity = assets.get(&asset_name).unwrap();
-                    let asset_quantity: u64 = asset_quantity.into();
-
-                    *output_balances_for_address
-                        .entry(format!(
-                            "{}{}",
-                            policy_id.to_hex(),
-                            hex::encode(asset_name.name())
-                        ))
-                        .or_insert(0) += asset_quantity;
-                }
-            }
+            Self::add_output_balance(&mut outputs_balances_by_address, output)?;
         }
 
         // Withdrawals leave the reward account and enter the transaction, so
@@ -779,63 +873,29 @@ impl ChainSigner for CardanoSigner {
             }
         }
 
-        let mut all_addresses: BTreeSet<&String> = BTreeSet::new();
-        for c in inputs_balances_by_address.keys() {
-            all_addresses.insert(c);
+        let effects =
+            Self::effects_from_balances(&inputs_balances_by_address, &outputs_balances_by_address);
+
+        // Collateral is consumed only when phase-2 (script) validation fails, so it is not part
+        // of `effects`, which describes what the transaction does when it succeeds. Netting the
+        // collateral inputs against `collateral_return` gives the worst-case loss, which a policy
+        // capping outflow has to add to `effects` itself — collateral does not reduce the change
+        // output, so it is invisible there.
+        let mut collateral_return_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        if let Some(collateral_return) = tx.body().collateral_return() {
+            Self::add_output_balance(&mut collateral_return_by_address, &collateral_return)?;
         }
-        for c in outputs_balances_by_address.keys() {
-            all_addresses.insert(c);
-        }
-
-        let empty_balances = AssetBalanceMap::new();
-        let mut effects: Vec<TransactionEffect> = Vec::new();
-        for effect_address in all_addresses {
-            let input_balances = inputs_balances_by_address
-                .get(effect_address)
-                .unwrap_or(&empty_balances);
-            let output_balances = outputs_balances_by_address
-                .get(effect_address)
-                .unwrap_or(&empty_balances);
-
-            let mut asset_ids: BTreeSet<&String> = BTreeSet::new();
-            for k in input_balances.keys() {
-                asset_ids.insert(k);
-            }
-            for k in output_balances.keys() {
-                asset_ids.insert(k);
-            }
-
-            let mut diff: Vec<(String, String)> = Vec::new();
-            for asset_id in asset_ids {
-                let input_balance = *input_balances.get(asset_id).unwrap_or(&0);
-                let output_balance = *output_balances.get(asset_id).unwrap_or(&0);
-
-                // i128 keeps the subtraction exact: a native-asset quantity can reach u64::MAX
-                let asset_diff = i128::from(output_balance) - i128::from(input_balance);
-                if asset_diff == 0 {
-                    continue;
-                }
-
-                diff.push((asset_id.clone(), asset_diff.to_string()));
-            }
-
-            if diff.is_empty() {
-                continue;
-            }
-
-            diff.sort_by(|a, b| a.0.cmp(&b.0));
-            effects.push(TransactionEffect {
-                address: effect_address.clone(),
-                diff,
-            });
-        }
-
-        effects.sort_by(|a, b| a.address.cmp(&b.address));
+        let collateral_effects = Self::effects_from_balances(
+            &collateral_balances_by_address,
+            &collateral_return_by_address,
+        );
 
         Ok(TransactionContext {
             effects,
             raw_hex: tx_hex,
             data: None,
+            chain_extra: (!collateral_effects.is_empty())
+                .then(|| serde_json::json!({ "collateral_effects": collateral_effects })),
         })
     }
 
@@ -1777,5 +1837,149 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Collateral without a `collateral_return`: the whole collateral input is at risk, and
+    /// none of it shows up in `effects` — the change output is unaffected by it.
+    #[test]
+    fn transaction_context_collateral_without_return() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let my_address = signer.derive_address(&key.expose()).unwrap();
+
+        let input_value = 10_000_000u64;
+        let collateral_value = 5_000_000u64;
+        let (source_tx_hash, source_cbor) = build_utxo_source_tx(&[
+            (&my_address, input_value, None),
+            (&my_address, collateral_value, None),
+        ]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&source_tx_hash, 0)],
+            &[(&my_address, input_value - TX_FEE, None)],
+            |body| {
+                let mut collateral = TransactionInputs::new();
+                collateral.add(&TransactionInput::new(
+                    &TransactionHash::from_hex(&source_tx_hash).unwrap(),
+                    1,
+                ));
+                body.set_collateral(&collateral);
+                body.set_total_collateral(&BigNum::from(collateral_value));
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![TransactionEffect {
+                address: my_address.clone(),
+                diff: vec![("lovelace".into(), format!("-{TX_FEE}"))],
+            }]
+        );
+        assert_eq!(
+            ctx.chain_extra,
+            Some(serde_json::json!({
+                "collateral_effects": [{
+                    "address": my_address,
+                    "diff": [["lovelace", format!("-{collateral_value}")]],
+                }],
+            }))
+        );
+    }
+
+    /// With a `collateral_return`, only the unreturned remainder is at risk.
+    #[test]
+    fn transaction_context_collateral_with_partial_return() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let my_address = signer.derive_address(&key.expose()).unwrap();
+
+        let input_value = 10_000_000u64;
+        let collateral_value = 5_000_000u64;
+        let collateral_returned = 3_000_000u64;
+        let (source_tx_hash, source_cbor) = build_utxo_source_tx(&[
+            (&my_address, input_value, None),
+            (&my_address, collateral_value, None),
+        ]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&source_tx_hash, 0)],
+            &[(&my_address, input_value - TX_FEE, None)],
+            |body| {
+                let mut collateral = TransactionInputs::new();
+                collateral.add(&TransactionInput::new(
+                    &TransactionHash::from_hex(&source_tx_hash).unwrap(),
+                    1,
+                ));
+                body.set_collateral(&collateral);
+                body.set_collateral_return(&TransactionOutput::new(
+                    &Address::from_bech32(&my_address).unwrap(),
+                    &Value::new(&BigNum::from(collateral_returned)),
+                ));
+                body.set_total_collateral(&BigNum::from(collateral_value - collateral_returned));
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.chain_extra,
+            Some(serde_json::json!({
+                "collateral_effects": [{
+                    "address": my_address,
+                    "diff": [[
+                        "lovelace",
+                        format!("-{}", collateral_value - collateral_returned),
+                    ]],
+                }],
+            }))
+        );
+    }
+
+    #[test]
+    fn transaction_context_without_collateral_has_no_chain_extra() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let address = signer.derive_address(&key.expose()).unwrap();
+
+        let input_value = 10_000_000u64;
+        let (source_tx_hash, source_cbor) = build_utxo_source_tx(&[(&address, input_value, None)]);
+        let tx_cbor = build_test_tx_cbor(
+            &[(&source_tx_hash, 0)],
+            &[(&address, input_value - TX_FEE, None)],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(ctx.chain_extra, None);
     }
 }

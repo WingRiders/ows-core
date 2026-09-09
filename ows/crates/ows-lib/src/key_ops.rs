@@ -138,6 +138,7 @@ pub fn sign_message_with_api_key(
         effects: vec![],
         raw_hex: hex::encode(msg_bytes),
         data: None,
+        chain_extra: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
         token,
@@ -173,6 +174,7 @@ pub fn sign_hash_with_api_key(
         effects: vec![],
         raw_hex: hex::encode(policy_bytes),
         data: None,
+        chain_extra: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
         token,

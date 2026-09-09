@@ -540,6 +540,7 @@ pub struct TransactionContext {
     pub effects: Vec<TransactionEffect>,
     pub raw_hex: String,          // the raw unsigned transaction
     pub data: Option<String>,     // calldata (EVM only)
+    pub chain_extra: Option<serde_json::Value>, // chain-specific detail effects cannot carry
 }
 ```
 
@@ -576,8 +577,11 @@ made `pub(crate)`-visible for this. For every non-Cardano chain the URL stays
 
 1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure),
    and record the raw hex for `TransactionContext.raw_hex`.
-2. Collect input references as `(tx_hash_hex, index)` pairs from `tx.body().inputs()`.
-3. If there are inputs, an RPC URL is **required** (else `InvalidMessage`). Inputs are
+2. Collect input references as `(tx_hash_hex, index)` pairs from `tx.body().inputs()`,
+   and the declared collateral references the same way from `tx.body().collateral()`.
+   Both sets are resolved in one batch and split apart afterwards
+   (see [section 4.4](#44-collateral-chain_extracollateral_effects)).
+3. If there is anything to resolve, an RPC URL is **required** (else `InvalidMessage`). Inputs are
    resolved *not* by asking Koios for UTxO values, but by fetching the **CBOR of each
    referenced transaction** (`fetch_txs_cbor`, one request set per unique tx hash) and
    reading the referenced output out of it: `POST {rpc}/tx_cbor` with
@@ -624,18 +628,54 @@ The signer builds two `address → (asset_id → amount)` maps and diffs them:
 
 For every address touched by either side, and every asset id it involves, the
 effect is `output_balance − input_balance`, computed in `i128` and rendered as a
-signed decimal string (see [§4.4](#44-why-amounts-are-strings)). Zero-diff assets and
+signed decimal string (see [§4.5](#45-why-amounts-are-strings)). Zero-diff assets and
 zero-diff addresses are dropped; the remaining `diff` entries are sorted by asset
 id and the `effects` list is sorted by address, so the context is deterministic
 (important for reproducible policy decisions and stable test vectors). A pure
 self-transfer, for example, yields a single effect on the sender with only the
 negative fee.
 
-The result is returned as `TransactionContext { effects, raw_hex, data: None }` and
-handed to the policy engine, which passes it (as part of `PolicyContext`) to
-built-in rules and to executable policies over stdin.
+The result is returned as `TransactionContext { effects, raw_hex, data: None,
+chain_extra }` and handed to the policy engine, which passes it (as part of
+`PolicyContext`) to built-in rules and to executable policies over stdin.
 
-#### 4.4 Why amounts are strings
+#### 4.4 Collateral (`chain_extra.collateral_effects`)
+
+Collateral is the one value-consuming part of a Cardano transaction that `effects`
+cannot describe honestly. Every other such field — a certificate deposit, a fee, a
+donation — reduces the change output, so it shows up in `effects` whether or not the
+signer models the cause. Collateral does not: it is consumed through a separate path
+and **only when phase-2 (script) validation fails**. Folding it into `effects` would
+report a loss on the success path that never happens; leaving it out entirely would
+let an executable policy that caps outflow miss it.
+
+So it is reported separately, in the generic `chain_extra` slot:
+
+```json
+"chain_extra": {
+  "collateral_effects": [
+    { "address": "addr1…", "diff": [["lovelace", "-2000000"]] }
+  ]
+}
+```
+
+The entries have the same shape as `effects`, and the same diffing code produces
+them (`effects_from_balances`): the resolved `collateral` inputs on one side,
+`collateral_return` on the other, so what is reported is the **worst-case loss** if
+the scripts fail. `total_collateral` is not read — it is a declared figure the ledger
+already checks against the same inputs, and deriving the number from resolved UTxOs
+keeps the one trust model (see [§4.2](#42-parsing-and-input-resolution-koios-tx_cbor)).
+
+Collateral inputs are resolved in the **same** Koios batch as the spent inputs, so
+exposing them costs no extra request, and they are subject to the same fail-closed
+rule: a collateral input Koios cannot return aborts context construction. `chain_extra`
+is omitted entirely when a transaction declares no collateral, which is every
+non-script transaction.
+
+A policy that caps outflow therefore has to read both lists and decide for itself
+whether to count the contingent one.
+
+#### 4.5 Why amounts are strings
 
 `TransactionEffect.diff` carries each amount as a signed decimal **string**, not an
 integer. `TransactionEffect` lives in `ows-core` and is shared by every chain, so
@@ -772,6 +812,15 @@ status → `HttpStatus`, and an undecodable response body or amount → the new
   by asset id, and ADA is normalized to the single `"lovelace"` key. This makes the
   context stable across runs, so policy decisions are reproducible and reference
   vectors are exact.
+- **Collateral is contingent, and reported as such.** Collateral is consumed only on
+  phase-2 validation failure, so it is reported under
+  `chain_extra.collateral_effects` rather than folded into `effects`, which would
+  overstate every script transaction's cost on the success path
+  (see [section 4.4](#44-collateral-chain_extracollateral_effects)). The consequence
+  for policy authors is explicit: a spend cap that reads only `effects` does not
+  bound the collateral at risk, because collateral does not reduce the change
+  output. Declarative rules read neither list, so capping spend needs an executable
+  policy, and that policy has to add the two together itself.
 
 ### Acceptance Criteria
 
@@ -813,9 +862,11 @@ These deliverables are considered complete when:
     correct signed ADA and native-asset diffs (verified against mocked Koios
     responses for self-transfer, external+change, asset-carrying, and
     multi-input/multi-output cases); withdrawals and certificate deposits/refunds
-    are booked against the corresponding reward address; it errors when the RPC URL
-    is missing for a transaction with inputs, or when Koios returns incomplete
-    transaction data.
+    are booked against the corresponding reward address; declared collateral is
+    resolved in the same batch and reported under `chain_extra.collateral_effects`,
+    net of `collateral_return`, and is absent for a transaction without collateral;
+    it errors when the RPC URL is missing for a transaction with inputs, or when
+    Koios returns incomplete transaction data.
 13. Address balance fetching returns ADA under `lovelace` plus one entry per
     native asset (fingerprint, `policy_id.asset_name`, token-registry
     symbol/decimals), and an amount that cannot be decoded
@@ -959,7 +1010,8 @@ Components modified or added:
   `encode_signed_transaction`, the `default_derivation_paths` / `encode_keys`
   overrides, and the `make_transaction_context` override plus its Koios `tx_cbor`
   client (`fetch_txs_cbor`), which also books withdrawals and certificate
-  deposits/refunds against the reward address.
+  deposits/refunds against the reward address and reports declared collateral under
+  `chain_extra.collateral_effects`.
 - `ows/crates/ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
   default methods `verify_sign_message_address`, `default_derivation_paths`, and
   `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
@@ -1061,6 +1113,10 @@ Implemented and passing for these deliverables:
   input with an external payment plus change, the same with a native asset split
   between external and change outputs, and multi-input/multi-output transactions
   that rebalance across the wallet's own addresses and to a third party. Three
+  collateral shapes are covered too: collateral with no `collateral_return` (the
+  whole collateral input is at risk, and none of it appears in `effects`), collateral
+  with a partial return (only the remainder is at risk), and a transaction with no
+  collateral at all (`chain_extra` is absent). Three
   staking shapes are covered on top of those: a **withdrawal** (reward address
   debited, payment address credited with the withdrawal minus the fee), a **stake
   registration deposit** (payment address debited by deposit + fee, reward address
