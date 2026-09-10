@@ -42,7 +42,7 @@ fn parse_chain(s: &str) -> Result<ows_core::Chain, OwsLibError> {
 fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAccount>, OwsLibError> {
     let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
     for chain in universal_wallet_chains() {
-        let signer = signer_for_chain(&chain);
+        let signer = signer_for_chain(&chain)?;
         let paths = signer.default_derivation_paths(index);
         let curve = signer.curve();
         let keys = HdDeriver::derive_keys_from_mnemonic(mnemonic, "", paths, curve)?;
@@ -187,7 +187,7 @@ impl KeyPair {
 fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, OwsLibError> {
     let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
     for chain in universal_wallet_chains() {
-        let signer = signer_for_chain(&chain);
+        let signer = signer_for_chain(&chain)?;
         let key = keys.key_for_curve(signer.curve());
         let address = signer.derive_address(key)?;
         accounts.push(WalletAccount {
@@ -213,7 +213,7 @@ pub(crate) fn secret_to_signing_key(
                 OwsLibError::InvalidInput("wallet contains invalid UTF-8 mnemonic".into())
             })?;
             let mnemonic = Mnemonic::from_phrase(phrase)?;
-            let signer = signer_for_chain_type(chain_type);
+            let signer = signer_for_chain_type(chain_type)?;
             let keys = HdDeriver::derive_keys_from_mnemonic_cached(
                 &mnemonic,
                 "",
@@ -225,7 +225,7 @@ pub(crate) fn secret_to_signing_key(
         KeyType::PrivateKey => {
             // JSON key pair — extract the right key for this chain's curve
             let keys = KeyPair::from_json_bytes(secret.expose())?;
-            let signer = signer_for_chain_type(chain_type);
+            let signer = signer_for_chain_type(chain_type)?;
             let key = keys.key_for_curve(signer.curve());
 
             // if the key for the requested curve is empty, it means that the wallet was imported using private keys before the support for the requested curve was added
@@ -263,7 +263,7 @@ pub fn derive_address(
 ) -> Result<String, OwsLibError> {
     let chain = parse_chain(chain)?;
     let mnemonic = Mnemonic::from_phrase(mnemonic_phrase)?;
-    let signer = signer_for_chain(&chain);
+    let signer = signer_for_chain(&chain)?;
     let paths = signer.default_derivation_paths(index.unwrap_or(0));
     let curve = signer.curve();
 
@@ -385,10 +385,10 @@ pub fn import_wallet_private_key(
         .then(|| decode_hex_key(private_key_hex))
         .transpose()?;
 
-    let source_curve = chain
-        .map(|c| parse_chain(c).map(|parsed| signer_for_chain(&parsed).curve()))
-        .transpose()?
-        .unwrap_or(ows_signer::Curve::Secp256k1);
+    let source_curve = match chain {
+        Some(c) => signer_for_chain(&parse_chain(c)?)?.curve(),
+        None => ows_signer::Curve::Secp256k1,
+    };
 
     let get_key =
         |key_hex: Option<&str>,
@@ -532,7 +532,7 @@ fn sign_hash_with_credential(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
-    let signer = signer_for_chain(chain);
+    let signer = signer_for_chain(chain)?;
     if signer.curve() != Curve::Secp256k1 {
         return Err(OwsLibError::InvalidInput(
             "raw hash signing is only supported for secp256k1-backed chains".into(),
@@ -597,7 +597,7 @@ pub fn sign_transaction(
     // Owner mode: existing passphrase-based signing (unchanged)
     let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(&chain);
+    let signer = signer_for_chain(&chain)?;
     let signable = signer.extract_signable_bytes(&tx_bytes)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
 
@@ -704,7 +704,7 @@ pub fn sign_message(
     // Owner mode
     let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(&chain);
+    let signer = signer_for_chain(&chain)?;
     let output = signer.sign_message(key.expose(), &msg_bytes, address)?;
 
     Ok(SignResult {
@@ -749,7 +749,7 @@ pub fn sign_typed_data(
     }
 
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(&chain);
+    let signer = signer_for_chain(&chain)?;
     signer.verify_sign_message_address(key.expose(), address)?;
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
@@ -785,7 +785,7 @@ pub fn sign_and_send(
         let chain_info = parse_chain(chain)?;
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
-        let signer = signer_for_chain(&chain_info);
+        let signer = signer_for_chain(&chain_info)?;
 
         // An explicit URL wins; otherwise resolve the configured one for the chains whose
         // make_transaction_context cannot build a context without it.
@@ -835,7 +835,7 @@ pub fn sign_encode_and_broadcast(
     rpc_url: Option<&str>,
 ) -> Result<SendResult, OwsLibError> {
     let chain = parse_chain(chain)?;
-    let signer = signer_for_chain(&chain);
+    let signer = signer_for_chain(&chain)?;
 
     // 1. Extract signable portion (strips signature-slot headers for Solana; no-op for others)
     let signable = signer.extract_signable_bytes(tx_bytes)?;
@@ -2362,7 +2362,7 @@ mod tests {
 
         // Now encode the full signed transaction (what the library does correctly)
         let key = decrypt_signing_key("send-bug", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm).unwrap();
         let output = signer.sign_transaction(key.expose(), &unsigned_tx).unwrap();
         let full_signed_tx = signer
             .encode_signed_transaction(&unsigned_tx, &output)
@@ -3165,7 +3165,7 @@ mod tests {
         // by manually calling the signer's extract/sign/encode chain:
         let key =
             decrypt_signing_key("char-sol-sig", ChainType::Solana, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Solana);
+        let signer = signer_for_chain_type(ChainType::Solana).unwrap();
 
         let signable = signer.extract_signable_bytes(&tx_bytes).unwrap();
         assert_eq!(
@@ -3231,7 +3231,7 @@ mod tests {
         // Path B: the internal pipeline (what sign_and_send uses)
         let key =
             decrypt_signing_key("char-encode", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm).unwrap();
         let output = signer.sign_transaction(key.expose(), &unsigned_tx).unwrap();
         let full_signed_tx = signer
             .encode_signed_transaction(&unsigned_tx, &output)
@@ -3368,7 +3368,7 @@ mod tests {
 
         let key =
             decrypt_signing_key(&wallet.id, ChainType::Evm, "pass", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm).unwrap();
         let direct = signer
             .sign(key.expose(), &hex::decode(&hash_hex).unwrap())
             .unwrap();
@@ -3658,7 +3658,7 @@ mod tests {
 
         // Path B: direct signer call (no credential branch)
         let key = decrypt_signing_key("reg-owner", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm).unwrap();
         let tx_bytes = hex::decode(tx_hex).unwrap();
         let direct_output = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
 
@@ -3737,7 +3737,7 @@ mod tests {
 
         // Direct signer
         let key = decrypt_signing_key("reg-msg", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm).unwrap();
         let direct = signer.sign_message(key.expose(), b"hello", None).unwrap();
 
         assert_eq!(
@@ -3868,7 +3868,7 @@ mod tests {
         // Path B: manual extract + sign
         let key =
             decrypt_signing_key("sol-match", ChainType::Solana, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain_type(ChainType::Solana);
+        let signer = signer_for_chain_type(ChainType::Solana).unwrap();
         let signable = signer.extract_signable_bytes(&full_tx).unwrap();
         let direct = signer.sign_transaction(key.expose(), signable).unwrap();
 

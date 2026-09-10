@@ -70,11 +70,19 @@ impl CardanoSigner {
         }
     }
 
-    pub fn from_chain_id(chain_id: &str) -> Self {
+    /// The network lives in the address header byte and is chosen here, not signed
+    /// into the transaction as on EVM, so an unrecognised reference must not fall
+    /// back to a network: assuming mainnet would derive mainnet addresses and produce
+    /// real mainnet signatures for someone who asked for something else.
+    pub fn from_chain_id(chain_id: &str) -> Result<Self, SignerError> {
         match chain_id {
-            "cip34:0-1" => Self::preprod(),
-            "cip34:0-2" => Self::preview(),
-            _ => Self::mainnet(),
+            "cip34:1-764824073" => Ok(Self::mainnet()),
+            "cip34:0-1" => Ok(Self::preprod()),
+            "cip34:0-2" => Ok(Self::preview()),
+            _ => Err(SignerError::UnsupportedChain(format!(
+                "unknown Cardano network '{chain_id}'; expected one of \
+                 cip34:1-764824073 (mainnet), cip34:0-1 (preprod), cip34:0-2 (preview)"
+            ))),
         }
     }
 
@@ -1006,6 +1014,40 @@ mod tests {
         assert_eq!(s.chain_type(), ChainType::Cardano);
         assert_eq!(s.curve(), Curve::Ed25519Bip32);
         assert_eq!(s.coin_type(), 1815);
+    }
+
+    #[test]
+    fn from_chain_id_maps_known_networks_and_rejects_the_rest() {
+        assert_eq!(
+            CardanoSigner::from_chain_id("cip34:1-764824073")
+                .unwrap()
+                .network_id,
+            NetworkInfo::mainnet().network_id()
+        );
+        assert_eq!(
+            CardanoSigner::from_chain_id("cip34:0-1")
+                .unwrap()
+                .network_id,
+            NetworkInfo::testnet_preprod().network_id()
+        );
+        assert_eq!(
+            CardanoSigner::from_chain_id("cip34:0-2")
+                .unwrap()
+                .network_id,
+            NetworkInfo::testnet_preview().network_id()
+        );
+
+        // `parse_chain` accepts any reference under the `cip34` namespace, so these
+        // reach the constructor; none of them may resolve to a network.
+        for chain_id in ["cip34:0-999", "cip34:1-1", "cip34:mainnet", "cip34:", ""] {
+            assert!(
+                matches!(
+                    CardanoSigner::from_chain_id(chain_id),
+                    Err(SignerError::UnsupportedChain(_))
+                ),
+                "{chain_id} was accepted"
+            );
+        }
     }
 
     #[test]

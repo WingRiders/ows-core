@@ -181,4 +181,7 @@ pub enum SignerError {
 
     #[error("RPC error: {0}")]
     RpcError(String),
+
+    #[error("unsupported chain: {0}")]
+    UnsupportedChain(String),
 }

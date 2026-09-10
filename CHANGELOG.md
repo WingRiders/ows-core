@@ -50,6 +50,9 @@ Rust API:
 - `BalanceInfo.value` and `.price` are `Option<f64>`, absent on chains without pricing
 - `enforce_policy_and_decrypt_key` is split into `load_authorized_wallet` and
   `enforce_policies_and_decrypt_key`
+- `signer_for_chain` and `signer_for_chain_type` return
+  `Result<Box<dyn ChainSigner>, SignerError>`: Cardano rejects a `cip34:` reference it
+  does not know (`SignerError::UnsupportedChain`) rather than assuming mainnet
 
 Node and Python SDKs — arity changes only. Every new parameter is at the **end** of
 the list, so existing positional calls are unaffected:

@@ -12,7 +12,7 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
     if let Some(cs) = chain_str {
         // Derive for a single chain
         let chain = parse_chain(cs)?;
-        let signer = signer_for_chain(&chain);
+        let signer = signer_for_chain(&chain)?;
         let paths = signer.default_derivation_paths(index);
         let curve = signer.curve();
 
@@ -24,7 +24,7 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
     } else {
         // Derive for all universal-wallet networks (see `ows_core::universal_wallet_chains`)
         for chain in universal_wallet_chains() {
-            let signer = signer_for_chain(&chain);
+            let signer = signer_for_chain(&chain)?;
             let paths = signer.default_derivation_paths(index);
             let curve = signer.curve();
 

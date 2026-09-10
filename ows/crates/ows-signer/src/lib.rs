@@ -41,7 +41,7 @@ mod integration_tests {
     const ABANDON_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn derive_address_for_chain(mnemonic: &Mnemonic, chain: ChainType) -> String {
-        let signer = signer_for_chain_type(chain);
+        let signer = signer_for_chain_type(chain).unwrap();
         let curve = signer.curve();
         let paths = signer.default_derivation_paths(0);
 
@@ -154,8 +154,8 @@ mod integration_tests {
     #[test]
     fn test_spark_uses_bitcoin_derivation_path() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
-        let btc_signer = signer_for_chain_type(ChainType::Bitcoin);
-        let spark_signer = signer_for_chain_type(ChainType::Spark);
+        let btc_signer = signer_for_chain_type(ChainType::Bitcoin).unwrap();
+        let spark_signer = signer_for_chain_type(ChainType::Spark).unwrap();
 
         // Same derivation path
         assert_eq!(
@@ -236,7 +236,7 @@ mod integration_tests {
             ChainType::Spark,
             ChainType::Filecoin,
         ] {
-            let signer = signer_for_chain_type(chain);
+            let signer = signer_for_chain_type(chain).unwrap();
             let path = signer.default_derivation_path(0);
             let key =
                 HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, Curve::Secp256k1).unwrap();
@@ -254,7 +254,7 @@ mod integration_tests {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
 
         for chain in [ChainType::Solana, ChainType::Ton] {
-            let signer = signer_for_chain_type(chain);
+            let signer = signer_for_chain_type(chain).unwrap();
             let path = signer.default_derivation_path(0);
             let key =
                 HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, Curve::Ed25519).unwrap();
@@ -280,8 +280,18 @@ mod integration_tests {
             ChainType::Xrpl,
             ChainType::Cardano,
         ] {
-            let signer = signer_for_chain_type(chain);
+            let signer = signer_for_chain_type(chain).unwrap();
             assert_eq!(signer.chain_type(), chain);
         }
+    }
+
+    #[test]
+    fn test_signer_for_chain_rejects_unknown_cardano_network() {
+        let chain = ows_core::parse_chain("cip34:0-999").unwrap();
+        assert_eq!(chain.chain_type, ChainType::Cardano);
+        assert!(matches!(
+            signer_for_chain(&chain),
+            Err(SignerError::UnsupportedChain(_))
+        ));
     }
 }

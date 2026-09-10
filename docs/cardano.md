@@ -235,9 +235,25 @@ RPC resolution reuses the generic precedence already in place: explicit override
 #### 1.5 Signer resolution
 
 `signer_for_chain` constructs `CardanoSigner::from_chain_id(chain.chain_id)`, which
-selects network parameters from the CAIP-2 id (`cip34:0-1` → preprod, `cip34:0-2`
-→ preview, anything else → mainnet). Network parameters come from
+selects network parameters from the CAIP-2 id — `cip34:1-764824073` → mainnet,
+`cip34:0-1` → preprod, `cip34:0-2` → preview — and **rejects any other reference**
+with `SignerError::UnsupportedChain`. Network parameters come from
 `cardano-serialization-lib`'s `NetworkInfo`.
+
+Rejecting is not a formality: `parse_chain` accepts any reference under a known
+namespace (`cip34:0-999` parses), so an unsupported network does reach this
+constructor. On EVM the chain id is signed into the transaction, so a wrong network
+cannot yield a signature that is valid elsewhere; on Cardano the network lives in the
+address header byte and is chosen here, so a fallback to mainnet would derive mainnet
+addresses and produce real mainnet signatures for a caller who asked for a testnet.
+A rejected reference is never signed with, transmitted or turned into an address. How
+early it fails depends on the path: the paths that build a transaction context
+(`sign_with_api_key`, `sign_and_send` in agent mode, `sign_encode_and_broadcast`,
+`sign_hash_with_credential`) construct the signer before resolving an RPC URL, before
+the policy context and before the key; the owner-mode signing paths and the api-key
+message and hash paths derive the key first and reject after it.
+This is why `signer_for_chain` and `signer_for_chain_type` return
+`Result<Box<dyn ChainSigner>, SignerError>`.
 
 ### 2. Key derivation and cryptography
 
@@ -1173,7 +1189,10 @@ Implemented and passing for these deliverables:
   preview).
 - **Config** (`config.rs`): default RPC lookups for all three Koios endpoints.
 - **Signer** (`cardano.rs`): CIP-1852 path construction; chain type/curve/coin
-  type; default path equals payment leaf.
+  type; default path equals payment leaf; `from_chain_id` maps the three known
+  references to their network ids and rejects every other one, with
+  `signer_for_chain` propagating that rejection for a `cip34:` id `parse_chain`
+  accepted.
 - **Address encoding** (`cardano.rs`): mainnet **base** address from 12- and
   24-word mnemonics (via `default_derivation_paths` and `encode_keys`) against fixed
   `addr1q…` vectors;

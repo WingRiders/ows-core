@@ -26,13 +26,17 @@ pub use self::ton::TonSigner;
 pub use self::tron::TronSigner;
 pub use self::xrpl::XrplSigner;
 
-use crate::traits::ChainSigner;
+use crate::traits::{ChainSigner, SignerError};
 use ows_core::{default_chain_for_type, Chain, ChainType};
 
-/// Resolve a signer from a parsed CAIP-2 chain. Families whose address format
-/// depends on the network read `chain.chain_id` inside their constructor.
-pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
-    match chain.chain_type {
+/// Resolve a signer from a parsed CAIP-2 chain. `parse_chain` accepts any reference
+/// within a known namespace, so an unsupported network reaches this point as a
+/// `Chain`: `CardanoSigner` reads `chain.chain_id` and rejects a reference it does not
+/// know rather than guessing a network — see [`CardanoSigner::from_chain_id`]. The
+/// other families whose address format depends on the network still resolve to one
+/// fixed network for every reference in their namespace.
+pub fn signer_for_chain(chain: &Chain) -> Result<Box<dyn ChainSigner>, SignerError> {
+    Ok(match chain.chain_type {
         ChainType::Evm => Box::new(EvmSigner),
         ChainType::Solana => Box::new(SolanaSigner),
         ChainType::Bitcoin => Box::new(BitcoinSigner::mainnet()),
@@ -45,11 +49,11 @@ pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
-        ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)),
-    }
+        ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)?),
+    })
 }
 
 /// Get a default signer for a given chain family (first registry entry per family).
-pub fn signer_for_chain_type(chain_type: ChainType) -> Box<dyn ChainSigner> {
+pub fn signer_for_chain_type(chain_type: ChainType) -> Result<Box<dyn ChainSigner>, SignerError> {
     signer_for_chain(&default_chain_for_type(chain_type))
 }
