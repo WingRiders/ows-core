@@ -680,10 +680,12 @@ already checks against the same inputs, and deriving the number from resolved UT
 keeps the one trust model (see [§4.2](#42-parsing-and-input-resolution-koios-tx_cbor)).
 
 Collateral inputs are resolved in the **same** Koios batch as the spent inputs, so
-exposing them costs no extra request, and they are subject to the same fail-closed
-rule: a collateral input Koios cannot return aborts context construction. `chain_extra`
-is omitted entirely when a transaction declares no collateral, which is every
-non-script transaction.
+exposing them usually costs no extra request — the batch is deduplicated and chunked
+at ten hashes per `tx_cbor` call, so collateral adds a call only when its own unique
+hashes push the total past a multiple of ten — and they are subject to the same
+fail-closed rule: a collateral input Koios cannot return aborts context construction.
+`chain_extra` is omitted entirely when a transaction declares no collateral, which is
+every non-script transaction.
 
 A policy that caps outflow therefore has to read both lists and decide for itself
 whether to count the contingent one.
