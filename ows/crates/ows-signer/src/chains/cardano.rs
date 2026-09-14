@@ -27,6 +27,19 @@ const LOVELACE_ASSET_ID: &str = "lovelace";
 const KOIOS_TXS_CBOR_CHUNK_SIZE: usize = 10;
 const KOIOS_REQUESTS_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Largest transaction we will hand to CSL's parser. The Cardano protocol's
+/// `maxTxSize` is 16384 bytes, so anything larger cannot be a valid on-chain
+/// transaction — it can only be an attempt to exhaust the parser.
+const MAX_TX_BYTES: usize = 16384;
+
+/// Largest CBOR nesting depth we will accept. CSL 14.1.2 descends recursively
+/// with no depth guard of its own (metadata / auxiliary data especially), so a
+/// deeply nested value overflows the stack and aborts the process. A real
+/// transaction nests only a handful of levels; this bound sits far above any
+/// legitimate value yet well below the overflow threshold on the smallest
+/// stacks the signer runs on.
+const MAX_CBOR_DEPTH: usize = 128;
+
 type AssetBalanceMap = BTreeMap<String, u64>;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -516,6 +529,12 @@ impl CardanoSigner {
             let cbor_bytes = hex::decode(cbor_hex).map_err(|e| {
                 SignerError::RpcError(format!("invalid CBOR hex for tx {expected_hash}: {e}"))
             })?;
+            // The hash check below cannot protect us here: a malicious or compromised
+            // Koios endpoint can return a crash payload that aborts the process inside
+            // from_bytes, before any hash is ever computed. Guard the bytes first.
+            check_tx_cbor(&cbor_bytes).map_err(|e| {
+                SignerError::RpcError(format!("invalid CBOR for tx {expected_hash}: {e}"))
+            })?;
             let tx = FixedTransaction::from_bytes(cbor_bytes).map_err(|e| {
                 SignerError::RpcError(format!("invalid CBOR for tx {expected_hash}: {e}"))
             })?;
@@ -727,6 +746,7 @@ impl ChainSigner for CardanoSigner {
     ) -> Result<SignOutput, SignerError> {
         let (pay, stake) = Self::decode_keys(private_key)?;
 
+        check_tx_cbor(tx_bytes).map_err(SignerError::InvalidTransaction)?;
         let tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
             .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
 
@@ -786,6 +806,7 @@ impl ChainSigner for CardanoSigner {
         tx_bytes: &[u8],
         signature: &SignOutput,
     ) -> Result<Vec<u8>, SignerError> {
+        check_tx_cbor(tx_bytes).map_err(SignerError::InvalidTransaction)?;
         let mut tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
             .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
 
@@ -806,6 +827,7 @@ impl ChainSigner for CardanoSigner {
     ) -> Result<TransactionContext, SignerError> {
         let tx_hex = hex::encode(tx_bytes);
 
+        check_tx_cbor(tx_bytes).map_err(SignerError::InvalidTransaction)?;
         let tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
             .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
 
@@ -965,6 +987,156 @@ impl ChainSigner for CardanoSigner {
 
         Ok(SecretBytes::new(buf))
     }
+}
+
+/// Reject transaction bytes that would crash CSL's parser before it ever runs.
+///
+/// Two input shapes abort the whole process inside `FixedTransaction::from_bytes`,
+/// and neither is recoverable with `catch_unwind`:
+///   * deeply nested CBOR overflows the stack during CSL's recursive descent;
+///   * a byte/text string whose length header declares a huge size makes the
+///     decoder allocate that much up front and abort on allocation failure.
+///
+/// A guard at the binding boundary is therefore useless — the fix has to be
+/// preventive, here in the parse path. This non-recursive scan catches both:
+/// it caps the total length, bounds nesting depth, and verifies every declared
+/// string length fits within the remaining input. It only checks structural
+/// well-formedness; CSL still does the real decoding and validation afterwards.
+///
+/// Returns a description of the first problem found, for the caller to wrap in
+/// whichever `SignerError` variant fits the call site.
+fn check_tx_cbor(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_TX_BYTES {
+        return Err(format!(
+            "transaction is {} bytes, over the {MAX_TX_BYTES}-byte limit",
+            bytes.len()
+        ));
+    }
+
+    fn read_uint(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u64, String> {
+        if *pos + n > bytes.len() {
+            return Err("truncated integer".into());
+        }
+        let mut v = 0u64;
+        for i in 0..n {
+            v = (v << 8) | bytes[*pos + i] as u64;
+        }
+        *pos += n;
+        Ok(v)
+    }
+
+    let len = bytes.len();
+    let mut pos = 0usize;
+
+    // Each frame is the number of items still expected in an open definite-length
+    // container, or `None` for an indefinite one (closed by a break). The vector
+    // length (minus the synthetic root) is the current nesting depth. The root
+    // frame requires exactly one top-level item — the transaction.
+    let mut stack: Vec<Option<u64>> = vec![Some(1)];
+
+    while !stack.is_empty() {
+        if matches!(stack.last(), Some(Some(0))) {
+            stack.pop();
+            continue;
+        }
+        if stack.len() - 1 > MAX_CBOR_DEPTH {
+            return Err("CBOR nesting too deep".into());
+        }
+        if pos >= len {
+            return Err("truncated CBOR".into());
+        }
+
+        let ib = bytes[pos];
+        pos += 1;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+
+        // A break closes the nearest indefinite-length container.
+        if major == 7 && ai == 31 {
+            match stack.last() {
+                Some(None) => {
+                    stack.pop();
+                }
+                _ => return Err("unexpected CBOR break".into()),
+            }
+            continue;
+        }
+
+        // This item fills one slot of the container it sits in.
+        if let Some(Some(remaining)) = stack.last_mut() {
+            *remaining -= 1;
+        }
+
+        let arg = match ai {
+            0..=23 => Some(ai as u64),
+            24 => Some(read_uint(bytes, &mut pos, 1)?),
+            25 => Some(read_uint(bytes, &mut pos, 2)?),
+            26 => Some(read_uint(bytes, &mut pos, 4)?),
+            27 => Some(read_uint(bytes, &mut pos, 8)?),
+            31 => None, // indefinite length
+            _ => return Err("reserved CBOR additional-info value".into()),
+        };
+
+        match major {
+            // Unsigned/negative integers carry no further payload.
+            0 | 1 => {}
+            // Byte / text strings: the whole point of the OOM guard.
+            2 | 3 => match arg {
+                Some(n) => {
+                    let n = n as usize;
+                    if n > len - pos {
+                        return Err("CBOR string length exceeds input".into());
+                    }
+                    pos += n;
+                }
+                None => loop {
+                    if pos >= len {
+                        return Err("truncated indefinite CBOR string".into());
+                    }
+                    let cb = bytes[pos];
+                    pos += 1;
+                    if cb == 0xff {
+                        break; // break tag ends the chunk sequence
+                    }
+                    if (cb >> 5) != major || (cb & 0x1f) == 31 {
+                        return Err("malformed indefinite CBOR string chunk".into());
+                    }
+                    let cn = match cb & 0x1f {
+                        0..=23 => (cb & 0x1f) as u64,
+                        24 => read_uint(bytes, &mut pos, 1)?,
+                        25 => read_uint(bytes, &mut pos, 2)?,
+                        26 => read_uint(bytes, &mut pos, 4)?,
+                        27 => read_uint(bytes, &mut pos, 8)?,
+                        _ => return Err("malformed CBOR string chunk length".into()),
+                    } as usize;
+                    if cn > len - pos {
+                        return Err("CBOR string chunk exceeds input".into());
+                    }
+                    pos += cn;
+                },
+            },
+            // Array: `n` following items.
+            4 => stack.push(arg),
+            // Map: `n` key/value pairs, i.e. 2n following items.
+            5 => match arg {
+                Some(n) => {
+                    let items = n.checked_mul(2).ok_or("CBOR map too large")?;
+                    stack.push(Some(items));
+                }
+                None => stack.push(None),
+            },
+            // Tag: wraps exactly one following item.
+            6 => stack.push(Some(1)),
+            // Simple values / floats: the argument was the whole payload.
+            7 => {}
+            _ => unreachable!("CBOR major type is only 3 bits"),
+        }
+    }
+
+    if pos != len {
+        return Err("trailing bytes after CBOR transaction".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2054,5 +2226,80 @@ mod tests {
         mock.assert();
 
         assert_eq!(ctx.chain_extra, None);
+    }
+
+    #[test]
+    fn check_tx_cbor_accepts_real_transactions() {
+        // A plain signed transaction and one carrying certificates and a second
+        // witness — both taken from the signing tests above — must pass the guard.
+        for hex_tx in [
+            "84a300d9010281825820cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe00018182581d6106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed03031a001e8480021a000f4240a100d901028182582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128584081a1235ccc8c96203f379891da1041af709f532f97a73d220eb081f444622701ce5660044f8fe90ec74d3d4ad7c1c0aece569a106f08a298566c51b139285500f5f6",
+            "84a400d9010281825820cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe0101818258390106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed0303127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f39831a002dc6c0021a000f42400ed9010281581c127d430c25123618becd71c191ea1ceb7108e76f479a3e6e839f3983a100d901028282582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a696121285840f0389089c22a690bcbcab9d5865a2b33c06f0a58ba236adaada5f24adb5a39759667876c24250f8c991d1b8c71dca80e05c789eb23a34b66fd53b81d629d1504825820097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c22065840610945a63febb28741a4d2f9870e3de903f0a8c2f1c7b86e0a61adb667b973306177827559a1e7bacd452682b90eb5b15f4e5ab5a1433b62e0b2429b76b0a604f5f6",
+        ] {
+            let bytes = hex::decode(hex_tx).unwrap();
+            assert!(check_tx_cbor(&bytes).is_ok(), "guard rejected a valid tx");
+            // The guard only screens; CSL must still accept what it lets through.
+            FixedTransaction::from_bytes(bytes).unwrap();
+        }
+    }
+
+    // A minimal well-formed tx body `{0: [[<32-byte txid>, 0]], 1: <outputs>, 2: 0}`,
+    // used to reach the interesting parts of the two crash payloads below.
+    fn crash_test_body(outputs: &[u8]) -> Vec<u8> {
+        let mut body = vec![0xa3]; // map(3)
+        body.push(0x00); // key 0: inputs
+        body.extend_from_slice(&[0x81, 0x82, 0x58, 0x20]); // [ [ bytes(32)
+        body.extend_from_slice(&[0u8; 32]); // txid
+        body.push(0x00); // index 0 ] ]
+        body.push(0x01); // key 1: outputs
+        body.extend_from_slice(outputs);
+        body.extend_from_slice(&[0x02, 0x00]); // key 2: fee 0
+        body
+    }
+
+    #[test]
+    fn check_tx_cbor_rejects_oversized_string_length() {
+        // A tx whose output-address bytestring declares ~2^62 bytes. CSL's decoder
+        // would allocate that up front and abort the process; the guard must reject
+        // it instead. Inside the size cap — the length header is the whole attack.
+        let mut outputs = vec![0x81, 0x82, 0x5b]; // [ [ bytes(8-byte length)
+        outputs.extend_from_slice(&0x3fff_ffff_ffff_fff0u64.to_be_bytes());
+        outputs.push(0x00); // amount 0 ] ]
+
+        let mut tx = vec![0x84]; // array(4)
+        tx.extend_from_slice(&crash_test_body(&outputs));
+        tx.extend_from_slice(&[0xa0, 0xf5, 0xf6]); // witness set, is_valid, null aux
+
+        assert!(tx.len() < MAX_TX_BYTES);
+        let err = check_tx_cbor(&tx).unwrap_err();
+        assert!(
+            err.contains("string length exceeds input"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_tx_cbor_rejects_deeply_nested_cbor() {
+        // ~3 KB of auxiliary-data nesting — inside the 16 KB size cap, but deep
+        // enough to overflow CSL's recursive descent and abort the process.
+        let mut aux = vec![0xa1, 0x00]; // {0: <deeply nested list>}
+        aux.extend(std::iter::repeat(0x81).take(3000)); // 3000x array(1)
+        aux.push(0x00); // innermost value
+
+        let mut tx = vec![0x84]; // array(4)
+        tx.extend_from_slice(&crash_test_body(&[0x80])); // empty outputs
+        tx.extend_from_slice(&[0xa0, 0xf5]); // witness set, is_valid
+        tx.extend_from_slice(&aux);
+
+        assert!(tx.len() < MAX_TX_BYTES);
+        let err = check_tx_cbor(&tx).unwrap_err();
+        assert!(err.contains("nesting too deep"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn check_tx_cbor_rejects_oversized_input() {
+        let too_big = vec![0u8; MAX_TX_BYTES + 1];
+        let err = check_tx_cbor(&too_big).unwrap_err();
+        assert!(err.contains("over the"), "unexpected error: {err}");
     }
 }
