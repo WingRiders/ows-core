@@ -16,6 +16,9 @@ const CHAIN_MAP = {
   xrpl: "xrpl:mainnet",
   filecoin: "fil:mainnet",
   spark: "spark:mainnet",
+  cardano: "cip34:1-764824073",
+  "cardano-preprod": "cip34:0-1",
+  "cardano-preview": "cip34:0-2",
 };
 
 function resolveChain(chain) {
