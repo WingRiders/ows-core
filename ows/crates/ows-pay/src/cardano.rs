@@ -73,7 +73,11 @@ pub(crate) async fn get_cardano_balances(
         )
     })?;
 
-    let mut assets_quantities: HashMap<(String, String, String), u64> = HashMap::new();
+    // Per-asset quantity sums. A single UTxO's quantity is u64 on-chain (CDDL
+    // `positive_coin`), but one address can hold the same asset across several UTxOs
+    // and an asset can be minted up to u64::MAX, so the sum can exceed u64 and would
+    // wrap (release) or panic (debug). u128, not i128: these are only ever added.
+    let mut assets_quantities: HashMap<(String, String, String), u128> = HashMap::new();
     for utxo in info.utxo_set {
         for asset in utxo.asset_list.unwrap_or_default() {
             let qty = asset.quantity.parse::<u64>().map_err(|e| {
@@ -91,7 +95,7 @@ pub(crate) async fn get_cardano_balances(
                 asset.asset_name.clone().unwrap_or_default(),
                 asset.fingerprint.clone(),
             );
-            *assets_quantities.entry(key).or_insert(0) += qty;
+            *assets_quantities.entry(key).or_insert(0) += u128::from(qty);
         }
     }
 
@@ -223,6 +227,53 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(serde_json::to_string(rows).unwrap())
             .create()
+    }
+
+    #[test]
+    fn asset_quantities_sum_past_u64_without_wrapping() {
+        // Two UTxOs at one address, each holding u64::MAX of the same asset. A u64
+        // accumulator would wrap (release) or panic (debug); u128 keeps the true sum.
+        let policy_id = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let asset_name = "54455354";
+        let fingerprint = "asset1ua6pz3yd5mdka946z8jw2fld3f8d0mmxt75gv9";
+
+        let mut server = Server::new();
+        let utxo = || KoiosAddressUtxo {
+            asset_list: Some(vec![KoiosAsset {
+                policy_id: policy_id.into(),
+                asset_name: Some(asset_name.into()),
+                fingerprint: fingerprint.into(),
+                quantity: u64::MAX.to_string(),
+            }]),
+        };
+        let address_mock = mock_address_info_response(
+            &mut server,
+            &[KoiosAddressInfoRow {
+                balance: "0".into(),
+                utxo_set: vec![utxo(), utxo()],
+            }],
+        );
+        let asset_mock = mock_asset_info_response(
+            &mut server,
+            &[KoiosAssetInfoRow {
+                policy_id: policy_id.into(),
+                asset_name: Some(asset_name.into()),
+                token_registry_metadata: None,
+            }],
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let balances = rt
+            .block_on(get_cardano_balances("addr1test", &server.url()))
+            .unwrap();
+
+        address_mock.assert();
+        asset_mock.assert();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].balance.amount, 2.0 * u64::MAX as f64);
     }
 
     #[test]

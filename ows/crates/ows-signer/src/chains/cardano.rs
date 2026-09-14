@@ -40,7 +40,14 @@ const MAX_TX_BYTES: usize = 16384;
 /// stacks the signer runs on.
 const MAX_CBOR_DEPTH: usize = 128;
 
-type AssetBalanceMap = BTreeMap<String, u64>;
+// Per-address, per-asset balance sums (lovelace and native assets alike). On-chain
+// both are u64 (CDDL `coin` / `positive_coin`), but summing several UTxOs or outputs
+// under one address can exceed u64 for a native asset — one asset can be minted up to
+// u64::MAX, whereas ADA's total supply keeps its sums well in range. i128, not u64, so
+// the sum can't wrap (release) or panic (debug); signed, not u128, because
+// `effects_from_balances` nets input against output and an outflow is negative. i128
+// holds any realistic sum (a tx's few hundred entries, each ≤ u64::MAX) with room to spare.
+type AssetBalanceMap = BTreeMap<String, i128>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosAssetListItem {
@@ -315,7 +322,7 @@ impl CardanoSigner {
             .entry(address)
             .or_default()
             .entry(LOVELACE_ASSET_ID.to_string())
-            .or_insert(0) += amount;
+            .or_insert(0) += i128::from(amount);
     }
 
     /// Fold a resolved UTxO's lovelace and native-asset amounts into `balances`, under its address.
@@ -327,22 +334,22 @@ impl CardanoSigner {
 
         *for_address
             .entry(LOVELACE_ASSET_ID.to_string())
-            .or_insert(0) += utxo.value.parse::<u64>().map_err(|e| {
+            .or_insert(0) += i128::from(utxo.value.parse::<u64>().map_err(|e| {
             SignerError::InvalidTransaction(format!(
                 "invalid lovelace value for utxo {}#{}: {e}",
                 utxo.tx_hash, utxo.tx_index
             ))
-        })?;
+        })?);
 
         for asset in utxo.asset_list.iter().flatten() {
             *for_address
                 .entry(format!("{}{}", asset.policy_id, asset.asset_name))
-                .or_insert(0) += asset.quantity.parse::<u64>().map_err(|e| {
+                .or_insert(0) += i128::from(asset.quantity.parse::<u64>().map_err(|e| {
                 SignerError::InvalidTransaction(format!(
                     "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
                     utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
                 ))
-            })?;
+            })?);
         }
 
         Ok(())
@@ -363,7 +370,7 @@ impl CardanoSigner {
         let lovelace: u64 = output.amount().coin().into();
         *for_address
             .entry(LOVELACE_ASSET_ID.to_string())
-            .or_insert(0) += lovelace;
+            .or_insert(0) += i128::from(lovelace);
 
         let Some(ma) = output.amount().multiasset() else {
             return Ok(());
@@ -383,7 +390,7 @@ impl CardanoSigner {
                         policy_id.to_hex(),
                         hex::encode(asset_name.name())
                     ))
-                    .or_insert(0) += asset_quantity;
+                    .or_insert(0) += i128::from(asset_quantity);
             }
         }
 
@@ -424,8 +431,7 @@ impl CardanoSigner {
                 let input_balance = *input_balances.get(asset_id).unwrap_or(&0);
                 let output_balance = *output_balances.get(asset_id).unwrap_or(&0);
 
-                // i128 keeps the subtraction exact: a native-asset quantity can reach u64::MAX
-                let asset_diff = i128::from(output_balance) - i128::from(input_balance);
+                let asset_diff = output_balance - input_balance;
                 if asset_diff == 0 {
                     continue;
                 }
@@ -2226,6 +2232,45 @@ mod tests {
         mock.assert();
 
         assert_eq!(ctx.chain_extra, None);
+    }
+
+    #[test]
+    fn add_utxo_balance_sums_past_u64_without_wrapping() {
+        // Two UTxOs at one address, each holding u64::MAX of the same native asset.
+        // A u64 accumulator would wrap (release) or panic (debug); i128 keeps the
+        // true sum, which the effect diff must report exactly.
+        let asset = KoiosAssetListItem {
+            policy_id: "a".repeat(56),
+            asset_name: "beef".to_string(),
+            quantity: u64::MAX.to_string(),
+        };
+        let row = |idx: u32| KoiosUtxoInfoRow {
+            tx_hash: "0".repeat(64),
+            tx_index: idx,
+            address: "addr_test1vabc".to_string(),
+            value: "1000000".to_string(),
+            asset_list: Some(vec![KoiosAssetListItem {
+                policy_id: asset.policy_id.clone(),
+                asset_name: asset.asset_name.clone(),
+                quantity: asset.quantity.clone(),
+            }]),
+        };
+
+        let mut inputs: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        CardanoSigner::add_utxo_balance(&mut inputs, &row(0)).unwrap();
+        CardanoSigner::add_utxo_balance(&mut inputs, &row(1)).unwrap();
+
+        let asset_id = format!("{}{}", asset.policy_id, asset.asset_name);
+        assert_eq!(
+            inputs["addr_test1vabc"][&asset_id],
+            2 * i128::from(u64::MAX)
+        );
+
+        // Spent with no matching output, the diff is the full negative sum.
+        let effects = CardanoSigner::effects_from_balances(&inputs, &BTreeMap::new());
+        let effect = &effects[0];
+        let (_, diff) = effect.diff.iter().find(|(id, _)| id == &asset_id).unwrap();
+        assert_eq!(diff, &(-2 * i128::from(u64::MAX)).to_string());
     }
 
     #[test]
