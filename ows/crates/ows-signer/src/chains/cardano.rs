@@ -979,17 +979,28 @@ impl ChainSigner for CardanoSigner {
             ));
         }
 
-        let mut buf = Vec::new();
+        // Validate the size before copying any key bytes, so the error path never
+        // drops an unwiped secret.
+        let total: usize = keys.iter().map(|key| key.secret.expose().len()).sum();
+        if total != ed25519_bip32::XPRV_SIZE && total != ed25519_bip32::XPRV_SIZE * 2 {
+            return Err(SignerError::InvalidPrivateKey(format!(
+                "Cardano encoded keys must be 96 (payment) or 192 (payment||stake) bytes, got {total}"
+            )));
+        }
+
+        // Sized up front: growing the buffer mid-copy would leave an unwiped copy of
+        // the payment extended private key in the freed allocation. `SecretBytes`
+        // wipes the final buffer on drop; the assertion keeps the no-growth invariant.
+        let mut buf = Vec::with_capacity(total);
+        let capacity = buf.capacity();
         for key in keys {
             buf.extend_from_slice(key.secret.expose());
         }
-
-        if buf.len() != ed25519_bip32::XPRV_SIZE && buf.len() != ed25519_bip32::XPRV_SIZE * 2 {
-            return Err(SignerError::InvalidPrivateKey(format!(
-                "Cardano encoded keys must be 96 (payment) or 192 (payment||stake) bytes, got {}",
-                buf.len()
-            )));
-        }
+        debug_assert_eq!(
+            buf.capacity(),
+            capacity,
+            "encoded keys outgrew their buffer"
+        );
 
         Ok(SecretBytes::new(buf))
     }
