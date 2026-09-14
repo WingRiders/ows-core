@@ -2,6 +2,7 @@ use crate::error::{PayError, PayErrorCode};
 use crate::types::{BalanceInfo, TokenBalance};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KoiosAddressInfoRow {
@@ -41,25 +42,54 @@ const ADA_DECIMALS: u32 = 6;
 // keeping page size small to avoid 413 Payload Too Large errors
 const KOIOS_ASSET_LIST_CHUNK_SIZE: usize = 20;
 
+const KOIOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest Koios response body we will buffer. Koios is a third-party endpoint;
+/// without a cap a hostile or broken one could stream an unbounded body and
+/// exhaust memory. A single wallet's balance/asset payload is far smaller.
+const KOIOS_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read a response body into memory, aborting once it exceeds the cap instead of
+/// buffering whatever the endpoint chooses to send. `reqwest`'s `.json()`/`.text()`
+/// would read the whole body first, so the streaming loop is what enforces the bound.
+async fn read_capped_body(mut resp: reqwest::Response) -> Result<Vec<u8>, PayError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > KOIOS_MAX_RESPONSE_BYTES {
+            return Err(PayError::new(
+                PayErrorCode::InvalidData,
+                format!("Koios response exceeds the {KOIOS_MAX_RESPONSE_BYTES}-byte limit"),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 pub(crate) async fn get_cardano_balances(
     wallet_address: &str,
     koios_base_url: &str,
 ) -> Result<Vec<TokenBalance>, PayError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(KOIOS_REQUEST_TIMEOUT)
+        .build()?;
     let body = serde_json::json!({ "_addresses": [wallet_address] });
     let url = format!("{koios_base_url}/address_info");
 
     let resp = client.post(&url).json(&body).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_capped_body(resp)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
         return Err(PayError::new(
             PayErrorCode::HttpStatus,
             format!("Koios address_info returned {status}: {body}"),
         ));
     }
 
-    let rows: Vec<KoiosAddressInfoRow> = resp.json().await?;
+    let rows: Vec<KoiosAddressInfoRow> = serde_json::from_slice(&read_capped_body(resp).await?)?;
 
     // we are fetching the balances for a single address, so we expect only one row
     let Some(info) = rows.into_iter().next() else {
@@ -184,13 +214,16 @@ async fn fetch_assets_info(
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_capped_body(resp)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
             return Err(PayError::new(
                 PayErrorCode::HttpStatus,
                 format!("Koios asset_info returned {status}: {body}"),
             ));
         }
-        let rows: Vec<KoiosAssetInfoRow> = resp.json().await?;
+        let rows: Vec<KoiosAssetInfoRow> = serde_json::from_slice(&read_capped_body(resp).await?)?;
         for row in rows {
             let key = (
                 row.policy_id.clone(),

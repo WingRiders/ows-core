@@ -17,6 +17,7 @@ use ows_core::policy::{TransactionContext, TransactionEffect};
 use ows_core::ChainType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::time::Duration;
 
 pub struct CardanoSigner {
@@ -39,6 +40,14 @@ const MAX_TX_BYTES: usize = 16384;
 /// legitimate value yet well below the overflow threshold on the smallest
 /// stacks the signer runs on.
 const MAX_CBOR_DEPTH: usize = 128;
+
+/// Largest Koios response body we will buffer. The endpoint is untrusted here — see
+/// `check_tx_cbor` — and without a cap it could stream an unbounded body and exhaust
+/// memory before a single byte is ever validated. A `tx_cbor` page carries at most
+/// `KOIOS_TXS_CBOR_CHUNK_SIZE` transactions, each bounded by `MAX_TX_BYTES` on-chain
+/// and hex-encoded on the wire, so a legitimate response stays three orders of
+/// magnitude below this.
+const KOIOS_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 // Per-address, per-asset balance sums (lovelace and native assets alike). On-chain
 // both are u64 (CDDL `coin` / `positive_coin`), but summing several UTxOs or outputs
@@ -484,14 +493,15 @@ impl CardanoSigner {
 
             if !resp.status().is_success() {
                 let status = resp.status();
-                let text = resp.text().unwrap_or_default();
+                let text = read_capped_body(resp)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
                 return Err(SignerError::RpcError(format!(
                     "Koios tx_cbor returned {status}: {text}"
                 )));
             }
 
-            let fetched: Vec<KoiosTxCborRow> = resp
-                .json()
+            let fetched: Vec<KoiosTxCborRow> = serde_json::from_slice(&read_capped_body(resp)?)
                 .map_err(|e| SignerError::RpcError(format!("Koios tx_cbor JSON: {e}")))?;
 
             for row in fetched {
@@ -1004,6 +1014,25 @@ impl ChainSigner for CardanoSigner {
 
         Ok(SecretBytes::new(buf))
     }
+}
+
+/// Read a response body into memory, refusing to buffer more than
+/// `KOIOS_MAX_RESPONSE_BYTES`. `.text()` and `.json()` read the whole body first,
+/// so reading through a capped reader is what enforces the bound.
+fn read_capped_body(resp: reqwest::blocking::Response) -> Result<Vec<u8>, SignerError> {
+    let mut buf = Vec::new();
+    // One byte past the cap, so a body sitting exactly at the limit still reads.
+    resp.take(KOIOS_MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| SignerError::RpcError(format!("reading Koios response: {e}")))?;
+
+    if buf.len() > KOIOS_MAX_RESPONSE_BYTES {
+        return Err(SignerError::RpcError(format!(
+            "Koios response exceeds the {KOIOS_MAX_RESPONSE_BYTES}-byte limit"
+        )));
+    }
+
+    Ok(buf)
 }
 
 /// Reject transaction bytes that would crash CSL's parser before it ever runs.
@@ -1635,6 +1664,25 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(serde_json::to_string(&body).unwrap())
             .create()
+    }
+
+    #[test]
+    fn fetch_txs_cbor_rejects_an_oversized_response() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/tx_cbor")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(vec![b'x'; KOIOS_MAX_RESPONSE_BYTES + 1])
+            .create();
+
+        let err = CardanoSigner::fetch_txs_cbor(&server.url(), &["0".repeat(64)]).unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(&err, SignerError::RpcError(msg) if msg.contains("exceeds the")),
+            "expected a size-limit error, got {err:?}"
+        );
     }
 
     #[test]
