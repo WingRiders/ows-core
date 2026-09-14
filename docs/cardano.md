@@ -107,7 +107,7 @@ Cardano introduces two additional, Cardano-specific dependencies:
   **and** non-hardened children, and `normalize_bytes_force3rd` for valid root
   keys. Chosen so derivation stays in the generic `HdDeriver`, rather than pulling
   a full chain SDK into the key path.
-- **`cardano-serialization-lib` (CSL, 14.1.1)** — the canonical Cardano library
+- **`cardano-serialization-lib` (CSL, 14.1.2)** — the canonical Cardano library
   for network parameters (`NetworkInfo`), address construction
   (`BaseAddress`/`EnterpriseAddress`/`RewardAddress`, `Credential`), public-key
   hashing (`PublicKey`), witness construction (`Vkey`, `Ed25519Signature`,
@@ -1151,9 +1151,9 @@ Dependencies added:
   (`ows/crates/ows-signer/Cargo.toml`, `ows/crates/ows-lib/Cargo.toml`).
 - `pbkdf2 = "0.12"` — Icarus master-key derivation
   (`ows/crates/ows-signer/Cargo.toml`).
-- `cardano-serialization-lib = "14.1.1"` — Cardano network parameters
-  (`NetworkInfo`), Shelley address encoding, and transaction/witness encoding
-  (`ows/crates/ows-signer/Cargo.toml`).
+- `cardano-serialization-lib = "14.1.1"` (lockfile resolves 14.1.2) — Cardano
+  network parameters (`NetworkInfo`), Shelley address encoding, and
+  transaction/witness encoding (`ows/crates/ows-signer/Cargo.toml`).
 - `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers
   (`ows/crates/ows-signer/Cargo.toml`).
 - `reqwest = "0.12"` (blocking, `json`, `rustls-tls`, no default features) — Koios
