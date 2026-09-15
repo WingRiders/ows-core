@@ -43,6 +43,13 @@ describe('@open-wallet-standard/adapters — wdk', () => {
     const address = await account.getAddress();
     assert.equal(address, btcAccount.address);
   });
+  it('resolves Cardano chain name', async () => {
+    const wallet = getWallet(walletName, vaultDir);
+    const cardanoAccount = wallet.accounts.find(a => a.chainId.startsWith('cip34:'));
+    const account = owsToWdkAccount(walletName, 'cardano', { vaultPath: vaultDir });
+    const address = await account.getAddress();
+    assert.equal(address, cardanoAccount.address);
+  });
   it('accepts CAIP-2 chain IDs directly', async () => {
     const wallet = getWallet(walletName, vaultDir);
     const evmAccount = wallet.accounts.find(a => a.chainId.startsWith('eip155:'));
