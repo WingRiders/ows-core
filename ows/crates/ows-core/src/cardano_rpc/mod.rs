@@ -42,8 +42,13 @@ pub enum CardanoRpcError {
 
 /// Cardano RPC operations, independent of the concrete provider (Koios, Blockfrost, …).
 pub trait CardanoRpcProvider: Send + Sync {
-    /// Submit a signed transaction (CBOR bytes). Returns the transaction hash.
-    fn broadcast_tx(&self, tx_cbor: &[u8]) -> Result<String, CardanoRpcError>;
+    /// Submit a signed transaction (CBOR bytes) and return its hash.
+    ///
+    /// `expected_tx_id` is the transaction ID the caller computed from the body it
+    /// signed; implementations pass the provider's response through
+    /// `check_broadcast_tx_id` against it.
+    fn broadcast_tx(&self, tx_cbor: &[u8], expected_tx_id: &str)
+        -> Result<String, CardanoRpcError>;
 
     /// Fetch the CBOR-encoded transactions for a set of transaction hashes.
     /// NOTE: The result can be partial if some transactions are not found.
@@ -102,6 +107,44 @@ pub fn resolve_cardano_provider(url: &str) -> Result<Box<dyn CardanoRpcProvider>
     }
 }
 
+/// Check that a submission response names the transaction that was submitted.
+///
+/// A provider's response is untrusted: a 64-character body is not necessarily hex,
+/// and a well-formed ID can belong to a different transaction. Both would otherwise
+/// be reported back as a successful broadcast of the caller's transaction.
+///
+/// A failure here says nothing about whether the transaction was accepted — the
+/// provider may have submitted it before answering — so callers must not resubmit on
+/// this error. The expected ID is included so it can be looked up on-chain instead.
+fn check_broadcast_tx_id(body: &str, expected_tx_id: &str) -> Result<String, CardanoRpcError> {
+    let body = body.trim();
+    let invalid = || {
+        CardanoRpcError::Rpc(format!(
+            "Cardano broadcast: invalid transaction hash in response for {expected_tx_id}: {body}"
+        ))
+    };
+
+    // Koios and Blockfrost both answer with a JSON string. Bare hex stays accepted for
+    // other deployments, but malformed quoting does not.
+    let tx_id = if body.starts_with('"') {
+        serde_json::from_str::<String>(body).map_err(|_| invalid())?
+    } else {
+        body.to_string()
+    };
+
+    let mut id_bytes = [0u8; 32];
+    hex::decode_to_slice(&tx_id, &mut id_bytes).map_err(|_| invalid())?;
+    let tx_id = hex::encode(id_bytes);
+
+    if !tx_id.eq_ignore_ascii_case(expected_tx_id) {
+        return Err(CardanoRpcError::Rpc(format!(
+            "Cardano broadcast: transaction hash mismatch: expected {expected_tx_id}, got {tx_id}"
+        )));
+    }
+
+    Ok(tx_id)
+}
+
 /// Shared blocking HTTP client used by the providers.
 fn blocking_client() -> Result<reqwest::blocking::Client, CardanoRpcError> {
     reqwest::blocking::Client::builder()
@@ -139,6 +182,58 @@ fn read_capped_body(resp: reqwest::blocking::Response) -> Result<Vec<u8>, Cardan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TX_ID: &str = "6c84b1c9ac839cad80b37ff528e7c6f9991de7d1b9b16055a6d8f7df0a7fa7ee";
+
+    #[test]
+    fn broadcast_id_accepts_json_and_bare_hex() {
+        for body in [TX_ID.to_string(), format!("\"{TX_ID}\"")] {
+            assert_eq!(check_broadcast_tx_id(&body, TX_ID).unwrap(), TX_ID);
+        }
+    }
+
+    #[test]
+    fn broadcast_id_normalizes_whitespace_and_hex_case() {
+        for body in [
+            format!(" \n{TX_ID}\n"),
+            format!(" \n\"{}\"\n", TX_ID.to_uppercase()),
+        ] {
+            assert_eq!(check_broadcast_tx_id(&body, TX_ID).unwrap(), TX_ID);
+        }
+    }
+
+    #[test]
+    fn broadcast_id_rejects_a_malformed_response() {
+        // None of these is 32 bytes of hex, however close to that size it looks:
+        // "é" is two bytes wide, so the last body is 64 bytes but 32 characters.
+        for body in [
+            String::new(),
+            "bad".into(),
+            "z".repeat(64),
+            format!("\"{TX_ID}"),
+            format!("[{TX_ID}]"),
+            "é".repeat(32),
+        ] {
+            let err = check_broadcast_tx_id(&body, TX_ID).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid transaction hash"),
+                "{body:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_id_rejects_a_different_transaction() {
+        let err = check_broadcast_tx_id(&format!("\"{}\"", "00".repeat(32)), TX_ID).unwrap_err();
+        assert!(
+            err.to_string().contains("transaction hash mismatch"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(TX_ID),
+            "the error should name the ID to look up on-chain: {err}"
+        );
+    }
 
     #[test]
     fn resolve_defaults_to_koios() {

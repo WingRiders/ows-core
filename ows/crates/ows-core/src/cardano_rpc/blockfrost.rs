@@ -1,6 +1,9 @@
 //! [Blockfrost](https://blockfrost.io) RPC provider.
 
-use super::{blocking_client, read_capped_body, CardanoRpcError, CardanoRpcProvider, ADA_DECIMALS};
+use super::{
+    blocking_client, check_broadcast_tx_id, read_capped_body, CardanoRpcError, CardanoRpcProvider,
+    ADA_DECIMALS,
+};
 use crate::{BalanceInfo, TokenBalance};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -72,7 +75,11 @@ impl BlockfrostProvider {
 }
 
 impl CardanoRpcProvider for BlockfrostProvider {
-    fn broadcast_tx(&self, tx_cbor: &[u8]) -> Result<String, CardanoRpcError> {
+    fn broadcast_tx(
+        &self,
+        tx_cbor: &[u8],
+        expected_tx_id: &str,
+    ) -> Result<String, CardanoRpcError> {
         let url = format!("{}/tx/submit", self.base_url);
         let client = blocking_client()?;
 
@@ -95,14 +102,7 @@ impl CardanoRpcProvider for BlockfrostProvider {
             )));
         }
 
-        let tx_hash = body.trim().trim_matches('"').to_string();
-        if tx_hash.len() != 64 {
-            return Err(CardanoRpcError::Rpc(format!(
-                "Blockfrost broadcast: invalid transaction hash in response: {tx_hash}"
-            )));
-        }
-
-        Ok(tx_hash)
+        check_broadcast_tx_id(&body, expected_tx_id)
     }
 
     fn fetch_txs_cbor(
@@ -237,6 +237,8 @@ mod tests {
     use super::*;
     use mockito::Server;
 
+    const TX_ID: &str = "6c84b1c9ac839cad80b37ff528e7c6f9991de7d1b9b16055a6d8f7df0a7fa7ee";
+
     #[test]
     fn split_asset_unit_splits_policy_and_name() {
         let policy = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 56 hex chars
@@ -246,23 +248,50 @@ mod tests {
         assert_eq!(n, name);
     }
 
-    #[test]
-    fn blockfrost_broadcast_tx() {
-        let tx_hash = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-
+    /// Submit against a mock answering `body`, with `TX_ID` as the transaction the
+    /// caller signed.
+    fn blockfrost_submit_to_mock(body: &str) -> Result<String, CardanoRpcError> {
         let mut server = Server::new();
         let mock = server
             .mock("POST", "/tx/submit")
             .match_header("project_id", "test-project")
             .with_status(200)
-            .with_body(format!("\"{tx_hash}\""))
+            .with_body(body)
             .create();
 
         let provider = BlockfrostProvider::new(&server.url(), "test-project".into());
-        let returned = provider.broadcast_tx(b"\x00\x01\x02").unwrap();
+        let result = provider.broadcast_tx(b"\x00\x01\x02", TX_ID);
 
         mock.assert();
-        assert_eq!(returned, tx_hash);
+        result
+    }
+
+    #[test]
+    fn blockfrost_broadcast_tx() {
+        assert_eq!(
+            blockfrost_submit_to_mock(&format!("\"{TX_ID}\"")).unwrap(),
+            TX_ID
+        );
+    }
+
+    #[test]
+    fn blockfrost_broadcast_tx_rejects_a_response_that_is_not_the_submitted_id() {
+        // Bodies that are not 32 bytes of hex, whatever their length, then a
+        // well-formed ID belonging to a different transaction.
+        for body in ["", "z".repeat(64).as_str(), &format!("\"{TX_ID}"), "[]"] {
+            let err = blockfrost_submit_to_mock(body).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid transaction hash"),
+                "{body:?}: {err}"
+            );
+        }
+
+        let err = blockfrost_submit_to_mock(&format!("\"{}\"", "00".repeat(32))).unwrap_err();
+        assert!(
+            err.to_string().contains("transaction hash mismatch"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(TX_ID), "{err}");
     }
 
     #[test]

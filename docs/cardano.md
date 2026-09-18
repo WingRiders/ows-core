@@ -451,6 +451,21 @@ via `CardanoRpcProvider::broadcast_tx` (Koios: `POST {rpc}/submittx` with
 `encode_signed_transaction` (see [§3.4](#34-transaction-signing)) is what feeds
 this path.
 
+Before the request goes out, `broadcast_cardano` computes the expected transaction
+ID with `CardanoSigner::transaction_id` — the BLAKE2b-256 hash of the preserved
+transaction body, excluding witnesses and auxiliary data, after the CBOR parser
+guards. Both providers pass the submission response through the shared
+`check_broadcast_tx_id`, which requires a 32-byte hexadecimal ID equal to that
+expected one. The response may be a JSON string or bare hex; surrounding
+whitespace and hex case are normalized. A malformed or mismatched ID fails the
+broadcast instead of returning a hash the caller would go on to treat as its
+transaction's.
+
+That failure is response validation, not evidence that the transaction was
+rejected: the provider may already have submitted it before answering. Do not
+resubmit on this error — look up the expected ID, which the error carries, on
+chain first.
+
 ### 3. Transaction and message signing (Chain Plugin Interface)
 
 This deliverable implements the `ChainSigner` plugin surface for Cardano:
@@ -1330,7 +1345,11 @@ Implemented and passing for these deliverables:
   asserts the exact sorted
   `effects` (per-address signed lovelace and asset diffs) and that the mock
   endpoint was hit. `KoiosProvider` and `BlockfrostProvider` have dedicated unit
-  tests for broadcast, transaction-CBOR fetch, and balance queries.
+  tests for broadcast, transaction-CBOR fetch, and balance queries. Broadcast
+  response validation is covered per provider and on the shared
+  `check_broadcast_tx_id` with malformed, unrelated and matching IDs, and
+  end-to-end through `broadcast_cardano` against the real ID of the submitted
+  transaction.
 
 ## References
 

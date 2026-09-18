@@ -1816,6 +1816,7 @@ name = "ows-core"
 version = "1.4.3"
 dependencies = [
  "chrono",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
