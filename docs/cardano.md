@@ -277,6 +277,12 @@ URL string and returns a `Box<dyn CardanoRpcProvider>`:
   `koios|` (same rationale for custom hosts).
 - **Any other URL** — rejected as unsupported.
 
+Whichever branch selects Blockfrost, the `project_id` is sent to the resolved URL
+as a request header, so that URL must name a host you control or trust with the
+key. Both branches take the URL from the same operator-controlled sources as
+`BLOCKFROST_PROJECT_ID` itself (explicit override, user config, built-in default);
+neither is reachable by an API-key caller, which cannot supply an RPC URL.
+
 After selection, the `koios|` / `blockfrost|` prefix is stripped before the
 provider issues HTTP requests. All Cardano call sites — `broadcast_cardano`
 (`ows-lib`), `make_transaction_context` (`ows-signer`), and balance fetching
