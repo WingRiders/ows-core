@@ -47,7 +47,6 @@ num-bigint = "0.4"
 libc = "0.2"
 signal-hook = "0.4"
 cardano-serialization-lib = "15.0.3"
-emurgo-cardano-message-signing = "1.1.0"
 
 [dev-dependencies]
 mockito = "1"
