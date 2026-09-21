@@ -1,12 +1,3 @@
 [workspace]
 resolver = "2"
 members = ["crates/ows-core", "crates/ows-signer", "crates/ows-lib", "crates/ows-pay", "crates/ows-cli"]
-
-# Midnight's ledger stack reaches wasm-bindgen 0.2.100 through reqwest -> js-sys,
-# while emurgo-cardano-message-signing pins wasm-bindgen to exactly 0.2.92. Both
-# pins apply only to wasm32, which this workspace never builds, but Cargo resolves
-# every target, so the two cannot coexist. cardano-serialization-lib relaxed the
-# same pin in 15.0.3; message-signing has had one release ever and still carries it.
-# Drop this patch once upstream publishes a release with the constraint relaxed.
-[patch.crates-io]
-emurgo-cardano-message-signing = { git = "https://github.com/WingRiders/message-signing", rev = "b7eac19da6b1efb20f5764392a813cc44c8d4f44" }
