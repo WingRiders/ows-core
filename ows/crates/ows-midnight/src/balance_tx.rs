@@ -2,22 +2,24 @@
 //! transaction against the indexer's UTXO set.
 //!
 //! The wallet injects its own inputs, preserving the existing ZK proofs: **shielded** coins to fund
-//! a shielded deficit (e.g. a contract deposit whose Zswap offer has outputs but no inputs), then
-//! **unshielded** NIGHT inputs (and a change output) to cover the transaction's unshielded outputs.
-//! Each added shielded fragment is proved on its own and merged into the already-proven guaranteed
-//! offer. When asked to pay fees on a chain that needs DUST, the fee is covered with either a
-//! signature-based **generationless** DUST fee registration funded by its own unregistered NIGHT (no
-//! proving), or, when the wallet has no unregistered NIGHT capacity (its NIGHT is all registered for
-//! dust generation), a proof-bearing **DUST spend** of its generated dust.
+//! every negative shielded cell in the ledger `balance()` (e.g. a contract deposit, or an offer that
+//! already spends some coins but is still short), then **unshielded** inputs (and per-token change)
+//! for every negative unshielded cell — NIGHT and custom tokens alike. Contract mints and withdrawals
+//! appear as positive cells and are not funded. Each added shielded fragment is proved on its own and
+//! merged into the matching Zswap offer. When asked to pay fees on a chain that needs DUST, the fee is
+//! covered with either a signature-based **generationless** DUST fee registration funded by its own
+//! unregistered NIGHT (no proving), or, when the wallet has no unregistered NIGHT capacity (its NIGHT
+//! is all registered for dust generation), a proof-bearing **DUST spend** of its generated dust.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
 use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
-    QualifiedInfo, ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
+    Nullifier, QualifiedInfo, ShieldedTokenType, TokenType as LedgerTokenType, UnshieldedTokenType,
+    UserAddress, NIGHT,
 };
 use midnight_ledger::dust::{
     DustActions, DustLocalState, DustPublicKey, DustRegistration, DustSpend,
@@ -148,36 +150,79 @@ fn select_utxos_for_token(
     Ok(out)
 }
 
-fn select_utxos_for_night(
-    utxos: &[UnshieldedUtxo],
-    sender_bech32: &str,
-    sender_vk: &VerifyingKey,
-    need: u128,
-) -> Result<Vec<UnshieldedUtxo>, std::io::Error> {
-    let night_wire = crate::parse_token_type(Some("night"))?.to_wire_token_type();
-    select_utxos_for_token(utxos, sender_bech32, sender_vk, &night_wire, need)
+/// Wire hex for an unshielded token type (32 zero bytes for NIGHT).
+fn unshielded_token_wire(tt: UnshieldedTokenType) -> String {
+    hex::encode(tt.0 .0)
 }
 
-fn zswap_offer_needs_shielded_inputs(offer: &ZswapOffer<ZswapProof, InMemoryDB>) -> bool {
-    offer.inputs.iter_deref().next().is_none() && offer.outputs.iter_deref().next().is_some()
+fn add_u128<K: Ord>(map: &mut BTreeMap<K, u128>, key: K, amount: u128) {
+    let e = map.entry(key).or_default();
+    *e = e.saturating_add(amount);
+}
+
+/// Negative cells from one ledger `balance()` walk, split by domain. Contract mints/withdrawals net
+/// positive and never appear here.
+struct LedgerDeficits {
+    shielded: Vec<(ShieldedTokenType, u128, u16)>,
+    unshielded: Vec<(UnshieldedTokenType, u128, u16)>,
+}
+
+fn ledger_token_deficits(tx: &TxProven) -> Result<LedgerDeficits, std::io::Error> {
+    let mut shielded = Vec::new();
+    let mut unshielded = Vec::new();
+    for ((token, segment), bal) in tx
+        .balance(None)
+        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?
+    {
+        if bal >= 0 {
+            continue;
+        }
+        let need = bal.unsigned_abs();
+        match token {
+            LedgerTokenType::Shielded(tt) => shielded.push((tt, need, segment)),
+            LedgerTokenType::Unshielded(tt) => unshielded.push((tt, need, segment)),
+            LedgerTokenType::Dust => {}
+        }
+    }
+    Ok(LedgerDeficits {
+        shielded,
+        unshielded,
+    })
 }
 
 /// Per-segment shielded token deficits (ledger `balance` negative = overspend).
 fn ledger_shielded_deficits(
     tx: &TxProven,
 ) -> Result<Vec<(ShieldedTokenType, u128, u16)>, std::io::Error> {
-    let mut out = Vec::new();
-    for ((token, segment), bal) in tx
-        .balance(None)
-        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?
-    {
-        if let LedgerTokenType::Shielded(tt) = token {
-            if bal < 0 {
-                out.push((tt, bal.unsigned_abs(), segment));
-            }
+    Ok(ledger_token_deficits(tx)?.shielded)
+}
+
+/// Per-segment unshielded token deficits (ledger `balance` negative = overspend). Covers NIGHT and
+/// custom unshielded tokens.
+fn ledger_unshielded_deficits(
+    tx: &TxProven,
+) -> Result<Vec<(UnshieldedTokenType, u128, u16)>, std::io::Error> {
+    Ok(ledger_token_deficits(tx)?.unshielded)
+}
+
+/// Nullifiers already spent by the transaction's Zswap offers — excluded from the wallet's funding
+/// selection so a top-up never double-spends a coin the dapp (or a prior merge) already spent.
+fn spent_shielded_nullifiers(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> BTreeSet<Nullifier> {
+    let mut spent = BTreeSet::new();
+    if let Some(offer) = base.guaranteed_coins.as_ref() {
+        for input in offer.inputs.iter_deref() {
+            spent.insert(input.nullifier);
         }
     }
-    Ok(out)
+    for pair in base.fallible_coins.iter() {
+        let (_seg, offer_sp) = pair.deref();
+        for input in offer_sp.inputs.iter_deref() {
+            spent.insert(input.nullifier);
+        }
+    }
+    spent
 }
 
 /// Return ledger per-segment imbalances (negative = overspend).
@@ -248,73 +293,106 @@ fn wrap_proven_standard(
 /// guaranteed offer and each per-segment fallible offer drawing **disjoint** coins from one pool.
 type UtxoKey = (String, i64);
 
-/// Build one balancing unshielded offer from a pre-fetched UTXO `pool`: select just enough sender NIGHT
-/// — skipping coins already `claimed` by another offer, so no coin is spent twice — to cover
-/// `need_night`, then emit those inputs plus `outputs_in` (the offer's own outputs, re-emitted) and a
-/// NIGHT change output. Records every coin it claims into `claimed` and returns the selected UTXOs so the
-/// caller can size the generationless DUST fee allowance from their unregistered NIGHT. Sorted for ledger
-/// validity; signatures are appended later by the signer, so the offer starts unsigned.
-fn build_night_offer(
+/// Claim `u` into `claimed` and turn it into an unsigned spend of `token`.
+fn claim_utxo_spend(
+    u: &UnshieldedUtxo,
+    token: UnshieldedTokenType,
+    claimed: &mut Vec<UtxoKey>,
+    sender_addr: &str,
+    sender_vk: &VerifyingKey,
+) -> Result<UtxoSpend, std::io::Error> {
+    claimed.push((u.intent_hash.clone(), u.output_index));
+    let ih = parse_intent_hash_hex(&u.intent_hash)?;
+    let out_no = u32::try_from(u.output_index).map_err(|_| err("output index out of range"))?;
+    let vk = resolve_owner_vk(&u.owner, sender_addr, sender_vk)?;
+    Ok(UtxoSpend {
+        value: u.value,
+        owner: vk,
+        type_: token,
+        intent_hash: ih,
+        output_no: out_no,
+    })
+}
+
+/// Build one balancing unshielded offer from a pre-fetched UTXO `pool`: for each per-token `deficit`,
+/// select just enough sender coins of that type — skipping coins already `claimed` by another offer,
+/// so no coin is spent twice — then emit those inputs plus `outputs_in` (the offer's own outputs,
+/// re-emitted) and a change output per token. An optional NIGHT `reserve` is spent balance-neutrally
+/// so its unregistered capacity can back a generationless DUST fee registration. Records every coin
+/// it claims into `claimed` and returns the selected UTXOs (fee sizing filters to NIGHT). Sorted for
+/// ledger validity; signatures are appended later by the signer, so the offer starts unsigned.
+fn build_unshielded_balancing_offer(
     pool: &[UnshieldedUtxo],
     claimed: &mut Vec<UtxoKey>,
     sender_vk: &VerifyingKey,
     sender_addr: &str,
-    need_night: u128,
+    deficits: &[(UnshieldedTokenType, u128)],
     outputs_in: Vec<UtxoOutput>,
     reserve: Option<&UnshieldedUtxo>,
 ) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
-    let available: Vec<UnshieldedUtxo> = pool
+    let sender_user = UserAddress::from(sender_vk.clone());
+    let mut need_by_token: BTreeMap<UnshieldedTokenType, u128> = BTreeMap::new();
+    for (token, need) in deficits {
+        if *need > 0 {
+            add_u128(&mut need_by_token, *token, *need);
+        }
+    }
+
+    let mut selected_all: Vec<UnshieldedUtxo> = Vec::new();
+    let mut inputs: Vec<UtxoSpend> = Vec::new();
+    let mut total_in_by_token: BTreeMap<UnshieldedTokenType, u128> = BTreeMap::new();
+
+    // Unclaimed coins once for the whole offer; each token selection claims into `claimed` so the
+    // next token (and the reserve) cannot reuse them.
+    let mut available: Vec<UnshieldedUtxo> = pool
         .iter()
         .filter(|u| !claimed.contains(&(u.intent_hash.clone(), u.output_index)))
         .cloned()
         .collect();
 
-    let mut selected = if need_night == 0 {
-        vec![]
-    } else {
-        select_utxos_for_night(&available, sender_addr, sender_vk, need_night)?
-    };
+    for (token, need) in &need_by_token {
+        let wire = unshielded_token_wire(*token);
+        let selected = select_utxos_for_token(&available, sender_addr, sender_vk, &wire, *need)?;
+        for u in &selected {
+            inputs.push(claim_utxo_spend(
+                u,
+                *token,
+                claimed,
+                sender_addr,
+                sender_vk,
+            )?);
+            add_u128(&mut total_in_by_token, *token, u.value);
+            selected_all.push(u.clone());
+            available
+                .retain(|a| !(a.intent_hash == u.intent_hash && a.output_index == u.output_index));
+        }
+    }
 
     // Reserve the best-Dust NIGHT coin for the generationless fee registration: spend it here so its
     // unregistered-NIGHT capacity backs the registration. Balance-neutral — its value returns as
     // change — and skipped when the payment already selected it or another offer claimed it, so the
     // wallet reserves exactly one coin instead of over-rotating its NIGHT.
     if let Some(r) = reserve {
-        let already = claimed.contains(&(r.intent_hash.clone(), r.output_index))
-            || selected
-                .iter()
-                .any(|u| u.intent_hash == r.intent_hash && u.output_index == r.output_index);
-        if !already {
-            selected.push(r.clone());
+        if !claimed.contains(&(r.intent_hash.clone(), r.output_index)) {
+            inputs.push(claim_utxo_spend(r, NIGHT, claimed, sender_addr, sender_vk)?);
+            add_u128(&mut total_in_by_token, NIGHT, r.value);
+            selected_all.push(r.clone());
         }
     }
 
-    let mut total_in = 0u128;
-    let mut inputs: Vec<UtxoSpend> = Vec::new();
-    for u in &selected {
-        claimed.push((u.intent_hash.clone(), u.output_index));
-        total_in = total_in.saturating_add(u.value);
-        let ih = parse_intent_hash_hex(&u.intent_hash)?;
-        let out_no = u32::try_from(u.output_index).map_err(|_| err("output index out of range"))?;
-        let vk = resolve_owner_vk(&u.owner, sender_addr, sender_vk)?;
-        inputs.push(UtxoSpend {
-            value: u.value,
-            owner: vk,
-            type_: NIGHT,
-            intent_hash: ih,
-            output_no: out_no,
-        });
-    }
-
     let mut outputs = outputs_in;
-    let change = total_in.saturating_sub(need_night);
-    if change > 0 {
-        let sender_user = UserAddress::from(inputs[0].owner.clone());
-        outputs.push(UtxoOutput {
-            value: change,
-            owner: sender_user,
-            type_: NIGHT,
-        });
+    // Change per token: selected total minus the deficit funded for that token (reserve adds to
+    // NIGHT total_in without raising the need, so it returns as change).
+    for (token, total_in) in &total_in_by_token {
+        let need = need_by_token.get(token).copied().unwrap_or(0);
+        let change = total_in.saturating_sub(need);
+        if change > 0 {
+            outputs.push(UtxoOutput {
+                value: change,
+                owner: sender_user,
+                type_: *token,
+            });
+        }
     }
 
     // Ledger validity requires inputs/outputs to be sorted (MalformedError::InputsNotSorted).
@@ -327,7 +405,34 @@ fn build_night_offer(
         outputs: outputs.into(),
         signatures: vec![].into(),
     };
-    Ok((offer, selected))
+    Ok((offer, selected_all))
+}
+
+/// Test helper: one balancing unshielded offer that funds a single NIGHT deficit.
+#[cfg(test)]
+fn build_night_offer(
+    pool: &[UnshieldedUtxo],
+    claimed: &mut Vec<UtxoKey>,
+    sender_vk: &VerifyingKey,
+    sender_addr: &str,
+    need_night: u128,
+    outputs_in: Vec<UtxoOutput>,
+    reserve: Option<&UnshieldedUtxo>,
+) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
+    let deficits: Vec<(UnshieldedTokenType, u128)> = if need_night > 0 {
+        vec![(NIGHT, need_night)]
+    } else {
+        vec![]
+    };
+    build_unshielded_balancing_offer(
+        pool,
+        claimed,
+        sender_vk,
+        sender_addr,
+        &deficits,
+        outputs_in,
+        reserve,
+    )
 }
 
 /// Build a fallible unshielded offer that consolidates several of the wallet's own NIGHT coins into a
@@ -481,6 +586,31 @@ fn insert_new_intent(
     Ok(())
 }
 
+/// Clone an unshielded offer's outputs for re-emit when the wallet replaces that offer with a funded one.
+fn offer_outputs(offer: &UnshieldedOffer<MnSig, InMemoryDB>) -> Vec<UtxoOutput> {
+    offer
+        .outputs
+        .iter_deref()
+        .map(|o| UtxoOutput {
+            value: o.value,
+            owner: o.owner,
+            type_: o.type_,
+        })
+        .collect()
+}
+
+/// The intent's fallible unshielded outputs, cloned — re-emitted by the balancing offer that replaces
+/// that intent's fallible offer when the wallet funds its deficit.
+fn fallible_outputs_of(
+    intent: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> Vec<UtxoOutput> {
+    intent
+        .fallible_unshielded_offer
+        .as_ref()
+        .map(|sp| offer_outputs(sp.deref()))
+        .unwrap_or_default()
+}
+
 /// The intent's guaranteed unshielded outputs, cloned — re-emitted by the balancing offer that replaces
 /// that intent's guaranteed offer when the wallet merges into it.
 fn guaranteed_outputs_of(
@@ -489,17 +619,7 @@ fn guaranteed_outputs_of(
     intent
         .guaranteed_unshielded_offer
         .as_ref()
-        .map(|sp| {
-            sp.deref()
-                .outputs
-                .iter_deref()
-                .map(|o| UtxoOutput {
-                    value: o.value,
-                    owner: o.owner,
-                    type_: o.type_,
-                })
-                .collect()
-        })
+        .map(|sp| offer_outputs(sp.deref()))
         .unwrap_or_default()
 }
 
@@ -583,41 +703,28 @@ pub struct BalancedPlan {
     seg_id: u16,
     intent_in: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     unshielded_offer: UnshieldedOffer<MnSig, InMemoryDB>,
-    /// Per-segment fallible unshielded balancing offers (each funds one intent's fallible NIGHT deficit
-    /// in its own segment). Empty when no intent carries a fallible unshielded offer.
+    /// Per-segment fallible unshielded balancing offers (each funds one intent's fallible unshielded
+    /// deficit in its own segment). Empty when no intent carries a fallible unshielded shortfall.
     fallible_offers: Vec<(u16, UnshieldedOffer<MnSig, InMemoryDB>)>,
     intent_ttl: Timestamp,
     shielded: Option<ShieldedFundingPlan>,
     dust: DustFeePlan,
 }
 
-/// Plan the wallet's shielded funding for a proven tx's shielded deficit (e.g. a contract deposit
-/// whose Zswap offer has outputs but no inputs): sync the wallet, then per intent segment choose the
-/// coins to spend (whole, largest-first) and the self-change to mint — threading coin consumption
-/// across segments so no coin is planned twice. Pure selection over the synced coin set — no spend,
-/// no proving. Returns `None` when the tx has no shielded shortfall.
+/// Plan the wallet's shielded funding for a proven tx's shielded deficit: sync the wallet, then per
+/// intent segment choose the coins to spend (whole, largest-first) and the self-change to mint —
+/// threading coin consumption across segments so no coin is planned twice, and skipping nullifiers
+/// the transaction already spends. Driven by negative shielded cells in ledger `balance()` — including
+/// an offer that already has some inputs but is still short — so contract mints (positive cells) are
+/// never funded. Pure selection over the synced coin set — no spend, no proving. Returns `None` when
+/// the tx has no shielded shortfall.
 fn plan_shielded_funding(
     base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     indexer_url: &str,
     scope: &SyncCacheScope,
 ) -> Result<Option<ShieldedFundingPlan>, std::io::Error> {
-    // A shielded shortfall can sit in the guaranteed offer (segment 0) or in any fallible offer
-    // (segment N>=1); gate on either needing inputs. `ledger_shielded_deficits` then reports the
-    // per-segment deficits across the whole tx via `balance()`.
-    let guaranteed_needs = base
-        .guaranteed_coins
-        .as_ref()
-        .is_some_and(|sp| zswap_offer_needs_shielded_inputs(sp.deref()));
-    let fallible_needs = base
-        .fallible_coins
-        .iter()
-        .any(|entry| zswap_offer_needs_shielded_inputs(entry.1.deref()));
-    let deficits = if guaranteed_needs || fallible_needs {
-        ledger_shielded_deficits(&Transaction::Standard(base.clone()))?
-    } else {
-        Vec::new()
-    };
+    let deficits = ledger_shielded_deficits(&Transaction::Standard(base.clone()))?;
     if deficits.is_empty() {
         return Ok(None);
     }
@@ -639,8 +746,14 @@ fn plan_shielded_funding(
 
     // The signer clones the tree fresh per segment, so a coin planned for one segment must not be
     // planned for another; thread the remaining coins across segments to keep the plans disjoint.
-    let mut remaining: Vec<QualifiedInfo> =
-        tree.coins.iter().map(|(_nul, qci)| *qci.deref()).collect();
+    // Also skip coins whose nullifier the transaction already spends — a top-up must not double-spend.
+    let already_spent = spent_shielded_nullifiers(base);
+    let mut remaining: Vec<QualifiedInfo> = tree
+        .coins
+        .iter()
+        .filter(|(nul, _)| !already_spent.contains(nul))
+        .map(|(_nul, qci)| *qci.deref())
+        .collect();
     let mut plans = Vec::new();
     for (segment, seg_deficits) in by_segment {
         let seg_plan = plan_shielded_inputs(&remaining, &seg_deficits)?;
@@ -660,11 +773,11 @@ fn plan_shielded_funding(
     Ok(Some(ShieldedFundingPlan { plans, tree }))
 }
 
-/// One intent's fallible unshielded NIGHT deficit: the segment it sits in, the NIGHT the wallet must
-/// supply there, and that offer's own outputs (re-emitted by the balancing offer that replaces it).
-struct FallibleNightDeficit {
+/// One intent's fallible unshielded deficit: the segment it sits in, the per-token amounts the wallet
+/// must supply there, and that offer's own outputs (re-emitted by the balancing offer that replaces it).
+struct FallibleUnshieldedDeficit {
     seg_id: u16,
-    need_night: u128,
+    needs: Vec<(UnshieldedTokenType, u128)>,
     outputs: Vec<UtxoOutput>,
 }
 
@@ -707,13 +820,14 @@ fn plan_unsealed_proven_standard_tx(
         ));
     };
 
-    // Plan a shielded deficit (e.g. a contract deposit) against the wallet's own shielded coins — a
-    // no-op when the tx has no shielded shortfall. Pure selection: no spend, no prove.
+    // Plan a shielded deficit against the wallet's own shielded coins — a no-op when ledger `balance()`
+    // has no negative shielded cell. Pure selection: no spend, no prove.
     let shielded = plan_shielded_funding(&base, crypto_provider, indexer_url, scope)?;
 
     // The guaranteed unshielded section aggregates one offer from each intent, so balancing spans every
-    // intent: sum the NIGHT the wallet must supply across all of them, reject shapes it cannot authorize,
-    // and fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
+    // intent: take the negative unshielded cells from ledger `balance()` (NIGHT and custom tokens;
+    // mints/withdrawals net positive and are skipped), reject shapes the wallet cannot authorize, and
+    // fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
     // Fees are paid from a DUST section, so one is added only on a live-DUST chain. When fees are
     // requested but liveness can't be confirmed, fail loud rather than silently emit a fee-less tx the
@@ -732,8 +846,7 @@ fn plan_unsealed_proven_standard_tx(
     } else {
         false
     };
-    let mut need_night: u128 = 0;
-    let mut fallible_deficits: Vec<FallibleNightDeficit> = Vec::new();
+    let mut fallible_outputs_by_seg: BTreeMap<u16, Vec<UtxoOutput>> = BTreeMap::new();
     let mut has_preexisting_dust = false;
     let mut chosen: Option<(
         u16,
@@ -766,14 +879,9 @@ fn plan_unsealed_proven_standard_tx(
                     "transaction carries dapp-provided unshielded inputs, which is unsupported",
                 ));
             }
-            for o in offer.outputs.iter_deref() {
-                if o.type_ == NIGHT {
-                    need_night = need_night.saturating_add(o.value);
-                }
-            }
         }
-        // A fallible unshielded offer is balanced in its own segment (each is checked independently), so
-        // its NIGHT deficit is collected per-segment rather than folded into `need_night`.
+        // A fallible unshielded offer is balanced in its own segment (each is checked independently).
+        // Capture its outputs for re-emit when that segment has a deficit; reject dapp-provided inputs.
         if let Some(foffer_sp) = intent.fallible_unshielded_offer.as_ref() {
             let foffer = foffer_sp.deref();
             if foffer.inputs.iter_deref().next().is_some() {
@@ -781,28 +889,7 @@ fn plan_unsealed_proven_standard_tx(
                     "transaction carries dapp-provided fallible unshielded inputs, which is unsupported",
                 ));
             }
-            let mut fneed = 0u128;
-            let outputs: Vec<UtxoOutput> = foffer
-                .outputs
-                .iter_deref()
-                .map(|o| {
-                    if o.type_ == NIGHT {
-                        fneed = fneed.saturating_add(o.value);
-                    }
-                    UtxoOutput {
-                        value: o.value,
-                        owner: o.owner,
-                        type_: o.type_,
-                    }
-                })
-                .collect();
-            if fneed > 0 {
-                fallible_deficits.push(FallibleNightDeficit {
-                    seg_id,
-                    need_night: fneed,
-                    outputs,
-                });
-            }
+            fallible_outputs_by_seg.insert(seg_id, fallible_outputs_of(intent));
         }
         let is_lower = match &chosen {
             Some((s, _)) => seg_id < *s,
@@ -812,6 +899,30 @@ fn plan_unsealed_proven_standard_tx(
             chosen = Some((seg_id, intent.clone()));
         }
     }
+
+    // Negative unshielded cells from the ledger — the amounts the wallet must supply, already net of
+    // contract mints/withdrawals. Segment 0 aggregates the guaranteed section; each fallible segment
+    // is funded on its own intent.
+    let mut guaranteed_needs: BTreeMap<UnshieldedTokenType, u128> = BTreeMap::new();
+    let mut fallible_needs: BTreeMap<u16, BTreeMap<UnshieldedTokenType, u128>> = BTreeMap::new();
+    for (token, need, segment) in ledger_unshielded_deficits(&Transaction::Standard(base.clone()))?
+    {
+        if segment == 0 {
+            add_u128(&mut guaranteed_needs, token, need);
+        } else {
+            add_u128(fallible_needs.entry(segment).or_default(), token, need);
+        }
+    }
+    let guaranteed_deficits: Vec<(UnshieldedTokenType, u128)> =
+        guaranteed_needs.into_iter().collect();
+    let fallible_deficits: Vec<FallibleUnshieldedDeficit> = fallible_needs
+        .into_iter()
+        .map(|(seg_id, needs)| FallibleUnshieldedDeficit {
+            seg_id,
+            needs: needs.into_iter().collect(),
+            outputs: fallible_outputs_by_seg.remove(&seg_id).unwrap_or_default(),
+        })
+        .collect();
 
     // Where the wallet folds its balancing inputs + dust. Normally it merges into an existing intent,
     // re-emitting that intent's own guaranteed outputs. But when the tx already carries a dust section,
@@ -856,25 +967,25 @@ fn plan_unsealed_proven_standard_tx(
         None => None,
     };
 
-    let (offer, selected) = build_night_offer(
+    let (offer, selected) = build_unshielded_balancing_offer(
         &pool,
         &mut claimed,
         sender_vk,
         sender_addr,
-        need_night,
+        &guaranteed_deficits,
         outputs_in,
         registration_reserve.as_ref(),
     )?;
 
-    // Fund each fallible unshielded offer in its own segment from the same (now-partly-claimed) pool.
+    // Fund each fallible unshielded deficit in its own segment from the same (now-partly-claimed) pool.
     let mut fallible_offers: Vec<(u16, UnshieldedOffer<MnSig, InMemoryDB>)> = Vec::new();
     for fd in &fallible_deficits {
-        let (foffer, _fselected) = build_night_offer(
+        let (foffer, _fselected) = build_unshielded_balancing_offer(
             &pool,
             &mut claimed,
             sender_vk,
             sender_addr,
-            fd.need_night,
+            &fd.needs,
             fd.outputs.clone(),
             None,
         )?;
@@ -1633,6 +1744,148 @@ mod tests {
         );
     }
 
+    /// A custom unshielded token is funded the same way as NIGHT: whole coins, largest-first, with
+    /// change of that same type — and a NIGHT coin in the pool is left untouched.
+    #[test]
+    fn build_unshielded_balancing_offer_funds_custom_token() {
+        use midnight_base_crypto::hash::HashOutput;
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let vk_hex = sender_vk_hex();
+        let custom = UnshieldedTokenType(HashOutput([0xab; 32]));
+        let custom_wire = unshielded_token_wire(custom);
+        let mut custom_utxo = night_pool_utxo(&vk_hex, 100, 1, 0);
+        custom_utxo.token_type = custom_wire;
+        let pool = vec![
+            custom_utxo,
+            night_pool_utxo(&vk_hex, 1_000_000, 2, 0), // must not be spent
+        ];
+        let mut claimed = Vec::new();
+        let (offer, selected) = build_unshielded_balancing_offer(
+            &pool,
+            &mut claimed,
+            &vk,
+            "sender",
+            &[(custom, 60)],
+            vec![],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].token_type, unshielded_token_wire(custom));
+        assert_eq!(offer.inputs.iter_deref().count(), 1);
+        assert_eq!(offer.inputs.iter_deref().next().unwrap().type_, custom);
+        let change: Vec<_> = offer
+            .outputs
+            .iter_deref()
+            .filter(|o| o.type_ == custom)
+            .collect();
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].value, 40);
+        assert!(
+            offer.inputs.iter_deref().all(|i| i.type_ != NIGHT),
+            "NIGHT pool coin must stay unspent"
+        );
+    }
+
+    /// A custom unshielded overspend in a fallible offer shows up as a negative unshielded cell in
+    /// ledger `balance()` — the same signal NIGHT uses — so `ledger_unshielded_deficits` reports it.
+    #[test]
+    fn ledger_unshielded_deficits_reports_custom_token_overspend() {
+        use midnight_base_crypto::hash::HashOutput;
+        let wallet = vk_of(UNSHIELDED_SEED_HEX);
+        let wallet_ua = UserAddress::from(wallet.clone());
+        let custom = UnshieldedTokenType(HashOutput([0xcd; 32]));
+        let offer = UnshieldedOffer {
+            inputs: vec![].into(),
+            outputs: vec![UtxoOutput {
+                value: 42,
+                owner: wallet_ua,
+                type_: custom,
+            }]
+            .into(),
+            signatures: vec![].into(),
+        };
+        let intent = Intent {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: Some(Sp::new(offer)),
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: PedersenRandomness::from(0),
+        };
+        let base = base_with_intents(vec![(1, intent)]);
+        let deficits = ledger_unshielded_deficits(&Transaction::Standard(base)).unwrap();
+        assert_eq!(deficits, vec![(custom, 42, 1)]);
+    }
+
+    /// An offer that already spends some shielded coins but is still short appears as a negative
+    /// shielded cell in ledger `balance()` — the same signal an empty-input deposit uses — so
+    /// `ledger_shielded_deficits` reports the remaining shortfall for top-up funding. Nullifiers the
+    /// offer already spends are excluded from the wallet's remaining coin set.
+    #[test]
+    fn ledger_shielded_deficits_reports_remaining_shortfall_when_offer_has_inputs() {
+        use midnight_storage::storage::Array;
+        use midnight_zswap::{Delta, Input};
+        use std::sync::Arc;
+        use transient_crypto::commitment::Pedersen;
+        use transient_crypto::curve::Fr;
+        use transient_crypto::merkle_tree::MerkleTreeDigest;
+        use transient_crypto::proofs::Proof;
+
+        let token = ShieldedTokenType(HashOutput([0x42; 32]));
+        let spent_nul = Nullifier(HashOutput([0xAA; 32]));
+
+        // Deltas-only shape (like mip6's sample offers): an input nullifier is present so the offer
+        // is not "outputs and no inputs", yet the delta still shows a 60-unit shortfall.
+        let offer = ZswapOffer {
+            inputs: vec![Input {
+                nullifier: spent_nul,
+                value_commitment: Pedersen::from(PedersenRandomness::from(0)),
+                contract_address: None,
+                merkle_tree_root: MerkleTreeDigest::from(Fr::from(0u64)),
+                proof: Arc::new(Proof(vec![])),
+            }]
+            .into(),
+            outputs: Array::new(),
+            transient: Array::new(),
+            deltas: vec![Delta {
+                token_type: token,
+                value: -60,
+            }]
+            .into(),
+        };
+        let mut base = base_with_intents(vec![]);
+        base.guaranteed_coins = Some(Sp::new(offer));
+
+        let deficits = ledger_shielded_deficits(&Transaction::Standard(base.clone())).unwrap();
+        assert_eq!(
+            deficits,
+            vec![(token, 60, 0)],
+            "remaining shortfall must be funded even when the offer already has inputs"
+        );
+
+        let already = spent_shielded_nullifiers(&base);
+        assert!(already.contains(&spent_nul));
+        // A wallet coin whose nullifier the offer already spent must not be selected for the top-up.
+        let wallet_coins = [
+            (spent_nul, qci(token, 100)),
+            (Nullifier(HashOutput([0xBB; 32])), qci(token, 60)),
+        ];
+        let remaining: Vec<_> = wallet_coins
+            .into_iter()
+            .filter(|(nul, _)| !already.contains(nul))
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].value, 60);
+        let plan = plan_shielded_inputs(&remaining, &[(token, 60)]).unwrap();
+        assert_eq!(plan.coins.len(), 1);
+        assert_eq!(plan.coins[0].value, 60);
+    }
+
     /// A balancing offer with no inputs and no outputs carries nothing in the guaranteed section, so the
     /// assembled intent drops it to None rather than emitting a degenerate 0-in/0-out offer — the shape a
     /// fee-less transfer takes once its NIGHT movement rides the fallible offer.
@@ -1747,6 +2000,163 @@ mod tests {
         );
     }
 
+    /// A sender-owned UTXO of an arbitrary unshielded token, for pools that are not NIGHT.
+    fn token_pool_utxo(
+        vk_hex: &str,
+        token: UnshieldedTokenType,
+        value: u128,
+        ih_byte: u8,
+    ) -> UnshieldedUtxo {
+        UnshieldedUtxo {
+            token_type: hex::encode(token.0 .0),
+            value,
+            intent_hash: hex::encode([ih_byte; 32]),
+            output_index: 0,
+            owner: vk_hex.to_string(),
+            ctime_unix_secs: Some(1_000),
+            registered_for_dust_generation: false,
+        }
+    }
+
+    /// The unshielded counterpart of `fallible_balancing_nets_the_segment_to_zero`: a deficit in a
+    /// **custom** unshielded token must be funded from the wallet's coins of that token, exactly as a
+    /// NIGHT deficit is. Nothing about the ledger's balance check is NIGHT-specific — `balance()`
+    /// keys on `TokenType::Unshielded(t)` for every `t`.
+    #[test]
+    fn fallible_balancing_nets_a_custom_unshielded_token_to_zero() {
+        let sk: [u8; 32] = hex::decode(UNSHIELDED_SEED_HEX)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk = MidnightSigningKey::from_bytes(&sk).unwrap().verifying_key();
+        let vk_hex = sender_vk_hex();
+        let token = UnshieldedTokenType(HashOutput([0x5a; 32]));
+
+        // A dapp fallible offer at segment 2: a 100-unit output of `token`, no inputs (the deficit).
+        let dapp_out = UtxoOutput {
+            value: 100,
+            owner: UserAddress::from(vk.clone()),
+            type_: token,
+        };
+        let dapp_fallible = UnshieldedOffer {
+            inputs: vec![].into(),
+            outputs: vec![dapp_out.clone()].into(),
+            signatures: vec![].into(),
+        };
+        let mut intent = intent_with(None, None);
+        intent.fallible_unshielded_offer = Some(Sp::new(dapp_fallible));
+        let base = base_with_intents(vec![(2, intent)]);
+
+        // Before balancing, segment 2 is overspent by the 100-unit output.
+        assert!(!tx_balance_imbalances(&Transaction::Standard(base.clone()))
+            .unwrap()
+            .is_empty());
+
+        // The wallet holds exactly the coin that covers it.
+        let pool = vec![token_pool_utxo(&vk_hex, token, 100, 1)];
+        let mut claimed = Vec::new();
+        let (foffer, _) = build_unshielded_balancing_offer(
+            &pool,
+            &mut claimed,
+            &vk,
+            "sender",
+            &[(token, 100)],
+            vec![dapp_out],
+            None,
+        )
+        .expect("the wallet must be able to fund a custom unshielded token deficit");
+        let mut balanced = base;
+        attach_fallible_offer(&mut balanced, 2, &foffer);
+
+        let imbalances = tx_balance_imbalances(&Transaction::Standard(balanced)).unwrap();
+        assert!(
+            imbalances.is_empty(),
+            "fallible segment must be balanced: {imbalances:?}"
+        );
+    }
+
+    /// A contract call that declares it takes NIGHT in creates a real unshielded deficit: the ledger
+    /// subtracts `effects.unshielded_inputs` from the segment. The balancer sizes its deficit from
+    /// negative cells in `balance()` (via `ledger_unshielded_deficits`), so the contract's intake is
+    /// funded even when the intent carries no unshielded offer outputs — attach the funded offer and
+    /// the segment nets to zero.
+    #[test]
+    fn a_contract_calls_unshielded_intake_is_part_of_the_night_deficit() {
+        use midnight_coin_structure::contract::ContractAddress;
+        use midnight_ledger::structure::{ContractAction, ContractCall, ProofVersioned};
+        use onchain_runtime::context::Effects;
+        use onchain_runtime::state::EntryPointBuf;
+        use onchain_runtime::transcript::Transcript;
+        use transient_crypto::proofs::Proof;
+
+        let sk: [u8; 32] = hex::decode(UNSHIELDED_SEED_HEX)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk = MidnightSigningKey::from_bytes(&sk).unwrap().verifying_key();
+        let vk_hex = sender_vk_hex();
+
+        // A call whose fallible transcript declares 100 NIGHT taken IN by the contract.
+        let mut effects = Effects::<InMemoryDB>::default();
+        effects.unshielded_inputs = effects
+            .unshielded_inputs
+            .insert(LedgerTokenType::Unshielded(NIGHT), 100);
+        let transcript = Sp::new(Transcript {
+            gas: Default::default(),
+            effects,
+            program: vec![].into(),
+            version: None,
+        });
+        let call = ContractAction::Call(Sp::new(ContractCall::<ProofMarker, InMemoryDB> {
+            address: ContractAddress(HashOutput([0xC0; 32])),
+            entry_point: EntryPointBuf(b"deposit".to_vec()),
+            guaranteed_transcript: None,
+            fallible_transcript: Some(transcript),
+            communication_commitment: Default::default(),
+            proof: ProofVersioned::V2(Proof(vec![])),
+        }));
+
+        let mut intent = intent_with(None, None);
+        intent.actions = vec![call].into();
+        let base = base_with_intents(vec![(2, intent)]);
+
+        // The ledger sees segment 2 short by the 100 NIGHT the contract takes in.
+        let imbalances = tx_balance_imbalances(&Transaction::Standard(base.clone())).unwrap();
+        assert!(
+            !imbalances.is_empty(),
+            "the contract's declared intake must show as a deficit"
+        );
+
+        let deficits = ledger_unshielded_deficits(&Transaction::Standard(base.clone())).unwrap();
+        assert_eq!(
+            deficits,
+            vec![(NIGHT, 100, 2)],
+            "the balancer must fund the contract's declared intake, not just the offer outputs"
+        );
+
+        // No fallible offer outputs to re-emit — fund from the deficit alone and attach.
+        let pool = vec![night_pool_utxo(&vk_hex, 100, 1, 0)];
+        let mut claimed = Vec::new();
+        let (foffer, _) = build_unshielded_balancing_offer(
+            &pool,
+            &mut claimed,
+            &vk,
+            "sender",
+            &[(NIGHT, 100)],
+            vec![],
+            None,
+        )
+        .expect("wallet must fund a contract-only unshielded intake");
+        let mut balanced = base;
+        attach_fallible_offer(&mut balanced, 2, &foffer);
+
+        let imbalances = tx_balance_imbalances(&Transaction::Standard(balanced)).unwrap();
+        assert!(
+            imbalances.is_empty(),
+            "funding the contract intake must net the segment to zero: {imbalances:?}"
+        );
+    }
+
     /// A proven tx whose single intent carries both a guaranteed and a fallible wallet input, at a
     /// non-zero segment — the shape the signer must sign across both offers.
     fn build_proven_tx_with_fallible(vk: &VerifyingKey) -> Vec<u8> {
@@ -1830,5 +2240,11 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(g_sigs, 1, "guaranteed input must be signed");
         assert_eq!(f_sigs, 1, "fallible input must be signed");
+    }
+
+    fn vk_of(seed_hex: &str) -> VerifyingKey {
+        MidnightSigningKey::from_bytes(&hex::decode(seed_hex).unwrap())
+            .unwrap()
+            .verifying_key()
     }
 }

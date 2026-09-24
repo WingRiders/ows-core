@@ -3509,6 +3509,7 @@ dependencies = [
  "midnight-coin-structure",
  "midnight-ledger",
  "midnight-ledger-static",
+ "midnight-onchain-runtime",
  "midnight-serialize",
  "midnight-storage",
  "midnight-transient-crypto",
