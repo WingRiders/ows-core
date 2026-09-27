@@ -2730,8 +2730,10 @@ name = "ows-core"
 version = "1.3.2"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "uuid",
 ]
@@ -2792,8 +2794,10 @@ dependencies = [
  "hmac",
  "k256",
  "libc",
+ "midnight-coin-structure",
  "midnight-ledger",
  "midnight-serialize",
+ "midnight-storage",
  "midnight-zswap",
  "num-bigint",
  "ows-core",
