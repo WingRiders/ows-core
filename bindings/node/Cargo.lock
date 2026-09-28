@@ -3576,6 +3576,7 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonrpsee",
+ "k256",
  "midnight-base-crypto",
  "midnight-coin-structure",
  "midnight-ledger",
