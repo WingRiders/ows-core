@@ -9,8 +9,8 @@ use ows_core::{
 };
 use ows_signer::chains::MidnightSigner;
 use ows_signer::{
-    decrypt, encrypt, signer_for_chain, signer_for_chain_type, CryptoEnvelope, Curve, HdDeriver,
-    Mnemonic, MnemonicStrength, SecretBytes,
+    decrypt, encrypt, signer_for_chain, signer_for_chain_type, ChainSigner, CryptoEnvelope, Curve,
+    HdDeriver, Mnemonic, MnemonicStrength, SecretBytes, SignOutput,
 };
 
 use crate::error::OwsLibError;
@@ -568,6 +568,7 @@ fn sign_hash_with_credential(
     Ok(SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction: None,
     })
 }
 
@@ -601,20 +602,25 @@ pub fn sign_transaction(
     let signer = signer_for_chain(&chain)?;
     let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
+    let transaction = signed_transaction_hex(&chain, signer.as_ref(), &signable_tx, &output)?;
 
     Ok(SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction,
     })
 }
 
 /// Decode the `--tx` input into transaction bytes. A hex decode for every chain; Midnight's input is
-/// a DApp Connector request (JSON, not hex), so it is carried through unchanged for the key-aware
-/// preparation step to parse. Needs no signing key, so it can run before policy evaluation on the
-/// agent path.
+/// a DApp Connector request, normalized here into canonical request JSON — a bare `zswapoffer` bech32
+/// or a bare hex transaction is wrapped into the request that carries it, so a caller can hand over an
+/// offer or a proven transaction without writing the envelope. Normalizing before the key-aware step
+/// also lets the agent path's policy pass classify the request. Needs no signing key.
 pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8>, OwsLibError> {
     if chain.chain_type == ChainType::Midnight {
-        return Ok(tx_input.as_bytes().to_vec());
+        let request = ows_midnight::normalize_connector_request(tx_input)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+        return Ok(request.into_bytes());
     }
     let clean = tx_input.strip_prefix("0x").unwrap_or(tx_input);
     hex::decode(clean)
@@ -655,6 +661,24 @@ pub fn prepare_signable_tx(
     // wallet's shielded/dust spend witnesses (the bearer instruments) in the signer.
     plan.authorize(chain.chain_id, &crypto_provider)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
+}
+
+/// The fully signed, sealed transaction hex — populated only for chains that assemble a complete
+/// broadcastable artifact at sign time. Midnight does: [`ChainSigner::encode_signed_transaction`]
+/// reattaches the intent signature to the proven transaction and seals it (keyless), so signing
+/// yields a submit-ready tx. Every other chain's signing product is the bare signature, so this is
+/// `None`.
+pub fn signed_transaction_hex(
+    chain: &ows_core::Chain,
+    signer: &dyn ChainSigner,
+    signable_tx: &[u8],
+    output: &SignOutput,
+) -> Result<Option<String>, OwsLibError> {
+    if chain.chain_type != ChainType::Midnight {
+        return Ok(None);
+    }
+    let sealed = signer.encode_signed_transaction(signable_tx, output)?;
+    Ok(Some(hex::encode(sealed)))
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.
@@ -757,10 +781,7 @@ pub fn sign_message(
     let signer = signer_for_chain(&chain)?;
     let output = signer.sign_message(key.expose(), &msg_bytes, address)?;
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign EIP-712 typed structured data. Returns hex-encoded signature.
@@ -807,6 +828,7 @@ pub fn sign_typed_data(
     Ok(SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction: None,
     })
 }
 
@@ -1359,6 +1381,15 @@ mod tests {
     use super::*;
     use ows_core::OwsError;
 
+    #[test]
+    fn decode_tx_input_wraps_a_bare_midnight_offer_as_a_connector_request() {
+        let chain = parse_chain("midnight:preview").unwrap();
+        let bytes = decode_tx_input(&chain, "zswapoffer1qqqmakeroffer").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["method"], "balanceSealedTransaction");
+        assert_eq!(json["makerTx"], "zswapoffer1qqqmakeroffer");
+    }
+
     // ---- helpers ----
 
     /// Build a private-key wallet directly in the vault, bypassing
@@ -1411,6 +1442,32 @@ mod tests {
         };
 
         crate::policy_store::save_policy(&policy, Some(vault)).unwrap();
+    }
+
+    #[test]
+    fn signed_transaction_hex_is_none_for_non_midnight_chains() {
+        use ows_core::{default_chain_for_type, ALL_CHAIN_TYPES};
+
+        // The sealed-transaction artifact is Midnight-only; every other chain's signing product is
+        // the bare signature, so the field stays `None` regardless of the (here unused) output.
+        let output = SignOutput {
+            signature: vec![],
+            recovery_id: None,
+            public_key: None,
+        };
+        for ct in ALL_CHAIN_TYPES
+            .iter()
+            .filter(|ct| **ct != ChainType::Midnight)
+        {
+            let chain = default_chain_for_type(*ct);
+            let signer = signer_for_chain(&chain).unwrap();
+            let sealed = signed_transaction_hex(&chain, signer.as_ref(), &[], &output).unwrap();
+            assert!(
+                sealed.is_none(),
+                "expected no sealed transaction for {}",
+                chain.chain_id
+            );
+        }
     }
 
     // ================================================================
