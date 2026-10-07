@@ -24,7 +24,8 @@ ows wallet import --name demo --mnemonic
 `wallet info` lists Midnight among the supported chains, and `mnemonic derive` with no
 `--chain` includes a `midnight:mainnet` line. The account is the **unshielded (Night)** address
 only — one address per chain, like every other chain. The shielded and dust addresses are
-derived too (`MidnightSigner::derive_addresses`), but no command prints them yet.
+derived too (`MidnightSigner::derive_addresses`) and printed by `ows fund balance` (see
+[fund-balance.md](./fund-balance.md)).
 
 ## The packed signing key (why it's mnemonic-only)
 
@@ -77,7 +78,7 @@ network:
 
 `{suffix}` is empty on mainnet and `_{reference}` on every other network (`mn_addr_preview`,
 `mn_shield-addr_preview`, `mn_dust_preview`, …). The wallet account and `derive` expose only the
-unshielded one; no command prints the shielded and dust addresses yet.
+unshielded one; `ows fund balance` prints the shielded and dust ones.
 
 ## Validation
 
