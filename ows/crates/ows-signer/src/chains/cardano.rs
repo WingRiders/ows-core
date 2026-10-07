@@ -464,7 +464,7 @@ impl CardanoSigner {
         for hash in &unique_hashes {
             if !txs_cbor.contains_key(hash) {
                 return Err(SignerError::RpcError(format!(
-                    "Koios tx_cbor missing transaction {hash}"
+                    "Cardano RPC provider did not return transaction {hash}"
                 )));
             }
         }

@@ -14,7 +14,7 @@ pub struct TokenBalance {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BalanceInfo {
     pub amount: f64,
-    /// Fiat value when known (e.g. MoonPay). Absent for chains without pricing (e.g. Cardano via Koios).
+    /// Fiat value when known (e.g. MoonPay). Absent for chains without pricing (e.g. Cardano).
     #[serde(default)]
     pub value: Option<f64>,
     /// Spot price when known. Absent for chains without pricing.
