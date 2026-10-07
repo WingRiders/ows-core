@@ -211,6 +211,9 @@ pub(super) fn complement_from_balance(
         desired_inputs,
         desired_outputs,
         intent_segment: first_disjoint_segment(maker_segments),
+        // The complement's own expiry never reaches the chain: the merge path rebuilds the taker's intent
+        // with a tip-aligned TTL. Only the maker's sealed TTL bounds when the merged tx can still land.
+        ttl: None,
     }
 }
 
@@ -257,6 +260,43 @@ pub(super) fn sealed_maker_complement(
         taker_unshielded_addr,
         taker_shielded_addr,
     ))
+}
+
+/// The contract actions a sealed maker offer carries. A merge preserves both halves' intents verbatim,
+/// so the maker's contract actions — the taker's complement adds none — are exactly what the submitted
+/// transaction performs, at the maker's own segments.
+pub(super) fn maker_contracts(
+    maker_bytes: &[u8],
+) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+    let mut r: &[u8] = maker_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut r)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+    let Transaction::Standard(base) = &tx else {
+        return Err(std::io::Error::other(
+            "balanceSealedTransaction expects a Standard maker transaction",
+        ));
+    };
+    Ok(crate::contracts::contract_interactions(base.actions()))
+}
+
+/// The DUST registrations of a sealed maker, which survive the merge into the submitted transaction. The
+/// taker's complement is a plain `makeIntent` and carries none.
+pub(super) fn maker_dust_registrations(
+    maker_bytes: &[u8],
+    wallet: &crate::dust_registrations::WalletDustKeys,
+) -> Result<Vec<crate::dust_registrations::RequestedDustRegistration>, std::io::Error> {
+    let mut r: &[u8] = maker_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut r)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+    let Transaction::Standard(base) = &tx else {
+        return Err(std::io::Error::other(
+            "balanceSealedTransaction expects a Standard maker transaction",
+        ));
+    };
+    crate::dust_registrations::requested_dust_registrations(
+        crate::dust_registrations::intent_registrations(base),
+        wallet,
+    )
 }
 
 /// Authorize the sealed-maker merge: build the taker's complementary half from its own coins, fold in a
@@ -330,6 +370,88 @@ pub(super) fn authorize_merge(
     ))
 }
 
+/// The wallet-relative effects a sealed-maker MERGE will have — the taker's own half **plus** the merged
+/// DUST fee it funds — all in the transaction's guaranteed section (segment 0): the taker's coins settle
+/// guaranteed just like a plain makeIntent (see [`super::make_intent::GUARANTEED_SEGMENT`]), and the fee
+/// is a guaranteed cost. The token movement is request-derived from the taker's
+/// [complement](sealed_maker_complement), exactly as a plain makeIntent. On a live-DUST chain, when the
+/// taker pays fees, the fee covers the whole merged tx (the maker contributes bytes but never pays), so
+/// it is sized against a **mock-proven** taker complement — fixed-size proofs give the exact fee with no
+/// real proving — and folded in as a DUST outflow, so a `sum(|diff|)` cap at the policy seam sees the
+/// burn. Sizing needs the same tip + spendable-dust sync the real merge uses; the real, submittable spend
+/// is proved only post-seam in [`authorize_merge`], so a merge denied at the seam never reaches a real
+/// proof.
+pub(super) fn merge_segment_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    maker_bytes: &[u8],
+    complement: &MakeIntentRequest,
+    pay_fees: bool,
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+    let mut effects = super::make_intent::request_effects(chain_id, crypto_provider, complement)?;
+
+    let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
+    let adding_dust =
+        pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(&indexer_url));
+    if !adding_dust {
+        return Ok(crate::balance_tx::single_segment(
+            super::make_intent::GUARANTEED_SEGMENT,
+            effects,
+        ));
+    }
+
+    // Size the merged DUST fee against the taker's mock-proven complement — same coin selection as the
+    // real merge, fixed-size mock proofs, no real proving. The maker (sealed) is needed only to size the
+    // fee against the merged tx.
+    let taker_base = super::make_intent::mock_authorize(chain_id, crypto_provider, complement)?;
+    let taker_seg = complement.intent_segment;
+    let binding_commitment = taker_base
+        .intents
+        .get(&taker_seg)
+        .ok_or_else(|| std::io::Error::other("taker complement missing its intent segment"))?
+        .deref()
+        .binding_commitment;
+
+    let mut mr: &[u8] = maker_bytes;
+    let maker: TxSealed = tagged_deserialize(&mut mr)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+
+    let scope = SyncCacheScope {
+        chain_id: Some(chain_id.to_string()),
+        ..Default::default()
+    };
+    let (ledger_params, tip_secs) =
+        crate::block_on(crate::ledger_params::fetch_indexer_tip(&indexer_url))?;
+    let dust_ctime = Timestamp::from_secs(tip_secs);
+
+    // Only the fee is reported as an effect here; nothing downstream proves or submits, so the synced
+    // dust state and re-priced parameters are dropped.
+    let sized = crate::balance_tx::size_merge_dust_fee(
+        &maker,
+        &taker_base,
+        taker_seg,
+        binding_commitment,
+        crypto_provider,
+        dust_ctime,
+        &ledger_params,
+        &indexer_url,
+        &scope,
+    )?;
+
+    let addresses = crypto_provider
+        .addresses(&MidnightNetwork::from_chain_id(chain_id))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if let Some(effect) =
+        crate::balance_tx::dust_outflow_effect(addresses.dust, sized.plan.fee_dust)
+    {
+        effects.push(effect);
+    }
+    Ok(crate::balance_tx::single_segment(
+        super::make_intent::GUARANTEED_SEGMENT,
+        effects,
+    ))
+}
+
 /// Size + realize the taker's DUST fee for the merge and splice it into the taker's complement intent
 /// (at `dust_seg`) before sealing. The fee covers the whole *merged* tx (the maker contributes bytes but
 /// never pays), so it is sized against the merged tx in [`crate::balance_tx::size_merge_dust_fee`]; the
@@ -359,7 +481,9 @@ fn attach_merge_dust_fee(
         .binding_commitment;
 
     // Size against the merged tx (offline, mock-proved), then prove the real, submittable spend.
-    let (plan, dust_state) = crate::balance_tx::size_merge_dust_fee(
+    // `size_merge_dust_fee` re-prices against the tip after its dust sync, so it hands back the
+    // parameters it actually sized against — proving must use those, not the staler ones read above.
+    let sized = crate::balance_tx::size_merge_dust_fee(
         maker,
         taker_base,
         dust_seg,
@@ -371,9 +495,13 @@ fn attach_merge_dust_fee(
         scope,
     )?;
     let prover = crate::balance_tx::midnight_prover(chain_id)?;
-    let dust_actions =
-        crate::block_on(crypto_provider.authorize_dust(&dust_state, &plan, &ledger_params, prover))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let dust_actions = crate::block_on(crypto_provider.authorize_dust(
+        &sized.dust_state,
+        &sized.plan,
+        &sized.ledger_params,
+        prover,
+    ))
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Splice the proven DUST section into the taker's complement intent, aligning its TTL to the tip
     // (the section's fee window is anchored at `dust_ctime`).
@@ -384,7 +512,7 @@ fn attach_merge_dust_fee(
         .deref()
         .clone();
     intent.dust_actions = Some(Sp::new(dust_actions));
-    intent.ttl = plan.intent_ttl;
+    intent.ttl = sized.plan.intent_ttl;
     taker_base.intents = taker_base.intents.insert(dust_seg, intent);
     Ok(())
 }
@@ -501,6 +629,18 @@ mod merge_tests {
                 "token {token}: taker must negate the maker's imbalance"
             );
         }
+    }
+
+    #[test]
+    fn contracts_of_a_real_sealed_maker_are_read_from_its_intents() {
+        let hex_str = include_str!("testdata/sealed_maker_preprod.hex");
+        let hex_str = hex_str.trim();
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+
+        // The fixture is a plain token swap, so it names no contract — what matters here is that a
+        // sealed maker's actions are readable at all, i.e. the seam reports `contracts` for a merge
+        // instead of failing to parse the maker it already balances against.
+        assert_eq!(maker_contracts(&bytes).unwrap(), Vec::new());
     }
 }
 

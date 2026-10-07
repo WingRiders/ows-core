@@ -10,6 +10,7 @@ use midnight_coin_structure::coin::Info as CoinInfo;
 use midnight_ledger::structure::{
     Intent, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput,
 };
+use midnight_serialize::tagged_serialize;
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
@@ -22,9 +23,9 @@ use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
-    decode_shielded_recipient, decode_unshielded_recipient, err, far_future_ttl,
-    prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
-    PreimageTx, TransferKind,
+    decode_shielded_recipient, decode_unshielded_recipient, default_intent_ttl, err,
+    mock_prove_unsealed, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
+    DesiredOutput, PreimageTx, TransferKind,
 };
 
 /// The intent that carries the wallet's unshielded outputs keys at a fallible segment (>= 1): the
@@ -95,6 +96,30 @@ pub(super) fn authorize(
     crate::authorize_proven_tx(chain_id, crypto_provider, plan)
 }
 
+/// The wallet-relative effects a `makeTransfer` will have, per segment, sized from the inert balance
+/// plan so the **DUST fee** the transfer burns is included — a `sum(|diff|)` cap at the policy seam must
+/// see it, and request-derived effects (outputs only) would under-state it. The outputs are
+/// **mock-proven** (proofs are fixed-size, so the sized fee matches the real one exactly) and the
+/// balancing is planned against the wallet's synced UTXOs; **no real proving happens here**, so a
+/// transfer denied at the seam never reaches [`authorize`]'s real proofs. `BalancedPlan::segment_effects`
+/// then nets the wallet's inputs against its own change and outputs — the value to each recipient plus
+/// the dust fee — attributing each to the segment (guaranteed or fallible) its offer rides.
+pub(super) fn segment_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeTransferRequest,
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+    let preimage = build_make_transfer_preimage(chain_id, req)?;
+    // Mock-prove into the *unsealed* proven form (`mock_prove` would seal it, and the balancer only
+    // consumes unsealed proven bytes). Fixed-size proofs → the sized fee equals the real one.
+    let mock_proven = mock_prove_unsealed(preimage)?;
+    let mut bytes = Vec::new();
+    tagged_serialize(&mock_proven, &mut bytes)
+        .map_err(|e| err(format!("serialize mock-proven makeTransfer: {e}")))?;
+    let plan = crate::plan_unsealed_proven_tx(chain_id, crypto_provider, &bytes, req.pay_fees)?;
+    plan.segment_effects(chain_id, crypto_provider)
+}
+
 /// Construct the `proof-preimage` transaction for a `makeTransfer`: recipient outputs and no inputs.
 /// Unshielded outputs ride the fallible unshielded offer of the maker intent (see
 /// [`MAKE_TRANSFER_INTENT_SEGMENT`]); shielded outputs ride the guaranteed Zswap offer. Balancing (the
@@ -123,9 +148,9 @@ fn build_make_transfer_preimage(
         fallible_unshielded_offer: unshielded_offer.map(Sp::new),
         actions: vec![].into(),
         dust_actions: None,
-        // The balancer re-aligns the TTL on the intent it owns (this one); a far-future stand-in avoids
-        // a spuriously-expired intent in the meantime.
-        ttl: far_future_ttl(),
+        // The balancer re-aligns the TTL on the intent it owns (this one); the wallet default avoids a
+        // spuriously-expired intent in the meantime.
+        ttl: default_intent_ttl(),
         binding_commitment: rng.r#gen(),
     };
     let intents: MnHashMap<u16, _, InMemoryDB> =
@@ -336,6 +361,59 @@ mod tests {
             intent.fallible_unshielded_offer.is_some(),
             "the NIGHT output rides the maker intent's fallible offer"
         );
+    }
+
+    /// A valid preview *shielded* address — a shielded output carries a real ZK proof, so it exercises
+    /// the mock prover (an unshielded output has no proof to size).
+    fn preview_shielded_address() -> String {
+        let mut blob = b"MNK1".to_vec();
+        blob.extend_from_slice(&[0x11u8; 32]);
+        blob.extend_from_slice(&[0x22u8; 32]);
+        blob.extend_from_slice(&[0x33u8; 32]);
+        MidnightSigner::preview()
+            .derive_addresses(&blob)
+            .expect("derive addresses")
+            .shielded
+    }
+
+    /// Regression guard for the effect-sizing prover: `mock_prove_unsealed` must yield the **unsealed**
+    /// proven form (`proof,embedded-fr`) that the balancer and merge fee sizing consume — the plain ledger
+    /// `mock_prove` seals to `proof,pedersen-schnorr`, which cannot re-parse as unsealed and so silently
+    /// breaks the whole make* effects path. Uses a shielded output so a real output proof is mock-sized.
+    #[test]
+    fn mock_prove_unsealed_yields_unsealed_proven_not_sealed() {
+        use midnight_ledger::structure::ProofMarker;
+        use midnight_serialize::tagged_deserialize;
+        type UnsealedProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
+
+        let req = MakeTransferRequest {
+            desired_outputs: vec![DesiredOutput {
+                kind: TransferKind::Shielded,
+                token_type: "night".into(),
+                value: 1_000,
+                recipient: preview_shielded_address(),
+            }],
+            pay_fees: true,
+        };
+        let preimage =
+            build_make_transfer_preimage("midnight:preview", &req).expect("build preimage");
+
+        // The plain ledger mock seals: its output is tagged pedersen-schnorr and must NOT parse as unsealed.
+        let sealed = preimage.mock_prove().expect("mock_prove");
+        let mut sealed_bytes = Vec::new();
+        tagged_serialize(&sealed, &mut sealed_bytes).unwrap();
+        assert!(
+            tagged_deserialize::<UnsealedProven>(&mut &sealed_bytes[..]).is_err(),
+            "mock_prove output is sealed and must not re-parse as unsealed proven"
+        );
+
+        // The effect-sizing prover keeps it unsealed: its output round-trips as embedded-fr.
+        let unsealed = mock_prove_unsealed(preimage).expect("mock_prove_unsealed");
+        let mut unsealed_bytes = Vec::new();
+        tagged_serialize(&unsealed, &mut unsealed_bytes).unwrap();
+        let back: UnsealedProven = tagged_deserialize(&mut &unsealed_bytes[..])
+            .expect("mock_prove_unsealed output must re-parse as unsealed proven (embedded-fr)");
+        assert!(matches!(back, Transaction::Standard(_)));
     }
 
     #[test]
