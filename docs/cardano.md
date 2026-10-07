@@ -233,7 +233,7 @@ are supported:
 | Provider    | Authentication | Default |
 | ----------- | -------------- | ------- |
 | **Koios**   | None (keyless) | Yes     |
-| **Blockfrost** | `project_id` API key via the `BLOCKFROST_PROJECT_ID` environment variable | No (opt-in via RPC URL override) |
+| **Blockfrost** | `project_id` API key via the `BLOCKFROST_PROJECT_ID` environment variable | No (opt-in via user config) |
 
 Both providers implement the same three operations: broadcast a signed
 transaction (CBOR), fetch the CBOR of a set of transactions (used to resolve
@@ -268,9 +268,10 @@ selects Blockfrost.
 `resolve_cardano_provider` (`ows/crates/ows-core/src/cardano_rpc/mod.rs`) inspects the RPC
 URL string and returns a `Box<dyn CardanoRpcProvider>`:
 
-- **Blockfrost** — when the URL contains `blockfrost.io/api` **or** is prefixed
-  with `blockfrost|`. The prefix form is for custom Blockfrost-compatible hosts
-  that would not match the substring heuristic (e.g. `blockfrost|https://my-proxy.example/api/v0`).
+- **Blockfrost** — when the URL is `https` and its parsed host is `blockfrost.io`
+  or a subdomain of it, **or** when the URL is prefixed with `blockfrost|`. The
+  prefix form is for custom Blockfrost-compatible hosts
+  (e.g. `blockfrost|https://my-proxy.example/api/v0`).
   The `project_id` is read from **`BLOCKFROST_PROJECT_ID`**; if the variable is
   unset, resolution returns an error.
 - **Koios** — when the URL contains `koios.rest/api` **or** is prefixed with
@@ -278,10 +279,11 @@ URL string and returns a `Box<dyn CardanoRpcProvider>`:
 - **Any other URL** — rejected as unsupported.
 
 Whichever branch selects Blockfrost, the `project_id` is sent to the resolved URL
-as a request header, so that URL must name a host you control or trust with the
-key. Both branches take the URL from the same operator-controlled sources as
-`BLOCKFROST_PROJECT_ID` itself (explicit override, user config, built-in default);
-neither is reachable by an API-key caller, which cannot supply an RPC URL.
+as a request header. Auto-detection checks the parsed host, so it only sends the
+key to Blockfrost itself. The `blockfrost|` prefix sends the key to any host, so
+only the operator may use it: in user config, or as an explicit override in owner
+mode. `sign_and_send` in API-key mode still accepts a caller RPC URL, but it
+refuses a URL with the `blockfrost|` prefix before any request.
 
 After selection, the `koios|` / `blockfrost|` prefix is stripped before the
 provider issues HTTP requests. All Cardano call sites — `broadcast_cardano`

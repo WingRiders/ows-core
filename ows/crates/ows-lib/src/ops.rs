@@ -786,6 +786,16 @@ pub fn sign_and_send(
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
         let signer = signer_for_chain(&chain_info)?;
 
+        // The prefix sends the operator's Blockfrost project_id to any host, so a
+        // token holder could use it to capture the key.
+        if rpc_url.is_some_and(|url| url.starts_with(ows_core::BLOCKFROST_URL_PREFIX)) {
+            return Err(OwsLibError::InvalidInput(format!(
+                "an API token cannot select an RPC URL with the `{}` prefix; \
+                 set a custom Blockfrost host in the operator config instead",
+                ows_core::BLOCKFROST_URL_PREFIX
+            )));
+        }
+
         // An explicit URL wins; otherwise resolve the configured one for the chains whose
         // make_transaction_context cannot build a context without it.
         let resolved_rpc_url = match rpc_url {
@@ -3704,6 +3714,57 @@ mod tests {
             OwsLibError::Crypto(_) => {}
             other => panic!("expected Crypto error for None passphrase, got: {other}"),
         }
+    }
+
+    #[test]
+    fn sign_and_send_refuses_a_blockfrost_prefix_from_an_api_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path();
+        let wallet = create_wallet("bf-agent", None, None, Some(vault)).unwrap();
+        let (token, _) = crate::key_ops::create_api_key(
+            "bf-agent-key",
+            std::slice::from_ref(&wallet.id),
+            &[],
+            "",
+            None,
+            Some(vault),
+        )
+        .unwrap();
+
+        let mut server = mockito::Server::new();
+        let no_request = server.mock("GET", mockito::Matcher::Any).expect(0).create();
+        let rpc_url = format!("blockfrost|{}", server.url());
+
+        let err = sign_and_send(
+            &wallet.id,
+            "cardano",
+            "deadbeef",
+            Some(&token),
+            None,
+            Some(&rpc_url),
+            Some(vault),
+        )
+        .unwrap_err();
+        match err {
+            OwsLibError::InvalidInput(msg) => assert!(msg.contains("blockfrost|"), "{msg}"),
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
+        no_request.assert();
+
+        // The owner may still choose a custom Blockfrost host.
+        let owner = sign_and_send(
+            &wallet.id,
+            "cardano",
+            "deadbeef",
+            None,
+            None,
+            Some(&rpc_url),
+            Some(vault),
+        );
+        assert!(
+            !owner.unwrap_err().to_string().contains("API token"),
+            "the owner path must not refuse the prefix"
+        );
     }
 
     #[test]

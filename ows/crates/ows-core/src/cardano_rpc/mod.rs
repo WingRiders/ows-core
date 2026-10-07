@@ -64,11 +64,24 @@ pub trait CardanoRpcProvider: Send + Sync {
 /// Environment variable holding the Blockfrost `project_id` (API key).
 pub const BLOCKFROST_PROJECT_ID_ENV: &str = "BLOCKFROST_PROJECT_ID";
 
-const BLOCKFROST_URL_PREFIX: &str = "blockfrost|";
+/// Prefix that selects Blockfrost for any host. The `project_id` goes to that
+/// host, so only the operator may set a URL with this prefix.
+pub const BLOCKFROST_URL_PREFIX: &str = "blockfrost|";
 const KOIOS_URL_PREFIX: &str = "koios|";
 
+/// Auto-detection checks the parsed host, not a substring: the `project_id`
+/// must only reach Blockfrost itself, over TLS.
 fn is_blockfrost_url(url: &str) -> bool {
-    url.starts_with(BLOCKFROST_URL_PREFIX) || url.contains("blockfrost.io/api")
+    if url.starts_with(BLOCKFROST_URL_PREFIX) {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|host| host == "blockfrost.io" || host.ends_with(".blockfrost.io"))
 }
 
 fn is_koios_url(url: &str) -> bool {
@@ -83,9 +96,9 @@ fn strip_provider_prefix(url: &str) -> &str {
 
 /// Select a Cardano RPC provider from its URL.
 ///
-/// Blockfrost is selected when the URL contains `blockfrost.io/api` or is
-/// prefixed with `blockfrost|` (reading the `project_id` from
-/// [`BLOCKFROST_PROJECT_ID_ENV`]). Koios is selected when the URL contains
+/// Blockfrost is selected for an `https` URL whose host is `blockfrost.io` or a
+/// subdomain of it, or for a URL prefixed with [`BLOCKFROST_URL_PREFIX`]
+/// (reading the `project_id` from [`BLOCKFROST_PROJECT_ID_ENV`]). Koios is selected when the URL contains
 /// `koios.rest/api` or is prefixed with `koios|`. Any other URL is rejected.
 pub fn resolve_cardano_provider(url: &str) -> Result<Box<dyn CardanoRpcProvider>, CardanoRpcError> {
     if is_blockfrost_url(url) {
@@ -241,5 +254,41 @@ mod tests {
         let provider = resolve_cardano_provider("https://api.koios.rest/api/v1").unwrap();
         // Smoke: the boxed provider is usable for the no-op empty utxo case.
         assert_eq!(provider.fetch_txs_cbor(&[]).unwrap(), BTreeMap::new());
+    }
+
+    #[test]
+    fn blockfrost_detection_accepts_blockfrost_hosts_and_the_prefix() {
+        for url in [
+            "https://cardano-mainnet.blockfrost.io/api/v0",
+            "https://blockfrost.io/api/v0",
+            "blockfrost|https://my-proxy.example/api/v0",
+        ] {
+            assert!(is_blockfrost_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn blockfrost_detection_rejects_other_hosts_that_mention_blockfrost() {
+        for url in [
+            "http://cardano-mainnet.blockfrost.io/api/v0",
+            "https://attacker.example/?x=blockfrost.io/api",
+            "https://attacker.example/blockfrost.io/api/v0",
+            "https://blockfrost.io.attacker.example/api/v0",
+            "https://attackerblockfrost.io/api/v0",
+            "https://cardano-mainnet.blockfrost.io@attacker.example/api/v0",
+        ] {
+            assert!(!is_blockfrost_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_url_that_only_mentions_blockfrost() {
+        let err = resolve_cardano_provider("https://attacker.example/?x=blockfrost.io/api")
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("unsupported Cardano RPC URL"),
+            "{err}"
+        );
     }
 }
