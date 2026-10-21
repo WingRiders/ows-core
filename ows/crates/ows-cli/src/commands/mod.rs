@@ -77,11 +77,18 @@ pub fn read_private_key() -> Result<Zeroizing<String>, CliError> {
     Ok(Zeroizing::new(trimmed))
 }
 
+/// Take the passphrase from the OWS_PASSPHRASE env var (or LWS_PASSPHRASE fallback) without
+/// prompting, removing it from the process environment. `None` when neither is set.
+pub fn take_passphrase() -> Option<Zeroizing<String>> {
+    clear_env_var("OWS_PASSPHRASE")
+        .or_else(|| clear_env_var("LWS_PASSPHRASE"))
+        .map(Zeroizing::new)
+}
+
 /// Read a passphrase from OWS_PASSPHRASE env var (or LWS_PASSPHRASE fallback) or prompt interactively.
 pub fn read_passphrase() -> Zeroizing<String> {
-    if let Some(value) = clear_env_var("OWS_PASSPHRASE").or_else(|| clear_env_var("LWS_PASSPHRASE"))
-    {
-        return Zeroizing::new(value);
+    if let Some(value) = take_passphrase() {
+        return value;
     }
     let stdin = io::stdin();
     if stdin.is_terminal() {

@@ -9,19 +9,14 @@ use cardano_serialization_lib::{
 };
 use ed25519_bip32::XPrv;
 use ows_core::policy::{TransactionContext, TransactionEffect};
-use ows_core::ChainType;
-use serde::{Deserialize, Serialize};
+use ows_core::{CardanoRpcProvider, ChainType};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::time::Duration;
 
 pub struct CardanoSigner {
     network_id: u8,
 }
 
 const LOVELACE_ASSET_ID: &str = "lovelace";
-const KOIOS_TXS_CBOR_CHUNK_SIZE: usize = 10;
-const KOIOS_REQUESTS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Largest transaction we will hand to CSL's parser. The Cardano protocol's
 /// `maxTxSize` is 16384 bytes, so anything larger cannot be a valid on-chain
@@ -36,14 +31,6 @@ const MAX_TX_BYTES: usize = 16384;
 /// stacks the signer runs on.
 const MAX_CBOR_DEPTH: usize = 128;
 
-/// Largest Koios response body we will buffer. The endpoint is untrusted here — see
-/// `check_tx_cbor` — and without a cap it could stream an unbounded body and exhaust
-/// memory before a single byte is ever validated. A `tx_cbor` page carries at most
-/// `KOIOS_TXS_CBOR_CHUNK_SIZE` transactions, each bounded by `MAX_TX_BYTES` on-chain
-/// and hex-encoded on the wire, so a legitimate response stays three orders of
-/// magnitude below this.
-const KOIOS_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-
 // Per-address, per-asset balance sums (lovelace and native assets alike). On-chain
 // both are u64 (CDDL `coin` / `positive_coin`), but summing several UTxOs or outputs
 // under one address can exceed u64 for a native asset — one asset can be minted up to
@@ -53,29 +40,33 @@ const KOIOS_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // holds any realistic sum (a tx's few hundred entries, each ≤ u64::MAX) with room to spare.
 type AssetBalanceMap = BTreeMap<String, i128>;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosAssetListItem {
+struct Asset {
     policy_id: String,
     asset_name: String,
-    quantity: String,
+    quantity: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosUtxoInfoRow {
+struct Utxo {
+    #[allow(dead_code)]
     tx_hash: String,
+    #[allow(dead_code)]
     tx_index: u32,
     address: String,
-    value: String,
-    asset_list: Option<Vec<KoiosAssetListItem>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosTxCborRow {
-    tx_hash: String,
-    cbor: String,
+    lovelace: u64,
+    assets: Vec<Asset>,
 }
 
 impl CardanoSigner {
+    /// Return the BLAKE2b-256 hash of the original transaction body, excluding
+    /// witnesses and auxiliary data. Preserve the CBOR bytes rather than hashing
+    /// a re-serialized body: equivalent encodings can have different IDs.
+    pub fn transaction_id(tx_bytes: &[u8]) -> Result<String, SignerError> {
+        check_tx_cbor(tx_bytes).map_err(SignerError::InvalidTransaction)?;
+        let tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
+            .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
+        Ok(tx.transaction_hash().to_hex())
+    }
+
     pub fn mainnet() -> Self {
         Self {
             network_id: NetworkInfo::mainnet().network_id(),
@@ -330,33 +321,18 @@ impl CardanoSigner {
     }
 
     /// Fold a resolved UTxO's lovelace and native-asset amounts into `balances`, under its address.
-    fn add_utxo_balance(
-        balances: &mut BTreeMap<String, AssetBalanceMap>,
-        utxo: &KoiosUtxoInfoRow,
-    ) -> Result<(), SignerError> {
+    fn add_utxo_balance(balances: &mut BTreeMap<String, AssetBalanceMap>, utxo: &Utxo) {
         let for_address = balances.entry(utxo.address.clone()).or_default();
 
         *for_address
             .entry(LOVELACE_ASSET_ID.to_string())
-            .or_insert(0) += i128::from(utxo.value.parse::<u64>().map_err(|e| {
-            SignerError::InvalidTransaction(format!(
-                "invalid lovelace value for utxo {}#{}: {e}",
-                utxo.tx_hash, utxo.tx_index
-            ))
-        })?);
+            .or_insert(0) += i128::from(utxo.lovelace);
 
-        for asset in utxo.asset_list.iter().flatten() {
+        for asset in &utxo.assets {
             *for_address
                 .entry(format!("{}{}", asset.policy_id, asset.asset_name))
-                .or_insert(0) += i128::from(asset.quantity.parse::<u64>().map_err(|e| {
-                SignerError::InvalidTransaction(format!(
-                    "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
-                    utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
-                ))
-            })?);
+                .or_insert(0) += i128::from(asset.quantity);
         }
-
-        Ok(())
     }
 
     /// Fold a transaction output's lovelace and native-asset amounts into `balances`, under its address.
@@ -458,62 +434,13 @@ impl CardanoSigner {
         effects
     }
 
-    fn fetch_txs_cbor(
-        koios_base_url: &str,
-        tx_hashes: &[String],
-    ) -> Result<BTreeMap<String, String>, SignerError> {
-        if tx_hashes.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(KOIOS_REQUESTS_TIMEOUT)
-            .build()
-            .map_err(|e| SignerError::RpcError(e.to_string()))?;
-
-        let base_url = koios_base_url.trim_end_matches('/');
-        let url = format!("{base_url}/tx_cbor");
-        let mut txs_cbor: BTreeMap<String, String> = BTreeMap::new();
-
-        for chunk in tx_hashes.chunks(KOIOS_TXS_CBOR_CHUNK_SIZE) {
-            let body = serde_json::json!({
-                "_tx_hashes": chunk,
-            });
-
-            let resp = client
-                .post(&url)
-                .json(&body)
-                .send()
-                .map_err(|e| SignerError::RpcError(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = read_capped_body(resp)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                return Err(SignerError::RpcError(format!(
-                    "Koios tx_cbor returned {status}: {text}"
-                )));
-            }
-
-            let fetched: Vec<KoiosTxCborRow> = serde_json::from_slice(&read_capped_body(resp)?)
-                .map_err(|e| SignerError::RpcError(format!("Koios tx_cbor JSON: {e}")))?;
-
-            for row in fetched {
-                txs_cbor.insert(row.tx_hash, row.cbor);
-            }
-        }
-
-        Ok(txs_cbor)
-    }
-
     /// Fetches UTXOs by retrieving each referenced transaction's CBOR and verifying
     /// that `transaction_hash()` matches the expected hash. This prevents a malicious
     /// RPC provider from returning fabricated UTXO data under a trusted tx hash.
     fn fetch_utxos(
-        koios_base_url: &str,
+        provider: &dyn CardanoRpcProvider,
         input_refs: &[(String, u32)],
-    ) -> Result<Vec<KoiosUtxoInfoRow>, SignerError> {
+    ) -> Result<Vec<Utxo>, SignerError> {
         if input_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -525,12 +452,14 @@ impl CardanoSigner {
             .into_iter()
             .collect();
 
-        let txs_cbor = Self::fetch_txs_cbor(koios_base_url, &unique_hashes)?;
+        let txs_cbor = provider
+            .fetch_txs_cbor(&unique_hashes)
+            .map_err(|e| SignerError::RpcError(e.to_string()))?;
 
         for hash in &unique_hashes {
             if !txs_cbor.contains_key(hash) {
                 return Err(SignerError::RpcError(format!(
-                    "Koios tx_cbor missing transaction {hash}"
+                    "Cardano RPC provider did not return transaction {hash}"
                 )));
             }
         }
@@ -541,7 +470,7 @@ impl CardanoSigner {
                 SignerError::RpcError(format!("invalid CBOR hex for tx {expected_hash}: {e}"))
             })?;
             // The hash check below cannot protect us here: a malicious or compromised
-            // Koios endpoint can return a crash payload that aborts the process inside
+            // RPC endpoint can return a crash payload that aborts the process inside
             // from_bytes, before any hash is ever computed. Guard the bytes first.
             check_tx_cbor(&cbor_bytes).map_err(|e| {
                 SignerError::RpcError(format!("invalid CBOR for tx {expected_hash}: {e}"))
@@ -580,7 +509,7 @@ impl CardanoSigner {
             })?;
             let lovelace: u64 = output.amount().coin().into();
 
-            let asset_list = match output.amount().multiasset() {
+            let assets = match output.amount().multiasset() {
                 Some(ma) if ma.keys().len() > 0 => {
                     let mut assets = Vec::new();
                     for policy_id_index in 0..ma.keys().len() {
@@ -589,24 +518,24 @@ impl CardanoSigner {
                         for asset_index in 0..policy_assets.len() {
                             let asset_name = policy_assets.keys().get(asset_index);
                             let quantity: u64 = policy_assets.get(&asset_name).unwrap().into();
-                            assets.push(KoiosAssetListItem {
+                            assets.push(Asset {
                                 policy_id: policy_id.to_hex(),
                                 asset_name: hex::encode(asset_name.name()),
-                                quantity: quantity.to_string(),
+                                quantity,
                             });
                         }
                     }
-                    Some(assets)
+                    assets
                 }
-                _ => None,
+                _ => Vec::new(),
             };
 
-            utxos.push(KoiosUtxoInfoRow {
+            utxos.push(Utxo {
                 tx_hash: tx_hash.clone(),
                 tx_index: *index,
                 address,
-                value: lovelace.to_string(),
-                asset_list,
+                lovelace,
+                assets,
             });
         }
 
@@ -843,25 +772,27 @@ impl ChainSigner for CardanoSigner {
         let mut inputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
         let mut collateral_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
         if !tx_input_refs.is_empty() || !collateral_refs.is_empty() {
-            let koios_base_url = rpc_url.ok_or_else(|| {
+            let rpc_url = rpc_url.ok_or_else(|| {
                 SignerError::InvalidMessage(
-                    "Koios RPC URL is required to fetch Cardano transaction inputs".into(),
+                    "Cardano RPC URL is required to fetch transaction inputs".into(),
                 )
             })?;
+            let provider = ows_core::resolve_cardano_provider(rpc_url)
+                .map_err(|e| SignerError::RpcError(e.to_string()))?;
 
             // Both sets resolve the same way, so they share one round trip. `fetch_utxos`
             // yields exactly one row per requested ref, in order, so the inputs occupy the
             // first `tx_input_refs.len()` rows and the collateral the rest.
             let mut all_refs = tx_input_refs.clone();
             all_refs.extend(collateral_refs.iter().cloned());
-            let utxos = Self::fetch_utxos(koios_base_url, &all_refs)?;
+            let utxos = Self::fetch_utxos(provider.as_ref(), &all_refs)?;
             let (input_utxos, collateral_utxos) = utxos.split_at(tx_input_refs.len());
 
             for utxo in input_utxos {
-                Self::add_utxo_balance(&mut inputs_balances_by_address, utxo)?;
+                Self::add_utxo_balance(&mut inputs_balances_by_address, utxo);
             }
             for utxo in collateral_utxos {
-                Self::add_utxo_balance(&mut collateral_balances_by_address, utxo)?;
+                Self::add_utxo_balance(&mut collateral_balances_by_address, utxo);
             }
         }
 
@@ -989,25 +920,6 @@ impl ChainSigner for CardanoSigner {
 
         Ok(SecretBytes::new(buf))
     }
-}
-
-/// Read a response body into memory, refusing to buffer more than
-/// `KOIOS_MAX_RESPONSE_BYTES`. `.text()` and `.json()` read the whole body first,
-/// so reading through a capped reader is what enforces the bound.
-fn read_capped_body(resp: reqwest::blocking::Response) -> Result<Vec<u8>, SignerError> {
-    let mut buf = Vec::new();
-    // One byte past the cap, so a body sitting exactly at the limit still reads.
-    resp.take(KOIOS_MAX_RESPONSE_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| SignerError::RpcError(format!("reading Koios response: {e}")))?;
-
-    if buf.len() > KOIOS_MAX_RESPONSE_BYTES {
-        return Err(SignerError::RpcError(format!(
-            "Koios response exceeds the {KOIOS_MAX_RESPONSE_BYTES}-byte limit"
-        )));
-    }
-
-    Ok(buf)
 }
 
 /// Reject transaction bytes that would crash CSL's parser before it ever runs.
@@ -1183,6 +1095,56 @@ mod tests {
         )
         .unwrap();
         signer.encode_keys(&keys).unwrap()
+    }
+
+    #[test]
+    fn transaction_id_preserves_original_body_encoding() {
+        // Same empty-input/output body and zero fee, encoded two different ways.
+        // IDs independently calculated as BLAKE2b-256 of the exact body bytes.
+        let cases = [
+            (
+                "a3008001800200",
+                "36fdff68dfe3660f1ceea60f018a0fd7a83da13def229108794c397a879b0436",
+            ),
+            (
+                "a300800180021800",
+                "63ffc1d1549843b64a70ffaaa75ae11239da276263da3e6545b9836ab2b41a11",
+            ),
+        ];
+        for (body, expected) in cases {
+            let tx = hex::decode(format!("84{body}a0f5f6")).unwrap();
+            assert_eq!(CardanoSigner::transaction_id(&tx).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn transaction_id_does_not_change_when_witnesses_are_added() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "jelly wolf grass equip diagram mixed bottom speed luggage venture stool end",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let tx = hex::decode("84a3008001800200a0f5f6").unwrap();
+        let witness = signer.sign_transaction(key.expose(), &tx).unwrap();
+        let signed = signer.encode_signed_transaction(&tx, &witness).unwrap();
+        assert_ne!(tx, signed);
+        assert_eq!(
+            CardanoSigner::transaction_id(&signed).unwrap(),
+            "36fdff68dfe3660f1ceea60f018a0fd7a83da13def229108794c397a879b0436"
+        );
+    }
+
+    #[test]
+    fn transaction_id_guards_untrusted_cbor_before_parsing() {
+        let mut nested = vec![0x81; MAX_CBOR_DEPTH + 1];
+        nested.push(0x00);
+        for input in [vec![0x80], vec![0x00; MAX_TX_BYTES + 1], nested] {
+            assert!(matches!(
+                CardanoSigner::transaction_id(&input),
+                Err(SignerError::InvalidTransaction(_))
+            ));
+        }
     }
 
     #[test]
@@ -1641,23 +1603,9 @@ mod tests {
             .create()
     }
 
-    #[test]
-    fn fetch_txs_cbor_rejects_an_oversized_response() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("POST", "/tx_cbor")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(vec![b'x'; KOIOS_MAX_RESPONSE_BYTES + 1])
-            .create();
-
-        let err = CardanoSigner::fetch_txs_cbor(&server.url(), &["0".repeat(64)]).unwrap_err();
-
-        mock.assert();
-        assert!(
-            matches!(&err, SignerError::RpcError(msg) if msg.contains("exceeds the")),
-            "expected a size-limit error, got {err:?}"
-        );
+    /// Wrap a mockito server URL so [`resolve_cardano_provider`] selects Koios.
+    fn koios_rpc_url(server: &Server) -> String {
+        format!("koios|{}", server.url())
     }
 
     #[test]
@@ -1683,7 +1631,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
 
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
@@ -1730,7 +1678,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1794,7 +1742,7 @@ mod tests {
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1863,7 +1811,7 @@ mod tests {
             &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
         );
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1928,7 +1876,7 @@ mod tests {
             &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
         );
 
-        let rpc_url = server.url();
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
             .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
@@ -1988,8 +1936,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2045,8 +1995,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2103,8 +2055,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2159,8 +2113,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2221,8 +2177,10 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
@@ -2260,51 +2218,14 @@ mod tests {
 
         let mut server = Server::new();
         let mock = mock_tx_cbor_response(&mut server, &[(source_tx_hash, source_cbor)]);
+
+        let rpc_url = koios_rpc_url(&server);
         let ctx = signer
-            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
             .unwrap();
         mock.assert();
 
         assert_eq!(ctx.chain_extra, None);
-    }
-
-    #[test]
-    fn add_utxo_balance_sums_past_u64_without_wrapping() {
-        // Two UTxOs at one address, each holding u64::MAX of the same native asset.
-        // A u64 accumulator would wrap (release) or panic (debug); i128 keeps the
-        // true sum, which the effect diff must report exactly.
-        let asset = KoiosAssetListItem {
-            policy_id: "a".repeat(56),
-            asset_name: "beef".to_string(),
-            quantity: u64::MAX.to_string(),
-        };
-        let row = |idx: u32| KoiosUtxoInfoRow {
-            tx_hash: "0".repeat(64),
-            tx_index: idx,
-            address: "addr_test1vabc".to_string(),
-            value: "1000000".to_string(),
-            asset_list: Some(vec![KoiosAssetListItem {
-                policy_id: asset.policy_id.clone(),
-                asset_name: asset.asset_name.clone(),
-                quantity: asset.quantity.clone(),
-            }]),
-        };
-
-        let mut inputs: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
-        CardanoSigner::add_utxo_balance(&mut inputs, &row(0)).unwrap();
-        CardanoSigner::add_utxo_balance(&mut inputs, &row(1)).unwrap();
-
-        let asset_id = format!("{}{}", asset.policy_id, asset.asset_name);
-        assert_eq!(
-            inputs["addr_test1vabc"][&asset_id],
-            2 * i128::from(u64::MAX)
-        );
-
-        // Spent with no matching output, the diff is the full negative sum.
-        let effects = CardanoSigner::effects_from_balances(&inputs, &BTreeMap::new());
-        let effect = &effects[0];
-        let (_, diff) = effect.diff.iter().find(|(id, _)| id == &asset_id).unwrap();
-        assert_eq!(diff, &(-2 * i128::from(u64::MAX)).to_string());
     }
 
     #[test]
@@ -2380,5 +2301,39 @@ mod tests {
         let too_big = vec![0u8; MAX_TX_BYTES + 1];
         let err = check_tx_cbor(&too_big).unwrap_err();
         assert!(err.contains("over the"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn add_utxo_balance_sums_past_u64_without_wrapping() {
+        // Two UTxOs at one address, each holding u64::MAX of the same native asset.
+        // A u64 accumulator would wrap (release) or panic (debug); i128 keeps the
+        // true sum, which the effect diff must report exactly.
+        let utxo = |idx: u32| Utxo {
+            tx_hash: "0".repeat(64),
+            tx_index: idx,
+            address: "addr_test1vabc".to_string(),
+            lovelace: 1_000_000,
+            assets: vec![Asset {
+                policy_id: "a".repeat(56),
+                asset_name: "beef".to_string(),
+                quantity: u64::MAX,
+            }],
+        };
+
+        let mut inputs: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        CardanoSigner::add_utxo_balance(&mut inputs, &utxo(0));
+        CardanoSigner::add_utxo_balance(&mut inputs, &utxo(1));
+
+        let asset_id = format!("{}{}", "a".repeat(56), "beef");
+        assert_eq!(
+            inputs["addr_test1vabc"][&asset_id],
+            2 * i128::from(u64::MAX)
+        );
+
+        // Spent with no matching output, the diff is the full negative sum.
+        let effects = CardanoSigner::effects_from_balances(&inputs, &BTreeMap::new());
+        let effect = &effects[0];
+        let (_, diff) = effect.diff.iter().find(|(id, _)| id == &asset_id).unwrap();
+        assert_eq!(diff, &(-2 * i128::from(u64::MAX)).to_string());
     }
 }

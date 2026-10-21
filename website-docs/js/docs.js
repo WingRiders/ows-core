@@ -22,6 +22,7 @@ var SDK_DOCS = [
 // Non-normative reference implementation docs (see docs/00-specification.md)
 var REFERENCE_DOCS = [
   { slug: 'cardano', title: 'Cardano Support', sidebar: 'Cardano' },
+  { slug: 'midnight', title: 'Midnight Support', sidebar: 'Midnight' },
 ];
 
 var DOCS = QUICKSTART_DOCS.concat(SDK_DOCS).concat(SPEC_DOCS).concat(REFERENCE_DOCS);

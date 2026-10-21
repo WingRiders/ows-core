@@ -81,6 +81,7 @@ impl Config {
             "eip155:999".into(),
             "https://rpc.hyperliquid.xyz/evm".into(),
         );
+        rpc.insert("eip155:5042".into(), "https://rpc.mainnet.arc.io".into());
         // Cardano mainnet
         rpc.insert(
             "cip34:1-764824073".into(),
@@ -93,6 +94,13 @@ impl Config {
         rpc.insert(
             "cip34:0-2".into(),
             "https://preview.koios.rest/api/v1".into(),
+        );
+        // Midnight reads balances from an indexer's GraphQL HTTP endpoint; its WebSocket endpoint
+        // is that URL's path plus `/ws`. Only preview has a public indexer that needs no API key,
+        // so mainnet and preprod have no default and need `rpc.midnight:<network>` set.
+        rpc.insert(
+            "midnight:preview".into(),
+            "https://indexer.preview.midnight.network/api/v4/graphql".into(),
         );
         rpc
     }
@@ -238,6 +246,10 @@ mod tests {
             Some("https://rpc.hyperliquid.xyz/evm")
         );
         assert_eq!(
+            config.rpc_url("eip155:5042"),
+            Some("https://rpc.mainnet.arc.io")
+        );
+        assert_eq!(
             config.rpc_url("cip34:1-764824073"),
             Some("https://api.koios.rest/api/v1")
         );
@@ -249,6 +261,13 @@ mod tests {
             config.rpc_url("cip34:0-2"),
             Some("https://preview.koios.rest/api/v1")
         );
+        assert_eq!(
+            config.rpc_url("midnight:preview"),
+            Some("https://indexer.preview.midnight.network/api/v4/graphql")
+        );
+        // No public indexer without an API key exists for these, so none is assumed.
+        assert_eq!(config.rpc_url("midnight:mainnet"), None);
+        assert_eq!(config.rpc_url("midnight:preprod"), None);
     }
 
     #[test]
@@ -291,7 +310,7 @@ mod tests {
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default_from(std::path::Path::new("/nonexistent/config.json"));
         // Should have all default RPCs
-        assert_eq!(config.rpc.len(), 26);
+        assert_eq!(config.rpc.len(), 28);
         assert_eq!(config.rpc_url("eip155:1"), Some("https://eth.llamarpc.com"));
         assert_eq!(
             config.rpc_url("near:mainnet"),

@@ -1,14 +1,20 @@
 pub mod api_key;
 pub mod caip;
+pub mod cardano_rpc;
 pub mod chain;
 pub mod config;
 pub mod error;
 pub mod policy;
+pub mod sync_cache;
 pub mod types;
 pub mod wallet_file;
 
 pub use api_key::ApiKeyFile;
 pub use caip::ChainId;
+pub use cardano_rpc::{
+    resolve_cardano_provider, BlockfrostProvider, CardanoRpcError, CardanoRpcProvider,
+    KoiosProvider, BLOCKFROST_URL_PREFIX,
+};
 pub use chain::{
     default_chain_for_type, parse_chain, universal_wallet_chains, Chain, ChainType,
     ALL_CHAIN_TYPES, KNOWN_CHAINS, UNIVERSAL_WALLET_ACCOUNT_COUNT,

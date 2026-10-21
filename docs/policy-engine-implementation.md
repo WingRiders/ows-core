@@ -74,6 +74,9 @@ addresses:
     if ctx["request_type"] == "sign_typed_data":  # no transaction to cap
         json.dump({"allow": False, "reason": "typed data not permitted"}, sys.stdout)
         sys.exit(0)
+    if ctx["request_type"] == "read_balance":  # reading balances moves nothing
+        json.dump({"allow": True}, sys.stdout)
+        sys.exit(0)
 
     tx = ctx["transaction"]
     owned = {"addr1qx2f..."}
@@ -106,8 +109,8 @@ Reference it in the policy file:
 | chain_id | CAIP-2 chain ID (e.g. eip155:8453) |
 | wallet_id | Wallet UUID |
 | api_key_id | API key UUID |
-| request_type | sign_transaction, sign_message, sign_hash or sign_typed_data; always present |
-| transaction | Absent for sign_typed_data; branch on request_type, not on this field's absence |
+| request_type | sign_transaction, sign_message, sign_hash, sign_typed_data or read_balance; always present |
+| transaction | Absent for sign_typed_data and read_balance; branch on request_type, not on this field's absence |
 | transaction.effects | Per-address asset movement; empty unless the chain's signer implements flow analysis (Cardano today) |
 | transaction.effects[].diff | [asset, amount] pairs; amount is a signed decimal string in the smallest unit |
 | transaction.chain_extra | Chain-specific detail effects cannot carry; present only when a chain fills it |

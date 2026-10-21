@@ -1,0 +1,97 @@
+//! URL helpers shared between the indexer-backed sync modules and the
+//! node submission pipeline.
+
+use reqwest::Url;
+
+/// `https://` / `http://` → `wss://` / `ws://`. Caller must reject non-http(s) schemes.
+pub(super) fn http_url_to_ws_url(trimmed: &str) -> Option<String> {
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        Some(format!("wss://{rest}"))
+    } else {
+        trimmed
+            .strip_prefix("http://")
+            .map(|rest| format!("ws://{rest}"))
+    }
+}
+
+/// `url` without the parts that can carry credentials (user info, query, fragment), for error
+/// messages and cache keys: hosted indexers take their API key in the query string. `None` when
+/// `url` doesn't parse.
+pub(crate) fn without_credentials(url: &str) -> Option<String> {
+    let mut parsed = Url::parse(url).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.into())
+}
+
+/// Derive the GraphQL-over-WebSocket endpoint from a configured indexer URL: the GraphQL HTTP
+/// endpoint's path plus `/ws`, keeping its query, which is where Midnight's indexer serves it
+/// whether self-hosted or hosted behind an API key passed in the query.
+///
+/// Accepts:
+/// - `wss://host/.../ws` (returned as-is)
+/// - `https://host/.../graphql` (→ `wss://host/.../graphql/ws`; trailing `/` ignored)
+/// - `https://host/api/v0?project_id=…` (→ `wss://host/api/v0/ws?project_id=…`)
+pub(super) fn indexer_ws_url(indexer_url: &str) -> Result<String, std::io::Error> {
+    let trimmed = indexer_url.trim_end_matches('/');
+    if trimmed.starts_with("wss://") || trimmed.starts_with("ws://") {
+        return Ok(trimmed.to_string());
+    }
+
+    let invalid = || {
+        std::io::Error::other(format!(
+            "invalid Midnight indexer URL scheme: {}",
+            without_credentials(indexer_url).unwrap_or_else(|| "(unparsable URL)".to_string())
+        ))
+    };
+    let mut url = Url::parse(indexer_url).map_err(|_| invalid())?;
+    let ws_path = format!("{}/ws", url.path().trim_end_matches('/'));
+    url.set_path(&ws_path);
+    http_url_to_ws_url(url.as_str()).ok_or_else(invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_url_from_https_graphql() {
+        let ws = indexer_ws_url("https://example.com/api/v4/graphql").unwrap();
+        assert_eq!(ws, "wss://example.com/api/v4/graphql/ws");
+        let ws = indexer_ws_url("http://127.0.0.1:8088/api/v4/graphql/").unwrap();
+        assert_eq!(ws, "ws://127.0.0.1:8088/api/v4/graphql/ws");
+    }
+
+    #[test]
+    fn ws_url_keeps_the_query() {
+        let ws = indexer_ws_url("https://indexer.example/api/v0?project_id=KEY").unwrap();
+        assert_eq!(ws, "wss://indexer.example/api/v0/ws?project_id=KEY");
+    }
+
+    #[test]
+    fn ws_url_passthrough() {
+        let ws = indexer_ws_url("wss://example.com/api/v4/graphql/ws").unwrap();
+        assert_eq!(ws, "wss://example.com/api/v4/graphql/ws");
+    }
+
+    #[test]
+    fn a_bad_scheme_is_reported_without_the_query() {
+        let msg = indexer_ws_url("ftp://indexer.example/api?project_id=KEY")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("ftp://indexer.example/api"), "{msg}");
+        assert!(!msg.contains("KEY"), "{msg}");
+    }
+
+    #[test]
+    fn credentials_are_stripped() {
+        assert_eq!(
+            without_credentials("https://user:pass@indexer.example/api/v0?project_id=KEY#frag")
+                .as_deref(),
+            Some("https://indexer.example/api/v0")
+        );
+        assert_eq!(without_credentials("not a url"), None);
+    }
+}

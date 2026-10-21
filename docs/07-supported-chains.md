@@ -63,6 +63,7 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Etherlink | `eip155:42793` |
 | Tempo | `eip155:4217` |
 | Hyperliquid | `eip155:999` |
+| Arc | `eip155:5042` |
 
 ### Non-EVM Networks
 
@@ -86,8 +87,6 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Midnight Preview | `midnight:preview` |
 | Midnight Preprod | `midnight:preprod` |
 
-Midnight is not limited to these three networks: **any `midnight:<network>` chain id is addressable**, so ad-hoc feature testnets and private deployments work without registering anything. The `<network>` reference is carried verbatim into the Bech32m HRP of every Midnight address — mainnet uses the bare HRP (`mn_addr`, `mn_shield-addr`, `mn_dust`) while every other network appends `_<network>` (`mn_addr_preview`, `mn_addr_my-feature`, …), so an address on one network can never be mistaken for one on another. The reference MUST be a valid Bech32m HRP fragment that the Midnight SDK also accepts: lowercase letters, digits 1-9, and hyphens only (no `0`), not starting or ending with a hyphen, and at most 32 characters (the CAIP-2 reference limit). A malformed or mixed-case reference is rejected — never coerced to lowercase and never cast to mainnet.
-
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
 ## Shorthand Aliases
@@ -106,6 +105,7 @@ avalanche → eip155:43114
 etherlink → eip155:42793
 tempo       → eip155:4217
 hyperliquid → eip155:999
+arc         → eip155:5042
 solana    → solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
 bitcoin   → bip122:000000000019d6689c085ae165831e93
 cosmos    → cosmos:cosmoshub-4

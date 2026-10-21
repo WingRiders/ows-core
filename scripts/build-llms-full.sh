@@ -17,6 +17,7 @@ SPEC_FILES=(
   07-supported-chains.md
   policy-engine-implementation.md
   cardano.md
+  midnight.md
 )
 
 SDK_FILES=(
@@ -44,6 +45,7 @@ Sitemap:
 - [07 — Supported Chains](https://docs.openwallet.sh/doc.html?slug=07-supported-chains): Blockchain networks supported by OWS and how to add new ones
 - [Policy Engine Implementation](https://docs.openwallet.sh/doc.html?slug=policy-engine-implementation): Detailed implementation guide for the policy engine
 - [Cardano Support](https://docs.openwallet.sh/doc.html?slug=cardano): Cardano integration — CIP-34 addressing, Ed25519-BIP32 derivation, CIP-8 signing, and policy context
+- [Midnight Support](https://docs.openwallet.sh/doc.html?slug=midnight): Midnight integration — open-ended network ids, the three-domain wallet account, address derivation, and indexer-synced balances
 - [CLI Reference](https://docs.openwallet.sh/doc.html?slug=sdk-cli): Command-line interface for managing wallets, signing, and key operations
 - [Node.js SDK](https://docs.openwallet.sh/doc.html?slug=sdk-node): Node.js / TypeScript SDK for programmatic wallet access
 - [Python SDK](https://docs.openwallet.sh/doc.html?slug=sdk-python): Python SDK for programmatic wallet access
