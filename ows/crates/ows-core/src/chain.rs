@@ -229,6 +229,11 @@ pub const KNOWN_CHAINS: &[Chain] = &[
         chain_id: "midnight:preprod",
     },
     Chain {
+        name: "midnight-stagenet",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:stagenet",
+    },
+    Chain {
         name: "tempo",
         chain_type: ChainType::Evm,
         chain_id: "eip155:4217",
@@ -713,6 +718,10 @@ mod tests {
         let preprod_alias = parse_chain("midnight-preprod").unwrap();
         assert_eq!(preprod_alias.chain_type, ChainType::Midnight);
         assert_eq!(preprod_alias.chain_id, "midnight:preprod");
+
+        let stagenet_alias = parse_chain("midnight-stagenet").unwrap();
+        assert_eq!(stagenet_alias.chain_type, ChainType::Midnight);
+        assert_eq!(stagenet_alias.chain_id, "midnight:stagenet");
     }
 
     #[test]
