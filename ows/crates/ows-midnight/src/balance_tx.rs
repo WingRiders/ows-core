@@ -550,6 +550,34 @@ fn empty_intent_skeleton() -> Intent<MnSig, ProofMarker, PedersenRandomness, InM
     }
 }
 
+/// A dust registration the dapp put in the transaction, accepted for the wallet to sign only when it
+/// registers the wallet's own NIGHT to the wallet's own dust address. A registration routes that
+/// NIGHT's DUST generation to `dust_address`, so any other target would give the generation away and
+/// `None` (a deregistration) would switch it off. The signer enforces the same rule; checking here
+/// fails the request before anything is proven.
+fn check_carried_registration(
+    reg: &DustRegistration<MnSig, InMemoryDB>,
+    wallet_vk: &VerifyingKey,
+    wallet_dust_address: &DustPublicKey,
+) -> Result<(), std::io::Error> {
+    if reg.night_key != *wallet_vk {
+        return Err(err(
+            "transaction carries a dust registration for another NIGHT key, which the wallet \
+             cannot sign",
+        ));
+    }
+    match reg.dust_address.as_deref() {
+        Some(addr) if addr == wallet_dust_address => Ok(()),
+        Some(_) => Err(err(
+            "transaction carries a dust registration to another dust address; the wallet only \
+             signs one to its own",
+        )),
+        None => Err(err(
+            "transaction carries a dust deregistration, which the wallet refuses to sign",
+        )),
+    }
+}
+
 /// The next unused intent segment id: one past the current maximum. Intents never sit at segment 0
 /// (reserved for the guaranteed section), so this is always `>= 1`. Errors when an intent already
 /// sits at the last segment (`u16::MAX`), which the ledger allows.
@@ -846,6 +874,9 @@ fn plan_unsealed_proven_standard_tx(
     } else {
         false
     };
+    let wallet_dust_address = crypto_provider
+        .dust_public_key()
+        .map_err(|e| err(e.to_string()))?;
     let mut fallible_outputs_by_seg: BTreeMap<u16, Vec<UtxoOutput>> = BTreeMap::new();
     let mut has_preexisting_dust = false;
     let mut chosen: Option<(
@@ -861,13 +892,17 @@ fn plan_unsealed_proven_standard_tx(
         // dust *registration*: unlike a proof-authorized dust *spend* (which passes through untouched), a
         // registration is signature-authorized, so a foreign one needs a signer the wallet lacks, and one
         // for the wallet's own key is redundant with the dust the wallet adds here and muddies the fee
-        // accounting.
+        // accounting. Without dust of the wallet's own, a registration of its NIGHT to its own dust
+        // address is the only kind it signs.
         if let Some(da) = intent.dust_actions.as_ref() {
             has_preexisting_dust = true;
             if adding_dust && !da.deref().registrations.is_empty() {
                 return Err(err(
                     "transaction already carries a dust fee registration, which is unsupported",
                 ));
+            }
+            for reg in da.deref().registrations.iter() {
+                check_carried_registration(&reg, sender_vk, &wallet_dust_address)?;
             }
         }
         if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
@@ -1237,8 +1272,8 @@ mod tests {
     const OTHER_SEED_HEX: &str = "92933dd3dff04c57c9f8950d6e08bd5c6f295655c03627a658e09b0726558cad";
 
     /// Pack a Midnight signing key the way `secret_to_signing_key` does: the `MNK1` magic followed
-    /// by three 32-byte role seeds. Only the unshielded seed is exercised by signing, so the
-    /// shielded/dust slots are filler.
+    /// by three 32-byte role seeds. Signing uses the unshielded seed, plus the dust seed (`0x22`) to
+    /// check a registration targets the wallet's own dust address; the shielded slot is filler.
     fn packed_signing_key(unshielded_seed_hex: &str) -> SecretBytes {
         let mut blob = b"MNK1".to_vec();
         blob.extend_from_slice(&hex::decode(unshielded_seed_hex).unwrap());
@@ -1248,14 +1283,26 @@ mod tests {
     }
 
     /// A generationless dust fee registration owned by `vk` — the signature-based (no-proof) fee
-    /// path. `dust_address` is arbitrary here; sign/seal don't inspect it.
+    /// path — to the dust address of [`packed_signing_key`]'s dust seed, the only target it signs.
     fn dust_fee_registration(vk: &VerifyingKey) -> DustActions<MnSig, ProofMarker, InMemoryDB> {
-        let dust_pk = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x22u8; 32]));
+        dust_registration_to(vk, Some(own_dust_address()))
+    }
+
+    /// The dust address of [`packed_signing_key`]'s dust seed.
+    fn own_dust_address() -> DustPublicKey {
+        DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x22u8; 32]))
+    }
+
+    /// A dust registration of `vk`'s NIGHT to `dust_address` (`None` deregisters).
+    fn dust_registration_to(
+        vk: &VerifyingKey,
+        dust_address: Option<DustPublicKey>,
+    ) -> DustActions<MnSig, ProofMarker, InMemoryDB> {
         DustActions {
             spends: vec![].into(),
             registrations: vec![DustRegistration {
                 night_key: vk.clone(),
-                dust_address: Some(Sp::new(dust_pk)),
+                dust_address: dust_address.map(Sp::new),
                 allow_fee_payment: 100_000,
                 signature: None,
             }]
@@ -1382,6 +1429,62 @@ mod tests {
             format!("{err}").contains("owned by the signing key"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A registration to another dust address, or a deregistration, would hand off or switch off the
+    /// wallet's DUST generation, so the signer refuses both, whatever the balancer let through.
+    #[test]
+    fn sign_refuses_a_registration_away_from_the_wallets_own_dust_address() {
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let elsewhere = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x33u8; 32]));
+
+        for (dust_address, expected) in [
+            (Some(elsewhere), "another dust address"),
+            (None, "dust deregistration"),
+        ] {
+            let tx_bytes =
+                build_proven_unshielded_tx(&vk, Some(dust_registration_to(&vk, dust_address)));
+            let err = signer
+                .sign_transaction(key.expose(), &tx_bytes)
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains(expected),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// The balancer applies the signer's rule to every registration the dapp's transaction carries,
+    /// so a bad one fails before anything is proven.
+    #[test]
+    fn a_carried_registration_must_target_the_wallets_own_dust_address() {
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let other_vk = MidnightSigningKey::from_bytes(&hex::decode(OTHER_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let own = own_dust_address();
+        let elsewhere = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x33u8; 32]));
+        let check = |night_key: &VerifyingKey, dust_address: Option<DustPublicKey>| {
+            let da = dust_registration_to(night_key, dust_address);
+            let reg = da.registrations.iter().next().unwrap();
+            check_carried_registration(&reg, &vk, &own)
+        };
+
+        assert!(check(&vk, Some(own)).is_ok());
+        for (night_key, dust_address, expected) in [
+            (&vk, Some(elsewhere), "another dust address"),
+            (&vk, None, "deregistration"),
+            (&other_vk, Some(own), "another NIGHT key"),
+        ] {
+            let msg = check(night_key, dust_address).unwrap_err().to_string();
+            assert!(msg.contains(expected), "{msg}");
+        }
     }
 
     #[test]

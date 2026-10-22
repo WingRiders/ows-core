@@ -376,18 +376,25 @@ impl MidnightSigner {
         Self::bech32m_encode(hrp, &payload)
     }
 
-    /// Dust address: Wallet SDK / ledger-v8 derives the dust public key (a field
-    /// element) from the 32-byte seed, SCALE-encodes it as a BigInt, and Bech32m-
-    /// encodes that payload under the network's `mn_dust{suffix}` HRP.
-    fn derive_dust_address_from_seed(&self, seed: &[u8]) -> Result<String, SignerError> {
+    /// The dust public key derived from a 32-byte dust seed: the wallet's own dust address, the only
+    /// one its DUST registrations may target.
+    fn dust_public_key_from_seed(seed: &[u8]) -> Result<DustPublicKey, SignerError> {
         let seed_arr = Zeroizing::new(<[u8; 32]>::try_from(seed).map_err(|_| {
             SignerError::InvalidPrivateKey(format!(
                 "expected 32-byte dust seed, got {} bytes",
                 seed.len()
             ))
         })?);
-        let dsk = DustSecretKey::derive_secret_key(&seed_arr);
-        let dpk = DustPublicKey::from(dsk);
+        Ok(DustPublicKey::from(DustSecretKey::derive_secret_key(
+            &seed_arr,
+        )))
+    }
+
+    /// Dust address: Wallet SDK / ledger-v8 derives the dust public key (a field
+    /// element) from the 32-byte seed, SCALE-encodes it as a BigInt, and Bech32m-
+    /// encodes that payload under the network's `mn_dust{suffix}` HRP.
+    fn derive_dust_address_from_seed(&self, seed: &[u8]) -> Result<String, SignerError> {
+        let dpk = Self::dust_public_key_from_seed(seed)?;
 
         // JS `fr_to_bigint`: little-endian bytes reversed, interpreted as big-endian
         // hex. The numeric value is the same; we build it from big-endian bytes.
@@ -975,6 +982,7 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
         SignerError::InvalidPrivateKey(format!("invalid midnight signing key: {e}"))
     })?;
     let vk = signing_key.verifying_key();
+    let own_dust_address = MidnightSigner::dust_public_key_from_seed(seeds.dust.expose())?;
 
     let mut rng = OsRng;
     let mut out = Vec::new();
@@ -991,13 +999,29 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
                 ));
             }
         }
-        // Each dust fee registration is likewise keyed to (and signed by) the wallet's Night key.
+        // Each dust fee registration is likewise keyed to (and signed by) the wallet's Night key. It
+        // routes that key's DUST generation to `dust_address`, so only the wallet's own dust address
+        // is signed: any other would give the generation away, and `None` (a deregistration) would
+        // switch it off.
         if let Some(da) = intent.dust_actions.as_ref() {
             for reg in da.deref().registrations.iter() {
                 if reg.night_key != vk {
                     return Err(SignerError::SigningFailed(
                         "dust fee registration must be owned by the signing key".into(),
                     ));
+                }
+                match reg.dust_address.as_deref() {
+                    Some(addr) if *addr == own_dust_address => {}
+                    Some(_) => {
+                        return Err(SignerError::SigningFailed(
+                            "refusing to sign a dust registration to another dust address".into(),
+                        ))
+                    }
+                    None => {
+                        return Err(SignerError::SigningFailed(
+                            "refusing to sign a dust deregistration".into(),
+                        ))
+                    }
                 }
             }
         }

@@ -471,9 +471,12 @@ supported so far.
   compatibility) — the DApp hands over a proven, *unsealed* transaction with a deficit; the wallet
   balances it with its own inputs across all three value domains, then seals and submits.
 
-An out-of-spec request (a proof-preimage input, a pre-existing dust registration, a `ClaimRewards`
-mint claim, or a not-yet-supported maker encoding) is rejected with a **precise** error rather than a
-generic "unsupported".
+An out-of-spec request (a proof-preimage input, a `ClaimRewards` mint claim, or a not-yet-supported
+maker encoding) is rejected with a **precise** error rather than a generic "unsupported". So is a
+dust registration the dapp put in the transaction, unless it registers the wallet's own NIGHT to the
+wallet's own dust address and the wallet adds no DUST of its own (`payFees: false`). A registration
+to any other dust address would hand the wallet's DUST generation to someone else, and a
+deregistration would switch it off, so the balancer and the signer both refuse them.
 
 `ows sign tx` returns the fully sealed, proven Midnight transaction on `SignResult.transaction`
 (`None` for other chains) — the seal-*without*-broadcast capability: the same bytes `send-tx`
