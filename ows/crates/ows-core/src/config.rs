@@ -96,18 +96,28 @@ impl Config {
             "https://preview.koios.rest/api/v1".into(),
         );
         // Midnight reads balances from an indexer's GraphQL HTTP endpoint; its WebSocket endpoint
-        // is that URL's path plus `/ws`. Only preview has a public indexer that needs no API key,
-        // so mainnet and preprod have no default and need `rpc.midnight:<network>` set.
+        // is that URL's path plus `/ws`. Only preview and stagenet have public indexers that need
+        // no API key, so mainnet and preprod have no default and need `rpc.midnight:<network>` set.
         rpc.insert(
             "midnight:preview".into(),
             "https://indexer.preview.midnight.network/api/v4/graphql".into(),
         );
+        // Stagenet runs ledger 9 ahead of preview and preprod.
+        rpc.insert(
+            "midnight:stagenet".into(),
+            "https://indexer.stagenet.shielded.tools/api/v4/graphql".into(),
+        );
         // Substrate node RPC, keyed `{chain_id}:node`, used for transaction submission — distinct
         // from the indexer above, which only answers balance queries. As with the indexer, only
-        // preview has a default; mainnet and preprod need `rpc.midnight:<network>:node` set.
+        // preview and stagenet have a default; mainnet and preprod need
+        // `rpc.midnight:<network>:node` set.
         rpc.insert(
             "midnight:preview:node".into(),
             "https://rpc.preview.midnight.network/".into(),
+        );
+        rpc.insert(
+            "midnight:stagenet:node".into(),
+            "https://rpc.stagenet.shielded.tools/".into(),
         );
         // Optional proof server: `rpc["{chain_id}:prover"]`. Intentionally omitted from defaults —
         // when unset, Midnight proves in-process with the local zkir prover.
@@ -274,6 +284,10 @@ mod tests {
             config.rpc_url("midnight:preview"),
             Some("https://indexer.preview.midnight.network/api/v4/graphql")
         );
+        assert_eq!(
+            config.rpc_url("midnight:stagenet"),
+            Some("https://indexer.stagenet.shielded.tools/api/v4/graphql")
+        );
         // No public indexer without an API key exists for these, so none is assumed.
         assert_eq!(config.rpc_url("midnight:mainnet"), None);
         assert_eq!(config.rpc_url("midnight:preprod"), None);
@@ -319,7 +333,7 @@ mod tests {
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default_from(std::path::Path::new("/nonexistent/config.json"));
         // Should have all default RPCs
-        assert_eq!(config.rpc.len(), 29);
+        assert_eq!(config.rpc.len(), 31);
         assert_eq!(config.rpc_url("eip155:1"), Some("https://eth.llamarpc.com"));
         assert_eq!(
             config.rpc_url("near:mainnet"),
@@ -330,10 +344,14 @@ mod tests {
             Some("https://rpc.testnet.near.org")
         );
         // The Midnight node RPC (tx submission) is a distinct default from the indexer, and like
-        // it exists only for preview.
+        // it exists only for preview and stagenet.
         assert_eq!(
             config.rpc_url("midnight:preview:node"),
             Some("https://rpc.preview.midnight.network/")
+        );
+        assert_eq!(
+            config.rpc_url("midnight:stagenet:node"),
+            Some("https://rpc.stagenet.shielded.tools/")
         );
         assert_eq!(config.rpc_url("midnight:mainnet:node"), None);
         assert_eq!(config.rpc_url("midnight:preprod:node"), None);
