@@ -3423,9 +3423,11 @@ name = "ows-midnight"
 version = "1.4.3"
 dependencies = [
  "anyhow",
+ "bech32 0.11.1",
  "futures-util",
  "hex",
  "jsonrpsee",
+ "k256",
  "midnight-base-crypto",
  "midnight-coin-structure",
  "midnight-ledger",
