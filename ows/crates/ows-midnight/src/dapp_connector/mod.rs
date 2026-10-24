@@ -124,9 +124,65 @@ impl ConnectorPlan {
             ),
         }
     }
-    // ── POLICY SEAM ── TODO(policy): `ConnectorPlan::effects()` belongs here — the wallet-relative
-    // movement each method contributes (request-derived for the `make*` methods, plan-derived for the
-    // `balance*` methods), for the seam to gate on before `authorize`. Not wired yet.
+    /// The wallet-relative net movement authorizing this plan will have — the view the policy seam gates
+    /// on, computed before any bearer instrument is built — grouped by the transaction segment each piece
+    /// occurs in: `0` guaranteed (always executed), `>= 1` fallible (executed in order, may fail).
+    /// Plan-derived for the `balance*` methods (from the inert [`BalancedPlan`] the wallet already
+    /// selected) and request-derived, at the intent's own segment, for the `make*` methods. The policy
+    /// seam interprets the guaranteed-versus-fallible distinction; here we only attribute.
+    pub fn segment_effects(
+        &self,
+        chain_id: &str,
+        crypto_provider: &MidnightCryptoProvider,
+    ) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+        match self {
+            ConnectorPlan::BalanceUnsealed(plan) | ConnectorPlan::BalanceSealed(plan) => {
+                plan.segment_effects(chain_id, crypto_provider)
+            }
+            ConnectorPlan::MakeTransfer(req) => {
+                make_transfer::segment_effects(chain_id, crypto_provider, req)
+            }
+            ConnectorPlan::MakeIntent(req) => {
+                make_intent::request_segment_effects(chain_id, crypto_provider, req)
+            }
+            // The wallet's movement in a merge is its own half — the `complement` it contributes and
+            // receives — plus the merged DUST fee it funds, all in the guaranteed section (see
+            // [`balance_sealed::merge_segment_effects`]).
+            ConnectorPlan::BalanceSealedMerge {
+                maker_tx,
+                complement,
+                pay_fees,
+            } => balance_sealed::merge_segment_effects(
+                chain_id,
+                crypto_provider,
+                maker_tx,
+                complement,
+                *pay_fees,
+            ),
+        }
+    }
+
+    /// The contract actions this plan's transaction carries — the counterparty identity, and the value
+    /// each contract declares it takes in and pays out, that the wallet-relative
+    /// [effects](Self::segment_effects) deliberately leave out. Handed to the same policy seam,
+    /// alongside them.
+    ///
+    /// Only the `balance*` methods can carry any: they complete a transaction someone else authored.
+    /// The `make*` methods build the wallet's own transfer from the request alone, so they talk to no
+    /// contract.
+    pub fn contracts(&self) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+        match self {
+            ConnectorPlan::BalanceUnsealed(plan) | ConnectorPlan::BalanceSealed(plan) => {
+                Ok(plan.contracts())
+            }
+            ConnectorPlan::MakeTransfer(_) | ConnectorPlan::MakeIntent(_) => Ok(Vec::new()),
+            // The taker's complement is a plain `makeIntent` and carries none; the contracts of a merge
+            // are the sealed maker's, which survive the merge into the submitted transaction.
+            ConnectorPlan::BalanceSealedMerge { maker_tx, .. } => {
+                balance_sealed::maker_contracts(maker_tx)
+            }
+        }
+    }
 }
 
 /// Parse a stringified connector request and plan it (inert) into a [`ConnectorPlan`], ready for the
