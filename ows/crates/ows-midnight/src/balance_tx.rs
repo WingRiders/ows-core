@@ -4,9 +4,10 @@
 //! The wallet injects its own inputs, preserving the existing ZK proofs: **shielded** coins to fund
 //! every negative shielded cell in the ledger `balance()` (e.g. a contract deposit, or an offer that
 //! already spends some coins but is still short), then **unshielded** inputs (and per-token change)
-//! for every negative unshielded cell — NIGHT and custom tokens alike. Contract mints and withdrawals
-//! appear as positive cells and are not funded. Each added shielded fragment is proved on its own and
-//! merged into the matching Zswap offer. When asked to pay fees on a chain that needs DUST, the fee is
+//! for every negative unshielded cell — NIGHT and custom tokens alike. A positive cell (spare
+//! value, or what a contract mint or withdrawal leaves) is claimed instead, as an output to the
+//! wallet itself in that segment. Each added shielded fragment is proved on its own and merged into
+//! the matching Zswap offer. When asked to pay fees on a chain that needs DUST, the fee is
 //! covered with either a signature-based **generationless** DUST fee registration funded by its own
 //! unregistered NIGHT (no proving), or, when the wallet has no unregistered NIGHT capacity (its NIGHT
 //! is all registered for dust generation), a proof-bearing **DUST spend** of its generated dust.
@@ -161,34 +162,75 @@ fn add_u128<K: Ord>(map: &mut BTreeMap<K, u128>, key: K, amount: u128) {
     *e = e.saturating_add(amount);
 }
 
-/// Negative cells from one ledger `balance()` walk, split by domain. Contract mints/withdrawals net
-/// positive and never appear here.
-struct LedgerDeficits {
+/// One side of a ledger `balance()` walk, split by domain: the negative cells (what the wallet must
+/// supply) or the positive ones (value no output receives yet), each as `(token, amount, segment)`.
+struct LedgerCells {
     shielded: Vec<(ShieldedTokenType, u128, u16)>,
     unshielded: Vec<(UnshieldedTokenType, u128, u16)>,
 }
 
-fn ledger_token_deficits(tx: &TxProven) -> Result<LedgerDeficits, std::io::Error> {
+fn ledger_token_cells(tx: &TxProven, surplus: bool) -> Result<LedgerCells, std::io::Error> {
     let mut shielded = Vec::new();
     let mut unshielded = Vec::new();
     for ((token, segment), bal) in tx
         .balance(None)
         .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?
     {
-        if bal >= 0 {
+        if bal == 0 || (bal > 0) != surplus {
             continue;
         }
-        let need = bal.unsigned_abs();
+        let amount = bal.unsigned_abs();
         match token {
-            LedgerTokenType::Shielded(tt) => shielded.push((tt, need, segment)),
-            LedgerTokenType::Unshielded(tt) => unshielded.push((tt, need, segment)),
+            LedgerTokenType::Shielded(tt) => shielded.push((tt, amount, segment)),
+            LedgerTokenType::Unshielded(tt) => unshielded.push((tt, amount, segment)),
             LedgerTokenType::Dust => {}
         }
     }
-    Ok(LedgerDeficits {
+    Ok(LedgerCells {
         shielded,
         unshielded,
     })
+}
+
+fn ledger_token_deficits(tx: &TxProven) -> Result<LedgerCells, std::io::Error> {
+    ledger_token_cells(tx, false)
+}
+
+/// The wallet's claim on a transaction's surplus: an output to itself for every positive balance.
+/// The ledger rejects only a negative balance, so value no output receives would otherwise be destroyed
+/// when the transaction is applied, or, for NIGHT, fail the ledger's supply check. Unshielded claims
+/// ride the guaranteed balancing offer (segment 0 nets every intent's guaranteed offer) or that
+/// segment's fallible offer; shielded claims become self-outputs in that segment's shielded plan.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SurplusClaims {
+    guaranteed: Vec<UtxoOutput>,
+    fallible: BTreeMap<u16, Vec<UtxoOutput>>,
+    shielded: BTreeMap<u16, Vec<(ShieldedTokenType, u128)>>,
+}
+
+fn surplus_claims(tx: &TxProven, wallet: UserAddress) -> Result<SurplusClaims, std::io::Error> {
+    let cells = ledger_token_cells(tx, true)?;
+    let mut claims = SurplusClaims::default();
+    for (token, value, segment) in cells.unshielded {
+        let output = UtxoOutput {
+            value,
+            owner: wallet,
+            type_: token,
+        };
+        if segment == 0 {
+            claims.guaranteed.push(output);
+        } else {
+            claims.fallible.entry(segment).or_default().push(output);
+        }
+    }
+    for (token, value, segment) in cells.shielded {
+        claims
+            .shielded
+            .entry(segment)
+            .or_default()
+            .push((token, value));
+    }
+    Ok(claims)
 }
 
 /// Per-segment shielded token deficits (ledger `balance` negative = overspend).
@@ -779,22 +821,38 @@ pub struct BalancedPlan {
     dust: DustFeePlan,
 }
 
-/// Plan the wallet's shielded funding for a proven tx's shielded deficit: sync the wallet, then per
-/// intent segment choose the coins to spend (whole, largest-first) and the self-change to mint —
-/// threading coin consumption across segments so no coin is planned twice, and skipping nullifiers
-/// the transaction already spends. Driven by negative shielded cells in ledger `balance()` — including
-/// an offer that already has some inputs but is still short — so contract mints (positive cells) are
-/// never funded. Pure selection over the synced coin set — no spend, no proving. Returns `None` when
-/// the tx has no shielded shortfall.
+/// Plan the wallet's shielded funding for a proven tx: per intent segment, the coins to spend (whole,
+/// largest-first) for a shielded deficit and the self-outputs to mint, which are the change from those
+/// coins plus the segment's `claims` on a shielded surplus. Coin consumption is threaded across
+/// segments so no coin is planned twice, and nullifiers the transaction already spends are skipped.
+/// Driven by negative shielded cells in ledger `balance()` — including an offer that already has some
+/// inputs but is still short. Pure selection over the synced coin set — no spend, no proving; a
+/// surplus-only plan spends nothing, so it doesn't sync. Returns `None` when there is neither a
+/// shortfall nor a claim.
 fn plan_shielded_funding(
     base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     indexer_url: &str,
     scope: &SyncCacheScope,
+    mut claims: BTreeMap<u16, Vec<(ShieldedTokenType, u128)>>,
 ) -> Result<Option<ShieldedFundingPlan>, std::io::Error> {
     let deficits = ledger_shielded_deficits(&Transaction::Standard(base.clone()))?;
     if deficits.is_empty() {
-        return Ok(None);
+        if claims.is_empty() {
+            return Ok(None);
+        }
+        let plans = claims
+            .into_iter()
+            .map(|(segment, change)| ShieldedSpendPlan {
+                segment,
+                coins: Vec::new(),
+                change,
+            })
+            .collect();
+        return Ok(Some(ShieldedFundingPlan {
+            plans,
+            tree: ZswapLocalState::new(),
+        }));
     }
 
     let current_block_height = crate::tip_verify::fetch_current_block_height(indexer_url);
@@ -829,20 +887,32 @@ fn plan_shielded_funding(
             continue;
         }
         remaining.retain(|c| !seg_plan.coins.contains(c));
+        let mut change = seg_plan.change_by_token;
+        change.extend(claims.remove(&segment).unwrap_or_default());
         plans.push(ShieldedSpendPlan {
             segment,
             coins: seg_plan.coins,
-            change: seg_plan.change_by_token,
+            change,
         });
     }
+    plans.extend(
+        claims
+            .into_iter()
+            .map(|(segment, change)| ShieldedSpendPlan {
+                segment,
+                coins: Vec::new(),
+                change,
+            }),
+    );
     if plans.is_empty() {
         return Ok(None);
     }
     Ok(Some(ShieldedFundingPlan { plans, tree }))
 }
 
-/// One intent's fallible unshielded deficit: the segment it sits in, the per-token amounts the wallet
-/// must supply there, and that offer's own outputs (re-emitted by the balancing offer that replaces it).
+/// One intent's fallible unshielded offer the wallet rebuilds: the segment it sits in, the per-token
+/// amounts the wallet must supply there (none when it only claims a surplus), and the outputs the
+/// replacement carries — the offer's own, re-emitted, plus the wallet's surplus claims.
 struct FallibleUnshieldedDeficit {
     seg_id: u16,
     needs: Vec<(UnshieldedTokenType, u128)>,
@@ -929,13 +999,19 @@ fn plan_unsealed_proven_standard_tx(
         ensure_tx_network_id_matches_chain(chain_id, &base.network_id)?;
     }
 
-    // Plan a shielded deficit against the wallet's own shielded coins — a no-op when ledger `balance()`
-    // has no negative shielded cell. Pure selection: no spend, no prove.
-    let shielded = plan_shielded_funding(&base, crypto_provider, indexer_url, scope)?;
+    // Claim every surplus for the wallet, then plan a shielded deficit against the wallet's own shielded
+    // coins together with the shielded claims — a no-op when ledger `balance()` has neither. Pure
+    // selection: no spend, no prove.
+    let claims = surplus_claims(
+        &Transaction::Standard(base.clone()),
+        UserAddress::from(sender_vk.clone()),
+    )?;
+    let shielded =
+        plan_shielded_funding(&base, crypto_provider, indexer_url, scope, claims.shielded)?;
 
     // The guaranteed unshielded section aggregates one offer from each intent, so balancing spans every
     // intent: take the negative unshielded cells from ledger `balance()` (NIGHT and custom tokens;
-    // mints/withdrawals net positive and are skipped), reject shapes the wallet cannot authorize, and
+    // mints/withdrawals net positive and are claimed instead), reject shapes the wallet cannot authorize, and
     // fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
     let adding_dust = adding_dust(pay_fees, indexer_url)?;
@@ -1002,7 +1078,7 @@ fn plan_unsealed_proven_standard_tx(
 
     // Negative unshielded cells from the ledger — the amounts the wallet must supply, already net of
     // contract mints/withdrawals. Segment 0 aggregates the guaranteed section; each fallible segment
-    // is funded on its own intent.
+    // is funded on its own intent. Positive cells are the surplus claims above.
     let mut guaranteed_needs: BTreeMap<UnshieldedTokenType, u128> = BTreeMap::new();
     let mut fallible_needs: BTreeMap<u16, BTreeMap<UnshieldedTokenType, u128>> = BTreeMap::new();
     for (token, need, segment) in ledger_unshielded_deficits(&Transaction::Standard(base.clone()))?
@@ -1015,20 +1091,35 @@ fn plan_unsealed_proven_standard_tx(
     }
     let guaranteed_deficits: Vec<(UnshieldedTokenType, u128)> =
         guaranteed_needs.into_iter().collect();
-    let fallible_deficits: Vec<FallibleUnshieldedDeficit> = fallible_needs
+    // A fallible segment is rebuilt when it is short or carries a surplus to claim.
+    let mut fallible_claims = claims.fallible;
+    let fallible_segments: BTreeSet<u16> = fallible_needs
+        .keys()
+        .chain(fallible_claims.keys())
+        .copied()
+        .collect();
+    let fallible_deficits: Vec<FallibleUnshieldedDeficit> = fallible_segments
         .into_iter()
-        .map(|(seg_id, needs)| FallibleUnshieldedDeficit {
-            seg_id,
-            needs: needs.into_iter().collect(),
-            outputs: fallible_outputs_by_seg.remove(&seg_id).unwrap_or_default(),
+        .map(|seg_id| {
+            let mut outputs = fallible_outputs_by_seg.remove(&seg_id).unwrap_or_default();
+            outputs.extend(fallible_claims.remove(&seg_id).unwrap_or_default());
+            FallibleUnshieldedDeficit {
+                seg_id,
+                needs: fallible_needs
+                    .remove(&seg_id)
+                    .map(|needs| needs.into_iter().collect())
+                    .unwrap_or_default(),
+                outputs,
+            }
         })
         .collect();
 
     // Where the wallet folds its balancing inputs + dust: an existing intent when there is one to reuse,
     // else a fresh skeleton — a shielded-only transaction has empty intents, and a preexisting dust
     // section blocks reuse (see `balancing_intent`).
-    let (seg_id, intent_in, outputs_in) =
+    let (seg_id, intent_in, mut outputs_in) =
         balancing_intent(&base, chosen, adding_dust, has_preexisting_dust)?;
+    outputs_in.extend(claims.guaranteed);
 
     // Fetch the wallet's UTXOs once; the guaranteed offer and each per-segment fallible offer draw
     // disjoint coins from this pool so no coin is spent twice.
@@ -1733,6 +1824,185 @@ mod tests {
         }
     }
 
+    fn wallet_vk() -> VerifyingKey {
+        MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key()
+    }
+
+    /// An unshielded offer spending one `value` coin of `token` owned by `vk`, with `outputs`.
+    fn spend_offer(
+        vk: &VerifyingKey,
+        token: UnshieldedTokenType,
+        value: u128,
+        outputs: Vec<UtxoOutput>,
+    ) -> UnshieldedOffer<MnSig, InMemoryDB> {
+        UnshieldedOffer {
+            inputs: vec![UtxoSpend {
+                value,
+                owner: vk.clone(),
+                type_: token,
+                intent_hash: IntentHash(HashOutput([9u8; 32])),
+                output_no: 0,
+            }]
+            .into(),
+            outputs: outputs.into(),
+            signatures: vec![].into(),
+        }
+    }
+
+    fn no_positive_cells(
+        base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    ) -> bool {
+        Transaction::Standard(base.clone())
+            .balance(None)
+            .unwrap()
+            .values()
+            .all(|bal| *bal <= 0)
+    }
+
+    /// Spending 1 000 000 NIGHT and keeping 400 000 leaves 600 000 that no output receives: the
+    /// ledger would fail it on the NIGHT supply check. The wallet claims exactly that, as an output
+    /// to itself in the guaranteed section, and the claim nets it to zero.
+    #[test]
+    fn claims_a_guaranteed_night_surplus() {
+        let spender = wallet_vk();
+        let keep = UtxoOutput {
+            value: 400_000,
+            owner: UserAddress::from(spender.clone()),
+            type_: NIGHT,
+        };
+        let offer = spend_offer(&spender, NIGHT, 1_000_000, vec![keep]);
+        let mut base = base_with_intents(vec![(1, intent_with(Some(offer), None))]);
+        let wallet = UserAddress::from(
+            MidnightSigningKey::from_bytes(&[0x33; 32])
+                .unwrap()
+                .verifying_key(),
+        );
+
+        let claims = surplus_claims(&Transaction::Standard(base.clone()), wallet).unwrap();
+        let claim = UtxoOutput {
+            value: 600_000,
+            owner: wallet,
+            type_: NIGHT,
+        };
+        assert_eq!(
+            claims,
+            SurplusClaims {
+                guaranteed: vec![claim],
+                ..Default::default()
+            }
+        );
+
+        // Riding the guaranteed offer, the claim brings segment 0 back to zero.
+        let mut intent = base.intents.get(&1).unwrap().deref().clone();
+        let mut offer = intent.guaranteed_unshielded_offer.unwrap().deref().clone();
+        let mut outputs: Vec<UtxoOutput> = offer.outputs.iter_deref().cloned().collect();
+        outputs.extend(claims.guaranteed);
+        outputs.sort();
+        offer.outputs = outputs.into();
+        intent.guaranteed_unshielded_offer = Some(Sp::new(offer));
+        base.intents = base.intents.insert(1, intent);
+        assert!(no_positive_cells(&base));
+        assert!(tx_balance_imbalances(&TxProven::Standard(base))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A surplus in a fallible segment is claimed in that segment, where it nets.
+    #[test]
+    fn claims_a_fallible_surplus_in_its_own_segment() {
+        let token = UnshieldedTokenType(HashOutput([0x44; 32]));
+        let mut intent = intent_with(None, None);
+        intent.fallible_unshielded_offer =
+            Some(Sp::new(spend_offer(&wallet_vk(), token, 100, vec![])));
+        let base = base_with_intents(vec![(2, intent)]);
+        let wallet = UserAddress::from(wallet_vk());
+
+        let claims = surplus_claims(&Transaction::Standard(base), wallet).unwrap();
+        assert!(claims.guaranteed.is_empty());
+        assert_eq!(
+            claims.fallible,
+            BTreeMap::from([(
+                2,
+                vec![UtxoOutput {
+                    value: 100,
+                    owner: wallet,
+                    type_: token,
+                }]
+            )])
+        );
+    }
+
+    /// A shielded surplus becomes a shielded output to the wallet in its segment. Planning it needs no
+    /// coins, so the plan is built without syncing (the indexer here is unreachable), and the output the
+    /// provider builds from it really nets the surplus.
+    #[test]
+    fn claims_a_shielded_surplus_with_a_real_output() {
+        use midnight_storage::storage::Array;
+        use midnight_zswap::{Delta, Input};
+        use std::sync::Arc;
+        use transient_crypto::commitment::Pedersen;
+        use transient_crypto::curve::Fr;
+        use transient_crypto::merkle_tree::MerkleTreeDigest;
+        use transient_crypto::proofs::Proof;
+
+        // The transaction spends 100 of a shielded token: one input, no output for it.
+        let token = ShieldedTokenType(HashOutput([0x55; 32]));
+        let given = ZswapOffer {
+            inputs: vec![Input {
+                nullifier: Nullifier(HashOutput([0xAB; 32])),
+                value_commitment: Pedersen::from(PedersenRandomness::from(0)),
+                contract_address: None,
+                merkle_tree_root: MerkleTreeDigest::from(Fr::from(0u64)),
+                proof: Arc::new(Proof(vec![])),
+            }]
+            .into(),
+            outputs: Array::new(),
+            transient: Array::new(),
+            deltas: vec![Delta {
+                token_type: token,
+                value: 100,
+            }]
+            .into(),
+        };
+        let mut base = base_with_intents(vec![]);
+        base.guaranteed_coins = Some(Sp::new(given));
+
+        let claims = surplus_claims(
+            &Transaction::Standard(base.clone()),
+            UserAddress::from(wallet_vk()),
+        )
+        .unwrap();
+        assert_eq!(claims.shielded, BTreeMap::from([(0, vec![(token, 100)])]));
+
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
+            .unwrap();
+        let scope = SyncCacheScope::default();
+        let plan = plan_shielded_funding(
+            &base,
+            &provider,
+            "http://127.0.0.1:1/api/v3/graphql",
+            &scope,
+            claims.shielded,
+        )
+        .unwrap()
+        .expect("a claim plan");
+        assert_eq!(plan.plans.len(), 1);
+        assert!(plan.plans[0].coins.is_empty());
+        assert_eq!(plan.plans[0].change, vec![(token, 100)]);
+
+        let built = provider
+            .mock_shielded_offers(&base.network_id, &plan.plans, &plan.tree)
+            .unwrap();
+        for (segment, offer) in &built.proven {
+            assert_eq!(offer.outputs.len(), 1, "one real output to the wallet");
+            place_shielded_fragment(&mut base, *segment, offer).unwrap();
+        }
+        assert!(no_positive_cells(&base));
+    }
+
     /// The fresh segment is one past the current maximum, and 1 when there are no intents — never 0
     /// (reserved for the guaranteed section).
     #[test]
@@ -2088,7 +2358,7 @@ mod tests {
         let token = ShieldedTokenType(HashOutput([0x42; 32]));
         let spent_nul = Nullifier(HashOutput([0xAA; 32]));
 
-        // Deltas-only shape (like mip6's sample offers): an input nullifier is present so the offer
+        // Deltas-only shape: an input nullifier is present so the offer
         // is not "outputs and no inputs", yet the delta still shows a 60-unit shortfall.
         let offer = ZswapOffer {
             inputs: vec![Input {

@@ -503,7 +503,8 @@ fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
 }
 
 /// A shielded input/change spend to authorize for one intent segment: the coins to spend and the
-/// self-change to mint per token. A keyless balancer plans this — selection needs the spending key
+/// outputs to mint to the wallet itself per token — change from those coins, and any surplus the
+/// transaction leaves that the wallet claims. A keyless balancer plans this — selection needs the spending key
 /// only to *detect* coins (via nullifiers), which is non-authorizing — and the authorizing witness is
 /// built from it here, in the signer.
 pub struct ShieldedSpendPlan {
