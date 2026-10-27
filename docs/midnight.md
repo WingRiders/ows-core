@@ -12,11 +12,38 @@ Commands with no Midnight-specific behavior work on a Midnight wallet exactly as
 docs describe: `fund deposit` (MoonPay only), `pay request` / `pay discover` (x402 only),
 `wallet export` / `rename` / `delete`, `mnemonic generate`, `update`, and `uninstall`.
 
+## Ledger version
+
+OWS builds against Midnight **ledger 9** (`midnight-ledger-v9` 1.0.0). Ledger 9 is not on
+crates.io yet, so `ows/Cargo.toml` pins its crates in `[patch.crates-io]` to the
+release-candidate tags the `midnight:stagenet` node (2.0.0) runs (`crate-ledger-9.1.0.0-rc.3`
+and its siblings); the node and python bindings are workspaces of their own and repeat the
+same pins. A wallet can neither build nor prove a transaction for a ledger it was not built
+against, so this build talks to stagenet; preview and preprod still run ledger 8 and need an OWS
+built against ledger 8 until they upgrade.
+
+What ledger 9 changes for a wallet:
+
+- **Transaction format.** Headers are `midnight:transaction[v12](signature[v2],…)` (ledger 8:
+  `transaction[v9](signature[v1],…)`). Neither ledger reads the other's bytes.
+- **Unshielded keys.** `Signature`, `SigningKey` and `SignatureVerifyingKey` are enums with a
+  Schnorr and an ECDSA arm. The Night key stays BIP-340 Schnorr in the Schnorr arm, so addresses
+  and the owner hex the indexer reports do not change, and a message signature is still a bare
+  64-byte BIP-340 signature.
+- **Proving.** A `ProvingProvider` also hands the ledger a key `Resolver`, which reads a
+  contract call's verifier key to tell its proof version. A `:prover` endpoint must be a
+  ledger-9 proof server (`midnight-proof-server` 9.0.0-rc.6, from the
+  `release/ledger-9.1.0.0-rc.3` branch of `midnightntwrk/midnight-ledger`).
+
+The rc.3 pins predate the fix for GHSA-wr7g-rr4v-jmj8, which first reaches ledger 9 in
+`crate-ledger-9.1.0.0-rc.6`. The finding is in the ledger's proof check, which the node runs, and
+the pins follow the node.
+
 ## Network identifiers
 
-OWS registers `midnight:mainnet`, `midnight:preview`, and `midnight:preprod`, with the aliases
-`midnight`, `midnight-preview`, and `midnight-preprod` (see 07 — Supported Chains). Midnight is
-not limited to these three networks: **any `midnight:<network>` chain id is addressable**, so
+OWS registers `midnight:mainnet`, `midnight:preview`, `midnight:preprod`, and
+`midnight:stagenet`, with the aliases `midnight`, `midnight-preview`, `midnight-preprod`, and
+`midnight-stagenet` (see 07 — Supported Chains). Midnight is not limited to these networks: **any `midnight:<network>` chain id is addressable**, so
 ad-hoc feature testnets and private deployments work without registering anything. The
 `<network>` reference is carried verbatim into the Bech32m HRP of every Midnight address —
 mainnet uses the bare HRP (`mn_addr`, `mn_shield-addr`, `mn_dust`) while every other network
@@ -447,9 +474,9 @@ renamed into place, so an interrupted run never leaves a truncated one behind.
 ### Configuration
 
 The GraphQL indexer URL comes from `~/.ows/config.json` under `rpc["midnight:<network>"]`; the
-WebSocket endpoint is that URL's path plus `/ws`, with any query kept. Only preview ships a
-default, since it is the only network with a public indexer that needs no API key. For mainnet
-and preprod, set the URL yourself: Midnight's
+WebSocket endpoint is that URL's path plus `/ws`, with any query kept. Only preview and
+stagenet ship a default, since they are the networks with a public indexer that needs no API
+key. For mainnet and preprod, set the URL yourself: Midnight's
 [networks guide](https://docs.midnight.network/guides/networks-and-environments) lists the hosted
 endpoints, which take a per-network API key in a `?project_id=` query, or point it at your own
 indexer (for example `http://localhost:8088/api/v4/graphql`). A plaintext `http://` or `ws://` URL
@@ -1067,8 +1094,9 @@ key-bearing preimages (enforced by the `no_key_material_gate` workspace test).
 
 Submission talks to the Substrate node RPC, resolved **separately from the balance indexer**. Provide
 it with `--rpc-url <url>`, else it resolves from the vault's config (`~/.ows/config.json` for the
-CLI, see [Which config file](#which-config-file)) under `rpc["midnight:<network>:node"]`. Only preview ships a default; for mainnet and preprod, set it
-yourself, to a hosted endpoint from the same networks guide or to your own node. A plaintext
+CLI, see [Which config file](#which-config-file)) under `rpc["midnight:<network>:node"]`. Only
+preview and stagenet ship a default; for mainnet and preprod, set it yourself, to a hosted endpoint
+from the same networks guide or to your own node. A plaintext
 `http://` or `ws://` URL is accepted only for a loopback address, such as a local node; anything else
 needs `https://` or `wss://`. Credentials in the URL never appear in error messages. Each node call
 is bounded (connect 30s, request 60s), and a failed or timed-out submit names the transaction hash,
@@ -1560,21 +1588,22 @@ effect-aware pass).
 ows config show
 # …
 # RPC endpoints:
-#   midnight:preview         https://indexer.preview.midnight.network/api/v4/graphql  (default)
-#   midnight:preview:node    https://rpc.preview.midnight.network/                    (default)
-#   midnight:preview:prover  http://127.0.0.1:6300                                    (custom)
+#   midnight:preview          https://indexer.preview.midnight.network/api/v4/graphql   (default)
+#   midnight:preview:node     https://rpc.preview.midnight.network/                     (default)
+#   midnight:stagenet         https://indexer.stagenet.shielded.tools/api/v4/graphql    (default)
+#   midnight:stagenet:node    https://rpc.stagenet.shielded.tools/                      (default)
+#   midnight:stagenet:prover  http://127.0.0.1:6300                                     (custom)
 ```
 
 `config show` is generic, but Midnight is the one chain family that registers **two
 endpoints per network** (indexer + node), with an optional third for proving, and
 understanding why is central to how Midnight commands reach the network.
 
-Only preview ships a default indexer: mainnet and preprod have no public indexer that answers
-without an API key, so their `midnight:<net>` entry has to be set (see
-[Fund balance](#fund-balance-ows-fund-balance)). The same goes for their `midnight:<net>:node`
-entry: only preview ships a default node, and Midnight's
-[networks guide](https://docs.midnight.network/guides/networks-and-environments) lists the hosted
-mainnet and preprod endpoints, which take a `?project_id=` key.
+Only preview and stagenet ship defaults, for both the indexer and the node: mainnet and
+preprod have no public indexer that answers without an API key, so their `midnight:<net>` and
+`midnight:<net>:node` entries have to be set (see [Fund balance](#fund-balance-ows-fund-balance)).
+Midnight's [networks guide](https://docs.midnight.network/guides/networks-and-environments) lists
+the hosted mainnet and preprod endpoints, which take a `?project_id=` key.
 
 The sample above shows a custom `:prover` entry. That key is **not** shipped in defaults, so
 it appears in `config show` only after you add it to `~/.ows/config.json`.
