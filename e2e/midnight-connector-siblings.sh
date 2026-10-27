@@ -20,14 +20,14 @@
 # Proving runs in-process by default (circuit keys fetched on first use) — or against
 # rpc["midnight:<net>:prover"] when configured. No proof server is required out of the box.
 #
-# Usage:  ./midnight-connector-siblings.sh [network]   # network defaults to midnight:preprod
+# Usage:  ./midnight-connector-siblings.sh [network]   # network defaults to midnight:stagenet (ledger 9)
 # Env:    CHAIN=midnight:preview   PROFILE=debug (faster build, slower prove)
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preprod}}"
+CHAIN="${1:-${CHAIN:-midnight:stagenet}}"
 
 # Colours — bold-blue headings, cyan commands, dim asides, green/red pass-fail. Suppressed when
 # stdout is not a terminal, so a piped/headless run stays free of escape codes.
@@ -122,7 +122,8 @@ else
     cargo build -p ows-cli --manifest-path "$WORKSPACE/Cargo.toml"
 fi
 [ -x "$OWS" ] || { printf '%s✗ build did not produce %s%s\n' "$RED" "$OWS" "$RESET"; exit 1; }
-# The indexer this chain balances against, which wait_landed polls (only preview ships a default).
+# The indexer this chain balances against, which wait_landed polls (only preview and stagenet ship a
+# default).
 INDEXER="$("$OWS" config show 2>/dev/null | awk -v k="$CHAIN" '$1 == k { print $2; exit }')"
 
 # ── Collect inputs ──────────────────────────────────────────────────────────────────────

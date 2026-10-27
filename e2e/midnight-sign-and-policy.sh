@@ -24,7 +24,7 @@
 #
 # Each step prints the exact command and waits for Enter before running it.
 #
-# Usage:  ./midnight-sign-and-policy.sh [network]   # network defaults to midnight:preprod
+# Usage:  ./midnight-sign-and-policy.sh [network]   # network defaults to midnight:stagenet (ledger 9)
 # Env:    CHAIN=midnight:preview   PROFILE=debug (faster build, slower sync/mock-prove)
 #         RECIPIENT_WALLET=<name>  external wallet the makeTransfer steps send TO, so the effect shows a
 #                                  real outflow rather than a self-transfer that nets to just the dust fee
@@ -39,7 +39,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preprod}}"
+CHAIN="${1:-${CHAIN:-midnight:stagenet}}"
 AUTO="${AUTO:-}"   # non-empty → non-interactive (see the Env block above)
 
 # Colours — bold-blue headings, cyan commands, dim asides, green/red pass-fail. Suppressed when

@@ -1049,20 +1049,20 @@ broadcasts, surfaced through a command that never submits. A `submitTransaction`
 4. **Seal** the proven, signed transaction.
 5. **Submit** the sealed bytes to the node over its Substrate RPC and print the resulting tx hash.
 
-### End-to-end on preview and preprod
+### End-to-end on stagenet
 
-`e2e/midnight-sign-send-tx.sh` exercises this command against a live node, preview by default
-(`CHAIN=midnight:preprod` for preprod). It builds `ows` from the checkout, confirms the command is
+`e2e/midnight-sign-send-tx.sh` exercises this command against a live node, stagenet by default,
+the one network that runs ledger 9. It builds `ows` from the checkout, confirms the command is
 wired, and checks that a malformed request is rejected with a precise error (all offline); then it runs
 the live path in two steps — **seal** the request with `sign tx` (no broadcast, printing the sealed
 tx), then **submit** it with `sign send-tx`. A DApp normally supplies the proven (`proof,embedded-fr`)
-input; the checkout bundles one per network at `e2e/shielded-movement-cap/tx-proven-preview.hex` and
-`tx-proven-preprod.hex`, so the live run works out of the box (override it with `TX_JSON=<path>`). Each
-maker is input-free, so each run re-selects fresh wallet inputs and is reusable.
+input; the checkout bundles one at `e2e/shielded-movement-cap/tx-proven-stagenet.hex`, so the live
+run works out of the box (override it with `TX_JSON=<path>`). The maker is input-free, so each run
+re-selects fresh wallet inputs and is reusable. The preview and preprod makers next to it are
+ledger-8 bytes, for an OWS built against ledger 8.
 
-Real round-trips landed on preprod at
-`0x379f10efcd2b82bac2c5e281d2d175b0367aef195b8845cdb75388737632fed3` (block 1762181) and on preview at
-`0xbb1753c3503c845881e998034138fa98817cc6f90a80cb9d62c2074ae9d63c3c` (block 1423263), crediting the
+A real round-trip landed on stagenet at
+`0xc6bf04e8e7b4b897f8797e39f1484d84416598ff860925ce5b22f8c62cfde949` (block 1050374), crediting the
 wallet's own address with the balanced outputs.
 
 ### The three value domains

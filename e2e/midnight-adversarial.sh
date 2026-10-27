@@ -21,8 +21,8 @@
 # default). Every live scenario is refused before anything is proved or broadcast; the script mints
 # its own policy and token and revokes them on exit.
 #
-# Usage:  ./midnight-adversarial.sh                       # offline tier, midnight:preview
-#         LIVE=1 WALLET=<name> [PASS=…] ./midnight-adversarial.sh midnight:preprod
+# Usage:  ./midnight-adversarial.sh                       # offline tier, midnight:stagenet (ledger 9)
+#         LIVE=1 WALLET=<name> [PASS=…] ./midnight-adversarial.sh midnight:stagenet
 # Env:    PROFILE=release (default debug: nothing here is crypto-heavy offline)
 #         OWS=<path to an ows binary> skips the build
 #
@@ -32,7 +32,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preview}}"
+CHAIN="${1:-${CHAIN:-midnight:stagenet}}"
 LIVE="${LIVE:-}"
 PROFILE="${PROFILE:-debug}"
 
@@ -370,6 +370,7 @@ if [ -n "$LIVE" ]; then
   # A valid recipient on this network (the BIP-39 test vector's address). Neither live request gets as
   # far as a broadcast, so it never receives anything.
   case "$CHAIN" in
+    midnight:stagenet) ADDR=mn_addr_stagenet1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qz2gd7g ;;
     midnight:preprod) ADDR=mn_addr_preprod1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q49ekgd ;;
     *)                ADDR=mn_addr_preview1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q4y8xms ;;
   esac
