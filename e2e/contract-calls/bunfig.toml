@@ -1,0 +1,2 @@
+# graphql has to load before a command's top-level await (see src/preload.ts).
+preload = ["./src/preload.ts"]
