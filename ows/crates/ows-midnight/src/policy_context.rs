@@ -130,6 +130,7 @@ mod tests {
                 call: None,
                 caller: None,
                 verifier_key: None,
+                arguments: None,
                 sent_to: vec![("00".repeat(32), "5".to_string())],
                 received_from: vec![],
                 payouts: vec![],
