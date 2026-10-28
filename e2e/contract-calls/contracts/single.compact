@@ -1,0 +1,21 @@
+pragma language_version 0.26;
+
+// (a) A single-call contract: one circuit with simple arguments and a return
+// value, no reads of prior state (so a saved tx stays valid until its TTL).
+
+import CompactStandardLibrary;
+
+export ledger last_amount: Uint<64>;
+export ledger last_tag: Bytes<32>;
+export ledger records: Counter;
+
+constructor() {
+  last_amount = 0 as Uint<64>;
+}
+
+export circuit record(amount: Uint<64>, tag: Bytes<32>): Uint<64> {
+  last_amount = disclose(amount);
+  last_tag = disclose(tag);
+  records.increment(1);
+  return disclose(amount);
+}

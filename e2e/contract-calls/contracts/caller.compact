@@ -1,0 +1,30 @@
+pragma language_version 0.26;
+
+// (b) root. Trimmed from experiments/cross-contract-calls/contracts/caller.compact.
+// write_then_read makes two sub-calls (Tally.set, Tally.get): three calls in one tx.
+
+import CompactStandardLibrary;
+
+contract Tally {
+  circuit set(x: Uint<64>): [];
+  circuit get(): Uint<64>;
+}
+
+export ledger tally: Tally;
+export ledger last_observed: Uint<64>;
+export ledger calls: Counter;
+
+constructor(t: Tally) {
+  tally = disclose(t);
+  last_observed = 0 as Uint<64>;
+}
+
+export circuit write_then_read(x: Uint<64>): Uint<64> {
+  calls.increment(1);
+  const written = disclose(x);
+  tally.set(written);
+  const observed = tally.get();
+  assert(observed == written, "read-your-writes violated across the call boundary");
+  last_observed = observed;
+  return observed;
+}

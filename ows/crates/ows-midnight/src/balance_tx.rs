@@ -4746,4 +4746,188 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// A real proven, unbalanced contract-call transaction — the bytes a dapp hands
+    /// `balanceUnsealedTransaction`. Built and proven on stagenet (ledger 9, compactc 0.34.0) against the
+    /// test contracts in `e2e/contract-calls/contracts/`; each one, built again fresh, was also funded by
+    /// OWS on stagenet and landed.
+    fn real_call_tx(
+        name: &str,
+    ) -> StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
+        let hex_str = match name {
+            "single" => include_str!("testdata/contract_calls/single.tx.hex"),
+            "composed" => include_str!("testdata/contract_calls/composed.tx.hex"),
+            "value" => include_str!("testdata/contract_calls/value.tx.hex"),
+            "value_forward" => include_str!("testdata/contract_calls/value_forward.tx.hex"),
+            "shielded" => include_str!("testdata/contract_calls/shielded.tx.hex"),
+            other => panic!("no fixture {other}"),
+        };
+        let bytes = hex::decode(hex_str.trim()).unwrap();
+        let tx: TxProven = tagged_deserialize(&mut &bytes[..]).unwrap();
+        let Transaction::Standard(base) = tx else {
+            panic!("the fixture is a Standard transaction");
+        };
+        base
+    }
+
+    /// The single intent a fixture carries, with its segment.
+    fn only_intent(
+        base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    ) -> (
+        u16,
+        Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    ) {
+        let mut intents = base.intents.iter().map(|pair| {
+            let (seg, intent) = pair.deref();
+            (*seg.deref(), intent.deref().clone())
+        });
+        let only = intents.next().expect("one intent");
+        assert!(intents.next().is_none(), "exactly one intent");
+        only
+    }
+
+    /// `Payer.pay_from_wallet(NIGHT, 1)` on stagenet: the root call takes 1 NIGHT in, sends it to the
+    /// Till and drives `Till.take_unshielded`, which takes it in again. Two contracts each declare an
+    /// intake of 1 NIGHT, but the payer's payout cancels its own intake in the ledger's balance, so the
+    /// wallet is short exactly 1 NIGHT — and funding that single NIGHT balances the real transaction.
+    #[test]
+    fn a_real_composed_payment_from_the_wallet_is_funded_once_and_balances() {
+        const ONE_NIGHT: u128 = 1_000_000;
+        let base = real_call_tx("value");
+        assert_eq!(
+            ledger_unshielded_deficits(&Transaction::Standard(base.clone())).unwrap(),
+            vec![(NIGHT, ONE_NIGHT, 0)],
+            "the call tree's guaranteed section is short one NIGHT, not two"
+        );
+        assert!(surplus_claims(
+            &Transaction::Standard(base.clone()),
+            UserAddress::from(wallet_vk())
+        )
+        .unwrap()
+        .guaranteed
+        .is_empty());
+
+        let wallet = wallet_vk();
+        let pool = vec![night_pool_utxo(&sender_vk_hex(), 3 * ONE_NIGHT, 1, 0)];
+        let (offer, _) = build_unshielded_balancing_offer(
+            &pool,
+            &mut Vec::new(),
+            &wallet,
+            "sender",
+            &[(NIGHT, ONE_NIGHT)],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let (seg, intent_in) = only_intent(&base);
+        let ttl = intent_in.ttl;
+        let balanced = wrap_proven_standard(
+            &base,
+            seg,
+            assemble_proven_intent(&offer, None, &intent_in, None, ttl),
+        );
+        assert_eq!(
+            tx_balance_imbalances(&balanced).unwrap(),
+            Vec::<String>::new(),
+            "funding the one NIGHT balances the real call tree"
+        );
+
+        let effects = plan_segment_effects(
+            &addrs(),
+            &UserAddress::from(wallet),
+            &[(0, &offer)],
+            &[],
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            effects,
+            vec![SegmentEffects {
+                segment: 0,
+                effects: vec![TransactionEffect {
+                    address: "mn_addr_unshielded".to_string(),
+                    diff: vec![(
+                        TokenType::Native.to_wire_token_type(),
+                        format!("-{ONE_NIGHT}")
+                    )],
+                }],
+            }],
+            "the wallet's effects count the payment once"
+        );
+    }
+
+    /// `Payer.forward_from_wallet(NIGHT, 1)`: the root takes nothing in itself; the sub-call it drives
+    /// does. The wallet funds a callee's intake exactly as it funds a root's.
+    #[test]
+    fn a_real_sub_calls_intake_is_the_wallets_deficit() {
+        assert_eq!(
+            ledger_unshielded_deficits(&Transaction::Standard(real_call_tx("value_forward")))
+                .unwrap(),
+            vec![(NIGHT, 1_000_000, 0)]
+        );
+    }
+
+    /// `Vault.deposit_shielded(coin)`: the dapp's offer outputs a 1000-unit coin to the contract with
+    /// nothing to fund it, so the ledger reports the coin's value as the wallet's shielded deficit, and
+    /// spending a 1500-unit coin for it shows in the effects as 1000 out, once.
+    #[test]
+    fn a_real_shielded_deposit_is_a_shielded_deficit_funded_once() {
+        let color = ShieldedTokenType(HashOutput(
+            hex::decode("1ff34b30e33b5a3e69037149ba1c787bed7dfd25274594e1ec8b391ff29fac93")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ));
+        let base = real_call_tx("shielded");
+        let deficits = ledger_shielded_deficits(&Transaction::Standard(base.clone())).unwrap();
+        assert_eq!(deficits, vec![(color, 1000, 0)]);
+        assert!(ledger_unshielded_deficits(&Transaction::Standard(base))
+            .unwrap()
+            .is_empty());
+
+        let plan = plan_shielded_inputs(&[qci(color, 1500)], &[(color, 1000)]).unwrap();
+        let effects = plan_segment_effects(
+            &addrs(),
+            &UserAddress::from(wallet_vk()),
+            &[],
+            &[ShieldedSpendPlan {
+                segment: 0,
+                coins: plan.coins,
+                change: plan.change_by_token,
+            }],
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0].effects,
+            vec![TransactionEffect {
+                address: "mn_shield_addr".to_string(),
+                diff: vec![(hex::encode(color.0 .0), "-1000".to_string())],
+            }]
+        );
+    }
+
+    /// Calls that move no value — a single call and a three-call tree — leave the ledger balanced
+    /// apart from fees: nothing for the wallet to fund or claim.
+    #[test]
+    fn real_calls_that_move_no_value_ask_nothing_of_the_wallet() {
+        for name in ["single", "composed"] {
+            let tx = Transaction::Standard(real_call_tx(name));
+            assert!(
+                ledger_unshielded_deficits(&tx).unwrap().is_empty(),
+                "{name}"
+            );
+            assert!(ledger_shielded_deficits(&tx).unwrap().is_empty(), "{name}");
+            let claims = surplus_claims(&tx, UserAddress::from(wallet_vk())).unwrap();
+            assert!(
+                claims.guaranteed.is_empty()
+                    && claims.fallible.is_empty()
+                    && claims.shielded.is_empty(),
+                "{name}"
+            );
+        }
+    }
 }
