@@ -3,14 +3,29 @@
 //! The companion of the wallet-relative effects, and deliberately disjoint from them: the effects say
 //! how much *the wallet* moves, these say *who* the transaction talks to and how much value each
 //! contract declares it takes in and pays out. Identity and counterparty amounts live only here.
+//!
+//! Everything a record says comes from the transaction's bytes or is checked against them. The
+//! verifier key a call's proof is checked against lives in the contract's state on chain, read before
+//! the policy pass ([`onchain`]).
 
 use std::collections::BTreeMap;
 
+use midnight_base_crypto::hash::HashOutput;
 use midnight_coin_structure::coin::{PublicAddress, TokenType as LedgerTokenType, UserAddress};
-use midnight_ledger::structure::{ContractAction, ProofKind};
+use midnight_coin_structure::contract::ContractAddress;
+use midnight_ledger::structure::{
+    ContractAction, ContractCall, ContractOperationVersion, ProofKind,
+};
+use midnight_serialize::Serializable as _;
 use midnight_storage::db::DB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use onchain_runtime::context::{ClaimedUnshieldedSpendsKey, Effects};
+use onchain_runtime::state::EntryPointBuf;
+use transient_crypto::curve::Fr;
+
+mod onchain;
+
+pub(crate) use onchain::fetch_operation_keys;
 
 /// The guaranteed section, executed before every fallible one. A call's guaranteed transcript runs
 /// here whichever intent carried it; only its fallible transcript runs in that intent's own segment.
@@ -35,10 +50,14 @@ pub enum ContractActionKind {
 /// sits. A fallible segment id is whatever `u16` the transaction's author picked for that intent — it
 /// is an identifier, not a sequence number, so guaranteed-versus-fallible is `== 0` versus `!= 0`.
 ///
+/// A call names itself (`call`) and, when another call in the transaction claims it, that call
+/// (`caller`): a composed transaction is a tree of calls, and each record carries its own place in it,
+/// so a policy judges the tree by reading every record rather than by where a record sits in the list.
+///
 /// The amounts are the ones the **contract's transcript declares**, not proven wallet movement: they
 /// equal what the wallet sends and receives only when the wallet is the contract's sole counterparty
-/// in that segment (the normal shape for a wallet-authored connector transaction), and they are only
-/// as trustworthy as the transcript is — meaningful for a proven or sealed transaction. For what the
+/// in that segment (the normal shape for a single wallet-funded call), and they are only as
+/// trustworthy as the transcript is — meaningful for a proven or sealed transaction. For what the
 /// wallet itself moves, read the effects.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContractInteraction {
@@ -50,6 +69,23 @@ pub struct ContractInteraction {
     /// a deploy or a maintenance update, neither of which targets one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_point: Option<String>,
+    /// A call's identity: its communication commitment, hex-encoded as the ledger serializes it (the
+    /// form the JS ledger API returns). Both records of a call that declares two transcripts carry the
+    /// same value. Absent for a deploy or a maintenance update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// The `call` of the call whose transcript claims this one — the contract that called it, in a
+    /// composed transaction. Absent for a root call (one the transaction makes directly).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+    /// SHA-256 of the verifier key the ledger checks this call's proof against, as the contract's
+    /// on-chain state holds it — equal to `sha256sum` of the compiled `<circuit>.verifier` file. A
+    /// contract's maintenance authority can replace it at the same address, so a policy pins this
+    /// rather than trusting the address and entry point alone. Absent for a deploy or maintenance
+    /// update, and when the indexer holds no state for the contract — a call the ledger refuses
+    /// (`ContractNotPresent`), since it checks every call against the state before the transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier_key: Option<String>,
     /// Per token, the total value the contract declares it takes in, from every party to the
     /// transaction together. The wallet sends this only when it is the contract's sole counterparty.
     pub sent_to: Vec<(String, String)>,
@@ -84,36 +120,79 @@ pub struct Payout {
     pub to_wallet: bool,
 }
 
+/// What the wallet established about a transaction's calls beyond what the bytes say, before the
+/// policy pass: the verifier keys on chain.
+#[derive(Debug, Clone, Default)]
+pub struct CallFacts {
+    /// Per contract and entry point, the hash of each verifier-key version its state holds.
+    pub(crate) operation_keys: BTreeMap<(ContractAddress, EntryPointBuf), OperationKeys>,
+}
+
+/// The SHA-256 of an operation's verifier keys, one per proof system the ledger supports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OperationKeys {
+    /// The key for ZKIR v2 proofs (the ledger's `ContractOperationVersion::V3`).
+    pub v2: Option<String>,
+    /// The key for ZKIR v3 proofs (`ContractOperationVersion::V4`).
+    pub v3: Option<String>,
+}
+
+impl OperationKeys {
+    /// The key a proof of `version` is verified against — mirroring the ledger's own choice when it
+    /// prices and verifies a call (`validation_cost_with_state`): the latest key when the version is
+    /// unknown.
+    fn for_version(&self, version: Option<ContractOperationVersion>) -> Option<&String> {
+        match version {
+            Some(ContractOperationVersion::V3) => self.v2.as_ref(),
+            Some(ContractOperationVersion::V4) => self.v3.as_ref(),
+            _ => self.v3.as_ref().or(self.v2.as_ref()),
+        }
+    }
+}
+
 /// The contract actions of a transaction's intents, one entry per executing segment. Pure over the
-/// ledger structure (no key, no network), so it is the unit-tested core behind every plan's
-/// `contracts()`; callers pass `StandardTransaction::actions()`, whose `u16` is the intent's segment,
-/// and the wallet's unshielded address, to mark the payouts that reach it.
+/// ledger structure and the established `facts` (no key, no network), so it is the unit-tested core
+/// behind every plan's `contracts()`; callers pass `StandardTransaction::actions()`, whose `u16` is
+/// the intent's segment, and the wallet's unshielded address, to mark the payouts that reach it.
 pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
     actions: impl Iterator<Item = (u16, ContractAction<P, D>)>,
     wallet: &UserAddress,
+    facts: &CallFacts,
 ) -> Vec<ContractInteraction> {
+    let actions: Vec<(u16, ContractAction<P, D>)> = actions.collect();
+    let callers = callers_by_claim(&actions);
     let mut out = Vec::new();
-    for (intent_segment, action) in actions {
+    for (intent_segment, action) in &actions {
         match action {
             ContractAction::Call(call) => {
-                let address = hex::encode(call.address.0 .0);
-                let entry_point = entry_point_label(&call.entry_point);
+                let id = CallId::of(call);
+                let identity = CallIdentity {
+                    address: &call.address,
+                    entry_point: entry_point_label(&call.entry_point),
+                    call: fr_hex(&call.communication_commitment),
+                    caller: callers.get(&id).map(fr_hex),
+                    verifier_key: facts
+                        .operation_keys
+                        .get(&(call.address, call.entry_point.clone()))
+                        .and_then(|keys| {
+                            keys.for_version(P::proof_version_to_operation_version(&call.proof))
+                        })
+                        .cloned(),
+                };
                 let guaranteed = call.guaranteed_transcript.as_ref();
                 let fallible = call.fallible_transcript.as_ref();
                 if let Some(transcript) = guaranteed {
                     out.push(call_interaction(
                         GUARANTEED_SEGMENT,
-                        &address,
-                        &entry_point,
+                        &identity,
                         &transcript.effects,
                         wallet,
                     ));
                 }
                 if let Some(transcript) = fallible {
                     out.push(call_interaction(
-                        intent_segment,
-                        &address,
-                        &entry_point,
+                        *intent_segment,
+                        &identity,
                         &transcript.effects,
                         wallet,
                     ));
@@ -122,9 +201,8 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
                     // A call declaring no transcript moves nothing, but a policy keyed on which
                     // contracts a transaction touches still has to see it.
                     out.push(call_interaction(
-                        intent_segment,
-                        &address,
-                        &entry_point,
+                        *intent_segment,
+                        &identity,
                         &Effects::<D>::default(),
                         wallet,
                     ));
@@ -132,44 +210,117 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
             }
             // A deploy and a maintenance update carry no transcript — the ledger skips both in the
             // guaranteed pass — so they declare no value movement and ride their intent's segment.
-            ContractAction::Deploy(deploy) => out.push(ContractInteraction {
-                segment: intent_segment,
-                kind: ContractActionKind::Deploy,
-                address: hex::encode(deploy.address().0 .0),
-                entry_point: None,
-                sent_to: Vec::new(),
-                received_from: Vec::new(),
-                payouts: Vec::new(),
-            }),
-            ContractAction::Maintain(update) => out.push(ContractInteraction {
-                segment: intent_segment,
-                kind: ContractActionKind::Maintain,
-                address: hex::encode(update.address.0 .0),
-                entry_point: None,
-                sent_to: Vec::new(),
-                received_from: Vec::new(),
-                payouts: Vec::new(),
-            }),
+            ContractAction::Deploy(deploy) => out.push(non_call_interaction(
+                *intent_segment,
+                ContractActionKind::Deploy,
+                deploy.address(),
+            )),
+            ContractAction::Maintain(update) => out.push(non_call_interaction(
+                *intent_segment,
+                ContractActionKind::Maintain,
+                update.address,
+            )),
         }
     }
     out
 }
 
+/// A call as another call's transcript claims it: the callee's address, entry-point hash and
+/// communication commitment — exactly the triple the ledger matches a claim against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CallId {
+    address: ContractAddress,
+    entry_point: HashOutput,
+    commitment: Fr,
+}
+
+impl CallId {
+    fn of<P: ProofKind<D>, D: DB>(call: &ContractCall<P, D>) -> Self {
+        CallId {
+            address: call.address,
+            entry_point: call.entry_point.ep_hash(),
+            commitment: call.communication_commitment,
+        }
+    }
+}
+
+/// For every call another call claims, the claiming call's communication commitment — the edges of
+/// the transaction's call tree. The ledger admits a claim only when the claimed call is in the same
+/// transaction and claimed once, so each callee has exactly one caller.
+fn callers_by_claim<P: ProofKind<D>, D: DB>(
+    actions: &[(u16, ContractAction<P, D>)],
+) -> BTreeMap<CallId, Fr> {
+    let mut callers = BTreeMap::new();
+    for (_, action) in actions {
+        let ContractAction::Call(call) = action else {
+            continue;
+        };
+        let transcripts = call
+            .guaranteed_transcript
+            .iter()
+            .chain(call.fallible_transcript.iter());
+        for transcript in transcripts {
+            for claim in transcript.effects.claimed_contract_calls.iter() {
+                let (_seq, address, entry_point, commitment) = (*claim).into_inner();
+                callers.insert(
+                    CallId {
+                        address,
+                        entry_point,
+                        commitment,
+                    },
+                    call.communication_commitment,
+                );
+            }
+        }
+    }
+    callers
+}
+
+/// What every record of one call shares, whichever transcript it reports.
+struct CallIdentity<'a> {
+    address: &'a ContractAddress,
+    entry_point: String,
+    call: String,
+    caller: Option<String>,
+    verifier_key: Option<String>,
+}
+
 fn call_interaction<D: DB>(
     segment: u16,
-    address: &str,
-    entry_point: &str,
+    identity: &CallIdentity<'_>,
     effects: &Effects<D>,
     wallet: &UserAddress,
 ) -> ContractInteraction {
     ContractInteraction {
         segment,
         kind: ContractActionKind::Call,
-        address: address.to_string(),
-        entry_point: Some(entry_point.to_string()),
+        address: hex::encode(identity.address.0 .0),
+        entry_point: Some(identity.entry_point.clone()),
+        call: Some(identity.call.clone()),
+        caller: identity.caller.clone(),
+        verifier_key: identity.verifier_key.clone(),
         sent_to: token_amounts(&effects.unshielded_inputs),
         received_from: token_amounts(&effects.unshielded_outputs),
         payouts: payouts(&effects.claimed_unshielded_spends, wallet),
+    }
+}
+
+fn non_call_interaction(
+    segment: u16,
+    kind: ContractActionKind,
+    address: ContractAddress,
+) -> ContractInteraction {
+    ContractInteraction {
+        segment,
+        kind,
+        address: hex::encode(address.0 .0),
+        entry_point: None,
+        call: None,
+        caller: None,
+        verifier_key: None,
+        sent_to: Vec::new(),
+        received_from: Vec::new(),
+        payouts: Vec::new(),
     }
 }
 
@@ -238,6 +389,15 @@ fn entry_point_label(entry_point: &[u8]) -> String {
     std::str::from_utf8(entry_point)
         .map(str::to_string)
         .unwrap_or_else(|_| hex::encode(entry_point))
+}
+
+/// A field element as the ledger serializes it, hex-encoded — the form the JS ledger API renders a
+/// communication commitment in, so a call's id reads the same on both sides.
+pub(crate) fn fr_hex(fr: &Fr) -> String {
+    let mut bytes = Vec::new();
+    fr.serialize(&mut bytes)
+        .expect("serializing a field element into memory cannot fail");
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
@@ -318,7 +478,11 @@ mod tests {
             Some(transcript(&[], &[(token(0x22), 250)])),
         );
 
-        let out = contract_interactions([(3u16, action)].into_iter(), &wallet());
+        let out = contract_interactions(
+            [(3u16, action)].into_iter(),
+            &wallet(),
+            &CallFacts::default(),
+        );
 
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].segment, GUARANTEED_SEGMENT);
@@ -345,6 +509,7 @@ mod tests {
         let out = contract_interactions(
             [(1u16, call(0x07, "noop", None, None))].into_iter(),
             &wallet(),
+            &CallFacts::default(),
         );
 
         assert_eq!(out.len(), 1);
@@ -380,6 +545,7 @@ mod tests {
             ]
             .into_iter(),
             &wallet(),
+            &CallFacts::default(),
         );
 
         assert_eq!(out.len(), 2);
@@ -413,7 +579,7 @@ mod tests {
         use midnight_serialize::tagged_deserialize;
         use transient_crypto::commitment::PureGeneratorPedersen;
 
-        let hex_str = include_str!("testdata/contract_call_stagenet.hex").trim();
+        let hex_str = include_str!("../testdata/contract_call_stagenet.hex").trim();
         let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
         let mut reader: &[u8] = &bytes;
         let tx: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
@@ -422,7 +588,7 @@ mod tests {
             panic!("the fixture is a Standard transaction");
         };
 
-        let out = contract_interactions(base.actions(), &wallet());
+        let out = contract_interactions(base.actions(), &wallet(), &CallFacts::default());
 
         assert_eq!(
             out.len(),
@@ -476,6 +642,7 @@ mod tests {
         let out = contract_interactions(
             [(1u16, call(0x0C, "swap", Some(transcript), None))].into_iter(),
             &wallet(),
+            &CallFacts::default(),
         );
 
         let tok = hex::encode([0x22u8; 32]);
@@ -520,9 +687,194 @@ mod tests {
             None,
         );
 
-        let out = contract_interactions([(1u16, action)].into_iter(), &wallet());
+        let out = contract_interactions(
+            [(1u16, action)].into_iter(),
+            &wallet(),
+            &CallFacts::default(),
+        );
 
         // The DUST dimension keeps the `dust` wire name the effects use; a zero amount is dropped.
         assert_eq!(out[0].sent_to, vec![("dust".to_string(), "42".to_string())]);
+    }
+
+    fn call_with(
+        contract: u8,
+        entry_point: &str,
+        commitment: Fr,
+        guaranteed: Option<Sp<Transcript<InMemoryDB>, InMemoryDB>>,
+    ) -> Action {
+        ContractAction::Call(Sp::new(Call {
+            address: address(contract),
+            entry_point: EntryPointBuf(entry_point.as_bytes().to_vec()),
+            guaranteed_transcript: guaranteed,
+            fallible_transcript: None,
+            communication_commitment: commitment,
+            proof: (),
+        }))
+    }
+
+    fn with_effects(
+        effects: Effects<InMemoryDB>,
+    ) -> Option<Sp<Transcript<InMemoryDB>, InMemoryDB>> {
+        Some(Sp::new(Transcript {
+            gas: Default::default(),
+            effects,
+            program: vec![].into(),
+            version: None,
+        }))
+    }
+
+    fn claiming(callee: u8, entry_point: &str, commitment: Fr) -> Effects<InMemoryDB> {
+        use onchain_runtime::context::ClaimedContractCallsValue;
+        let mut effects = Effects::<InMemoryDB>::default();
+        effects.claimed_contract_calls =
+            effects
+                .claimed_contract_calls
+                .insert(ClaimedContractCallsValue(
+                    0,
+                    address(callee),
+                    EntryPointBuf(entry_point.as_bytes().to_vec()).ep_hash(),
+                    commitment,
+                ));
+        effects
+    }
+
+    #[test]
+    fn a_composed_call_names_its_caller_and_the_root_names_none() {
+        // caller.write_then_read claims tally.set — the shape of a two-contract call tree.
+        let (root, callee) = (Fr::from(22u64), Fr::from(11u64));
+        let out = contract_interactions(
+            [
+                (
+                    1u16,
+                    call_with(
+                        0xAA,
+                        "write_then_read",
+                        root,
+                        with_effects(claiming(0xBB, "set", callee)),
+                    ),
+                ),
+                (
+                    1u16,
+                    call_with(0xBB, "set", callee, Some(transcript(&[], &[]))),
+                ),
+            ]
+            .into_iter(),
+            &wallet(),
+            &CallFacts::default(),
+        );
+
+        assert_eq!(out[0].call, Some(fr_hex(&root)));
+        assert_eq!(out[0].caller, None);
+        assert_eq!(out[1].call, Some(fr_hex(&callee)));
+        assert_eq!(out[1].caller, Some(fr_hex(&root)));
+    }
+
+    #[test]
+    fn a_claim_names_a_caller_only_when_address_entry_point_and_commitment_all_match() {
+        // The ledger admits a claim only on the full triple, so a near miss is no edge.
+        let callee = Fr::from(11u64);
+        for claim in [
+            claiming(0xBB, "get", callee),
+            claiming(0xCC, "set", callee),
+            claiming(0xBB, "set", Fr::from(12u64)),
+        ] {
+            let out = contract_interactions(
+                [
+                    (
+                        1u16,
+                        call_with(0xAA, "root", Fr::from(22u64), with_effects(claim)),
+                    ),
+                    (
+                        1u16,
+                        call_with(0xBB, "set", callee, Some(transcript(&[], &[]))),
+                    ),
+                ]
+                .into_iter(),
+                &wallet(),
+                &CallFacts::default(),
+            );
+            assert_eq!(out[1].caller, None);
+        }
+    }
+
+    #[test]
+    fn the_verifier_key_follows_the_proof_version_the_ledger_checks_against() {
+        let keys = OperationKeys {
+            v2: Some("v2-key".into()),
+            v3: Some("v3-key".into()),
+        };
+        assert_eq!(
+            keys.for_version(Some(ContractOperationVersion::V3))
+                .map(String::as_str),
+            Some("v2-key")
+        );
+        assert_eq!(
+            keys.for_version(Some(ContractOperationVersion::V4))
+                .map(String::as_str),
+            Some("v3-key")
+        );
+        assert_eq!(keys.for_version(None).map(String::as_str), Some("v3-key"));
+        let v2_only = OperationKeys {
+            v2: Some("v2-key".into()),
+            v3: None,
+        };
+        assert_eq!(
+            v2_only.for_version(None).map(String::as_str),
+            Some("v2-key")
+        );
+        assert_eq!(
+            v2_only.for_version(Some(ContractOperationVersion::V4)),
+            None,
+            "a v3 proof against a contract holding only a v2 key has no key to pin"
+        );
+    }
+
+    /// The real stagenet call fixture, with the verifier keys its contract holds on chain: the call's
+    /// record pins the key its proof is checked against, and that key is byte for byte the one Compact
+    /// compiled — `sha256sum contracts/managed/account/keys/deposit_unshielded.verifier` in the passport
+    /// playground (compactc 0.34.0) prints `b8b29aca…`.
+    ///
+    /// Fixture: `testdata/acc_state_stagenet.hex` is `contractAction(address:
+    /// "f973e22e0a15c1c4ef9dd5d6d6c87f6c60728b6277e09421de8f780644477421") { state }` on the stagenet
+    /// indexer, as of tx `b8078ee3b84895dfcf55dff0842124bc8e8016c5d2d7f8f1fe2f1e0abc14d241` (block
+    /// 975950).
+    #[test]
+    fn a_real_call_pins_the_verifier_key_its_contract_holds_on_chain() {
+        use midnight_ledger::structure::Signature as MnSig;
+        use midnight_ledger::structure::{ProofMarker, Transaction};
+        use midnight_serialize::tagged_deserialize;
+        use transient_crypto::commitment::PureGeneratorPedersen;
+
+        let contract = ContractAddress(HashOutput(
+            hex::decode("f973e22e0a15c1c4ef9dd5d6d6c87f6c60728b6277e09421de8f780644477421")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ));
+        let state = include_str!("../testdata/acc_state_stagenet.hex").trim();
+        let facts = CallFacts {
+            operation_keys: onchain::operation_keys(contract, state).unwrap(),
+            ..Default::default()
+        };
+        let deposit =
+            &facts.operation_keys[&(contract, EntryPointBuf(b"deposit_unshielded".to_vec()))];
+        assert_eq!(deposit.v3, None, "the account contract compiles to ZKIR v2");
+
+        let hex_str = include_str!("../testdata/contract_call_stagenet.hex").trim();
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+        let tx: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
+            tagged_deserialize(&mut &bytes[..]).unwrap();
+        let Transaction::Standard(base) = &tx else {
+            panic!("the fixture is a Standard transaction");
+        };
+        let out = contract_interactions(base.actions(), &wallet(), &facts);
+
+        assert_eq!(
+            out[0].verifier_key.as_deref(),
+            Some("b8b29aca1d6a86f57efc504ad9bf348a2ef7dd643cdd2be08810ee4412050d23")
+        );
+        assert_eq!(out[0].caller, None, "a direct call has no caller");
+        assert!(out[0].call.is_some());
     }
 }
