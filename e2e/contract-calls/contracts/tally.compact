@@ -1,0 +1,23 @@
+pragma language_version 0.26;
+
+// (b) callee. Trimmed from experiments/cross-contract-calls/contracts/tally.compact.
+// Compiled to contracts/managed/Tally: the directory name is the ABI the
+// Caller's generated code imports.
+
+import CompactStandardLibrary;
+
+export ledger total: Uint<64>;
+export ledger writes: Counter;
+
+constructor() {
+  total = 0 as Uint<64>;
+}
+
+export circuit set(x: Uint<64>): [] {
+  total = disclose(x);
+  writes.increment(1);
+}
+
+export circuit get(): Uint<64> {
+  return total;
+}

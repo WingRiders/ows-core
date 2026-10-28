@@ -1,0 +1,16 @@
+pragma language_version 0.26;
+
+// (c) callee: claims unshielded value addressed to it. Trimmed from
+// experiments/cross-contract-calls/contracts/till.compact (unshielded half only).
+
+import CompactStandardLibrary;
+
+export ledger unshielded_claims: Counter;
+
+constructor() {
+}
+
+export circuit take_unshielded(color: Bytes<32>, amount: Uint<128>): [] {
+  receiveUnshielded(disclose(color), disclose(amount));
+  unshielded_claims.increment(1);
+}
