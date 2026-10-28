@@ -111,8 +111,10 @@ fn registration_dust_actions(
     }
 }
 
-/// Build a generationless fee registration sized to `fee_dust`, or `None` when the selected inputs
-/// have no unregistered NIGHT capacity.
+/// Build a generationless fee registration sized to `fee_dust`, or `None` when the selected inputs'
+/// unregistered NIGHT capacity cannot cover it. Capacity short of the fee is no registration at all,
+/// so the caller falls back to a DUST spend: a young NIGHT coin must not block a wallet that holds
+/// DUST.
 fn try_registration_dust_actions(
     selected: &[UnshieldedUtxo],
     fee_dust: u128,
@@ -121,7 +123,7 @@ fn try_registration_dust_actions(
     dust_ctime: Timestamp,
 ) -> Result<Option<DustActions<MnSig, ProofMarker, InMemoryDB>>, std::io::Error> {
     let dust_allow = dust_allowance_from_night_inputs(selected, dust_ctime)?;
-    if dust_allow == 0 {
+    if dust_allow == 0 || dust_allow < fee_dust {
         return Ok(None);
     }
     let allow_fee_payment = cap_allow_fee_payment(dust_allow, fee_dust)?;
@@ -767,6 +769,23 @@ mod tests {
     /// The live-run trigger for the proof-bearing fallback: a fully dust-registered wallet has no
     /// generationless capacity, so `try_registration_dust_actions` yields `None` and the caller must
     /// fall back to proving a DUST spend.
+    /// Capacity that covers only part of the fee is no registration, so sizing moves on to a DUST
+    /// spend instead of aborting with the registration's shortfall.
+    #[test]
+    fn capacity_short_of_the_fee_yields_no_registration() {
+        let dust_pk = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x22u8; 32]));
+        let night_vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let now = Timestamp::from_secs(2_000);
+        let young = [night_utxo(STARS_PER_NIGHT, false, Some(1_999))];
+        assert!(dust_allowance_from_night_inputs(&young, now).unwrap() > 0);
+
+        let none =
+            try_registration_dust_actions(&young, 10u128.pow(15), dust_pk, night_vk, now).unwrap();
+        assert!(none.is_none());
+    }
+
     #[test]
     fn all_registered_night_yields_no_registration_forcing_the_spend_fallback() {
         let dust_pk = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x22u8; 32]));
