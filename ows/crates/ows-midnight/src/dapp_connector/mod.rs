@@ -167,9 +167,7 @@ impl ConnectorPlan {
             ConnectorPlan::MakeTransfer(_) | ConnectorPlan::MakeIntent(_) => Ok(Vec::new()),
             // The taker's complement is a plain `makeIntent` and carries none; the contracts of a merge
             // are the sealed maker's, which survive the merge into the submitted transaction.
-            ConnectorPlan::BalanceSealedMerge(merge) => {
-                balance_sealed::maker_contracts(merge.maker_tx(), &wallet)
-            }
+            ConnectorPlan::BalanceSealedMerge(merge) => merge.contracts(&wallet),
         }
     }
 

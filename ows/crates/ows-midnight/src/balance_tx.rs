@@ -49,7 +49,7 @@ use transient_crypto::proofs::Proof as ZswapProof;
 use ows_core::policy::TransactionEffect;
 use ows_core::sync_cache::SyncCacheScope;
 
-use crate::contracts::{contract_interactions, ContractInteraction};
+use crate::contracts::{contract_interactions, CallFacts, ContractInteraction};
 use crate::policy_context::{DustRegistrationContext, FeeContext};
 use crate::UnshieldedUtxo;
 
@@ -923,6 +923,8 @@ pub struct BalancedPlan {
     consolidation: Option<Consolidation>,
     /// The dust registrations the dapp's transaction carries, which the wallet signs as they are.
     carried_registrations: Vec<CarriedRegistration>,
+    /// What the wallet established about the transaction's calls for the policy pass.
+    facts: CallFacts,
 }
 
 impl BalancedPlan {
@@ -1005,7 +1007,7 @@ impl BalancedPlan {
     /// [effects](Self::segment_effects) deliberately omit; the wallet's own balancing adds no contract
     /// action, so these are entirely the dapp's.
     pub(crate) fn contracts(&self, wallet: &UserAddress) -> Vec<ContractInteraction> {
-        contract_interactions(self.base.actions(), wallet)
+        contract_interactions(self.base.actions(), wallet, &self.facts)
     }
 
     /// How the wallet pays this plan's DUST fee, and the most DUST that can take.
@@ -1116,6 +1118,7 @@ impl BalancedPlan {
             dust,
             consolidation: None,
             carried_registrations: vec![],
+            facts: CallFacts::default(),
         }
     }
 }
@@ -1224,6 +1227,39 @@ fn scan_shielded_inflow<P: midnight_storage::Storable<InMemoryDB>>(
         }
     }
     inflow
+}
+
+/// What the wallet establishes about the calls of a transaction it is asked to complete, for the
+/// policy pass: the verifier key each called contract holds on chain.
+pub(crate) fn establish_call_facts<P>(
+    actions: impl Iterator<
+        Item = (
+            u16,
+            midnight_ledger::structure::ContractAction<P, InMemoryDB>,
+        ),
+    >,
+    indexer_url: &str,
+) -> Result<CallFacts, std::io::Error>
+where
+    P: ProofKind<InMemoryDB>,
+{
+    let actions: Vec<_> = actions.collect();
+    let addresses: BTreeSet<_> = actions
+        .iter()
+        .filter_map(|(_, action)| match action {
+            midnight_ledger::structure::ContractAction::Call(call) => Some(call.address),
+            _ => None,
+        })
+        .collect();
+    let operation_keys = if addresses.is_empty() {
+        BTreeMap::new()
+    } else {
+        crate::block_on(crate::contracts::fetch_operation_keys(
+            indexer_url,
+            &addresses,
+        ))?
+    };
+    Ok(CallFacts { operation_keys })
 }
 
 /// The wallet-relative effects authorizing a plan will have, grouped by the transaction segment they
@@ -1634,6 +1670,9 @@ fn plan_unsealed_proven_standard_tx(
         ensure_tx_network_id_matches_chain(chain_id, &base.network_id)?;
     }
 
+    // What the policy pass will learn about the transaction's calls, established before anything else.
+    let facts = establish_call_facts(base.actions(), indexer_url)?;
+
     // Claim every surplus for the wallet, then plan a shielded deficit against the wallet's own shielded
     // coins together with the shielded claims — a no-op when ledger `balance()` has neither. Pure
     // selection: no spend, no prove.
@@ -1909,6 +1948,7 @@ fn plan_unsealed_proven_standard_tx(
         dust,
         consolidation,
         carried_registrations,
+        facts,
     })
 }
 
@@ -3444,6 +3484,7 @@ mod tests {
             dust: DustFeePlan::None,
             consolidation: None,
             carried_registrations: vec![],
+            facts: CallFacts::default(),
         };
         let bytes = authorize_proven_tx("midnight:mainnet", &provider, plan, None).unwrap();
         let Transaction::Standard(stx) = tagged_deserialize::<TxProven>(&mut &bytes[..]).unwrap()
@@ -3572,6 +3613,7 @@ mod tests {
                 dust,
                 consolidation: Some(consolidation.clone()),
                 carried_registrations: vec![],
+                facts: CallFacts::default(),
             };
             let bytes = authorize_proven_tx("midnight:mainnet", &provider, plan, Some(&vault))
                 .unwrap_or_else(|e| panic!("{fee}: {e}"));
@@ -3652,6 +3694,7 @@ mod tests {
             dust: DustFeePlan::None,
             consolidation: Some(consolidation),
             carried_registrations: vec![],
+            facts: CallFacts::default(),
         }
     }
 
@@ -3805,6 +3848,7 @@ mod tests {
             dust,
             consolidation: None,
             carried_registrations: vec![],
+            facts: CallFacts::default(),
         }
     }
 

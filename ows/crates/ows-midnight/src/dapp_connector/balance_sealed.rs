@@ -28,6 +28,7 @@ use super::build::{DesiredOutput, TransferKind};
 use super::make_intent::{DesiredInput, MakeIntentRequest, OfferPlan};
 use super::swap_offer;
 use super::{classify_unsealed_payload, ConnectorPlan, UnsealedKind};
+use crate::contracts::CallFacts;
 
 /// A fully sealed (`proof,pedersen-schnorr`) Midnight transaction — the form a maker offer arrives in.
 type TxSealed = Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
@@ -318,19 +319,37 @@ pub(super) fn sealed_maker_complement(
 pub(super) fn maker_contracts(
     maker_bytes: &[u8],
     wallet: &UserAddress,
+    facts: &CallFacts,
 ) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
-    let mut r: &[u8] = maker_bytes;
-    let tx: TxSealed = tagged_deserialize(&mut r)
-        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+    let tx = parse_maker(maker_bytes)?;
     let Transaction::Standard(base) = &tx else {
-        return Err(std::io::Error::other(
-            "balanceSealedTransaction expects a Standard maker transaction",
-        ));
+        return Err(not_standard());
     };
     Ok(crate::contracts::contract_interactions(
         base.actions(),
         wallet,
+        facts,
     ))
+}
+
+fn parse_maker(maker_bytes: &[u8]) -> Result<TxSealed, std::io::Error> {
+    let mut r: &[u8] = maker_bytes;
+    tagged_deserialize(&mut r)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))
+}
+
+fn not_standard() -> std::io::Error {
+    std::io::Error::other("balanceSealedTransaction expects a Standard maker transaction")
+}
+
+/// What the wallet establishes about the maker's calls before the policy pass: the verifier keys on
+/// chain.
+fn maker_call_facts(maker_bytes: &[u8], indexer_url: &str) -> Result<CallFacts, std::io::Error> {
+    let tx = parse_maker(maker_bytes)?;
+    let Transaction::Standard(base) = &tx else {
+        return Err(not_standard());
+    };
+    crate::balance_tx::establish_call_facts(base.actions(), indexer_url)
 }
 
 /// A sealed-maker merge decided before the policy seam: the maker's sealed bytes, the taker's
@@ -343,6 +362,8 @@ pub struct MergePlan {
     complement: MakeIntentRequest,
     taker: OfferPlan,
     fee: Option<MergeFee>,
+    /// What the wallet established about the maker's calls for the policy pass.
+    facts: CallFacts,
 }
 
 /// How the taker pays the merged transaction's fee, decided before the policy seam.
@@ -373,10 +394,12 @@ impl MergeFee {
 }
 
 impl MergePlan {
-    /// The maker's sealed bytes, whose contract actions survive the merge into the submitted
-    /// transaction.
-    pub(super) fn maker_tx(&self) -> &[u8] {
-        &self.maker_tx
+    /// The contract actions the merged transaction performs: the maker's, which survive the merge.
+    pub(super) fn contracts(
+        &self,
+        wallet: &UserAddress,
+    ) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+        maker_contracts(&self.maker_tx, wallet, &self.facts)
     }
 
     /// How the taker pays the merged transaction's fee, and the most DUST that can take.
@@ -431,12 +454,15 @@ fn plan_merge(
     pay_fees: bool,
     vault_path: Option<&Path>,
 ) -> Result<MergePlan, std::io::Error> {
+    let indexer_url = crate::wallet::resolve_indexer_url(chain_id, vault_path)?;
+    let facts = maker_call_facts(&maker_tx, &indexer_url)?;
     let (taker, fee) = plan_taker_half(
         chain_id,
         crypto_provider,
         &maker_tx,
         &complement,
         pay_fees,
+        &indexer_url,
         vault_path,
     )?;
     Ok(MergePlan {
@@ -444,6 +470,7 @@ fn plan_merge(
         complement,
         taker,
         fee,
+        facts,
     })
 }
 
@@ -454,10 +481,10 @@ fn plan_taker_half(
     maker_tx: &[u8],
     complement: &MakeIntentRequest,
     pay_fees: bool,
+    indexer_url: &str,
     vault_path: Option<&Path>,
 ) -> Result<(OfferPlan, Option<MergeFee>), std::io::Error> {
-    let indexer_url = crate::wallet::resolve_indexer_url(chain_id, vault_path)?;
-    let paying = crate::balance_tx::adding_dust(pay_fees, &indexer_url)?;
+    let paying = crate::balance_tx::adding_dust(pay_fees, indexer_url)?;
     let spends_unshielded = complement
         .desired_inputs
         .iter()
@@ -480,7 +507,7 @@ fn plan_taker_half(
     }
 
     let (ledger_params, tip_secs) =
-        crate::block_on(crate::ledger_params::fetch_indexer_tip(&indexer_url))?;
+        crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
     let tip = Timestamp::from_secs(tip_secs);
     let mut mr: &[u8] = maker_tx;
     let maker: TxSealed = tagged_deserialize(&mut mr)
@@ -535,7 +562,7 @@ fn plan_taker_half(
         &maker,
         &taker,
         complement.intent_segment,
-        &indexer_url,
+        indexer_url,
         &ledger_params,
         tip,
         vault_path,
@@ -644,6 +671,7 @@ pub(super) fn authorize_merge(
         complement,
         taker,
         fee,
+        facts: _,
     } = merge;
     // The taker's imbalanced complementary half rides a segment disjoint from the maker's (picked in
     // `complement_from_balance`); that intent carries the fee section.
@@ -1023,6 +1051,7 @@ mod merge_tests {
             complement,
             taker,
             fee: Some(MergeFee::Registration(Box::new(fee))),
+            facts: CallFacts::default(),
         }));
         let context = plan.policy_context(chain, &provider).unwrap();
         assert_eq!(
@@ -1100,7 +1129,10 @@ mod merge_tests {
         // sealed maker's actions are readable at all, i.e. the seam reports `contracts` for a merge
         // instead of failing to parse the maker it already balances against.
         let wallet = UserAddress(HashOutput([0; 32]));
-        assert_eq!(maker_contracts(&bytes, &wallet).unwrap(), Vec::new());
+        assert_eq!(
+            maker_contracts(&bytes, &wallet, &CallFacts::default()).unwrap(),
+            Vec::new()
+        );
     }
 }
 
@@ -1499,6 +1531,7 @@ mod tests {
                 complement,
                 taker: half,
                 fee: None,
+                facts: CallFacts::default(),
             };
             assert_eq!(
                 merge_segment_effects(CHAIN, &taker, &merge).unwrap(),
