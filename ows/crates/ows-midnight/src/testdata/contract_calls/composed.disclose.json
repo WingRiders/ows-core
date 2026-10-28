@@ -1,0 +1,83 @@
+{
+  "calls": [
+    {
+      "address": "3cae90703ef2c18d1fe5cd730d4021e9ac5b84c104514d8ed2c0e791627cf96d",
+      "entryPoint": "set",
+      "input": {
+        "value": [
+          "2a"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [],
+        "alignment": []
+      },
+      "communicationCommitmentRand": "73a5d3026c6f902509b4acc8fed9093a7afc7e9f959caf7beaf67c0a63b80c7d53"
+    },
+    {
+      "address": "3cae90703ef2c18d1fe5cd730d4021e9ac5b84c104514d8ed2c0e791627cf96d",
+      "entryPoint": "get",
+      "input": {
+        "value": [],
+        "alignment": []
+      },
+      "output": {
+        "value": [
+          "2a"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          }
+        ]
+      },
+      "communicationCommitmentRand": "73f80b552e676232e37ddb7ace1ab29175a572fc3b6fa6b430051749542ce42f4e"
+    },
+    {
+      "address": "125bca33ae1231b7045d184018b6efedf5c527bb8a5d3a2f3189c917279633fe",
+      "entryPoint": "write_then_read",
+      "input": {
+        "value": [
+          "2a"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [
+          "2a"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          }
+        ]
+      },
+      "communicationCommitmentRand": "73936a74d0be853744b730981ba606d3b20411abd306af885f6ea39a4d0aea0e2e"
+    }
+  ]
+}

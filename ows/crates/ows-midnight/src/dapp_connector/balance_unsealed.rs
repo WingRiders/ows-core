@@ -8,6 +8,7 @@ use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
 use super::ConnectorPlan;
+use crate::contracts::Disclosures;
 
 /// Pre-seal Midnight transaction shapes the wallet can classify by tag. Per the DApp Connector spec a
 /// `balanceUnsealedTransaction` arrives already **proven** (`proof,embedded-fr`) — "unsealed" means
@@ -51,12 +52,14 @@ pub fn is_sealed_maker_payload(tx_bytes: &[u8]) -> bool {
     tx_bytes.starts_with(TAG_PROOF_PEDERSEN_SCHNORR)
 }
 
-/// A parsed `balanceUnsealedTransaction` connector request: the tagged v12 transaction to balance and
-/// whether the wallet should register DUST to pay fees.
+/// A parsed `balanceUnsealedTransaction` connector request: the tagged v12 transaction to balance,
+/// whether the wallet should register DUST to pay fees, and what the tooling discloses about the
+/// transaction's calls.
 #[derive(Debug, Clone)]
 pub struct BalanceUnsealedRequest {
     pub tx_bytes: Vec<u8>,
     pub pay_fees: bool,
+    pub disclosures: Disclosures,
 }
 
 fn default_pay_fees() -> bool {
@@ -79,6 +82,10 @@ struct BalanceUnsealedJson {
     tx: String,
     #[serde(default)]
     options: Option<PayFeesOptions>,
+    /// An OWS extension to the connector request: the arguments of the calls the tooling built, and the
+    /// shielded coins it sends them, each checked against the transaction before a policy sees it.
+    #[serde(default)]
+    disclose: Option<Disclosures>,
 }
 
 /// Parse a stringified DApp Connector `balanceUnsealedTransaction` request into its transaction
@@ -92,6 +99,7 @@ pub fn parse_balance_unsealed_json(json: &str) -> Result<BalanceUnsealedRequest,
     Ok(BalanceUnsealedRequest {
         tx_bytes,
         pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
+        disclosures: req.disclose.unwrap_or_default(),
     })
 }
 
@@ -114,6 +122,7 @@ pub(super) fn plan(
                 crypto_provider,
                 &request.tx_bytes,
                 request.pay_fees,
+                &request.disclosures,
                 vault_path,
             )?;
             Ok(ConnectorPlan::BalanceUnsealed(Box::new(plan)))

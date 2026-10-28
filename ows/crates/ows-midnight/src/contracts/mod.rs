@@ -1,15 +1,19 @@
 //! The contract actions a transaction carries, read off the ledger structure for the policy seam.
 //!
 //! The companion of the wallet-relative effects, and deliberately disjoint from them: the effects say
-//! how much *the wallet* moves, these say *who* the transaction talks to and how much value each
-//! contract declares it takes in and pays out. Identity and counterparty amounts live only here.
+//! how much *the wallet* moves, these say *who* the transaction talks to, *what* it asks of them and
+//! how much value each contract declares it takes in and pays out. Identity and counterparty amounts
+//! live only here.
 //!
-//! Everything a record says comes from the transaction's bytes or is checked against them. The
-//! verifier key a call's proof is checked against lives in the contract's state on chain, read before
-//! the policy pass ([`onchain`]).
+//! Everything a record says comes from the transaction's bytes or is checked against them. A call's
+//! arguments are not in the bytes — they are private inputs to its proof — so they appear only when
+//! the tooling that built the call discloses them and they open the call's communication commitment
+//! ([`disclosure`]). The verifier key a call's proof is checked against lives in the contract's state
+//! on chain, read before the policy pass ([`onchain`]).
 
 use std::collections::BTreeMap;
 
+use midnight_base_crypto::fab::{AlignedValue, AlignmentAtom, AlignmentSegment, ValueAtom};
 use midnight_base_crypto::hash::HashOutput;
 use midnight_coin_structure::coin::{PublicAddress, TokenType as LedgerTokenType, UserAddress};
 use midnight_coin_structure::contract::ContractAddress;
@@ -23,8 +27,13 @@ use onchain_runtime::context::{ClaimedUnshieldedSpendsKey, Effects};
 use onchain_runtime::state::EntryPointBuf;
 use transient_crypto::curve::Fr;
 
+mod disclosure;
 mod onchain;
+#[cfg(test)]
+mod real_calls;
 
+pub(crate) use disclosure::verify_disclosures;
+pub use disclosure::Disclosures;
 pub(crate) use onchain::fetch_operation_keys;
 
 /// The guaranteed section, executed before every fallible one. A call's guaranteed transcript runs
@@ -86,6 +95,11 @@ pub struct ContractInteraction {
     /// (`ContractNotPresent`), since it checks every call against the state before the transaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verifier_key: Option<String>,
+    /// The call's arguments and result, present only when the tooling disclosed them and they open
+    /// the call's communication commitment — the ledger's own binding of a proof to its inputs and
+    /// outputs. Without a disclosure a policy knows whom the call targets, not what it asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<CallArguments>,
     /// Per token, the total value the contract declares it takes in, from every party to the
     /// transaction together. The wallet sends this only when it is the contract's sole counterparty.
     pub sent_to: Vec<(String, String)>,
@@ -120,12 +134,43 @@ pub struct Payout {
     pub to_wallet: bool,
 }
 
+/// A call's disclosed arguments (`input`) and result (`output`), each flattened into the atoms the
+/// ledger lays them out as, in declaration order. A Compact `Uint<64>` is one 8-byte atom, a
+/// `Bytes<32>` one 32-byte atom, a struct its fields' atoms in order, and a `Maybe`/enum a 2-byte
+/// variant atom followed by that variant's atoms — the canonical vector a policy constrains.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CallArguments {
+    pub input: Vec<Atom>,
+    pub output: Vec<Atom>,
+}
+
+/// One atom of a disclosed value. Byte atoms carry their full declared width in `hex` (the ledger's
+/// little-endian bytes, zero-padded), and — up to 16 bytes — the same bytes read as an unsigned
+/// integer in `uint`, so a policy caps an amount by comparing a decimal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Atom {
+    Bytes {
+        length: u32,
+        hex: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uint: Option<String>,
+    },
+    /// A native field element, little-endian.
+    Field { hex: String },
+    /// A value the ledger represents by its hash.
+    Compress { hex: String },
+}
+
 /// What the wallet established about a transaction's calls beyond what the bytes say, before the
-/// policy pass: the verifier keys on chain.
+/// policy pass: the verifier keys on chain, and the arguments the tooling disclosed, each checked
+/// against the transaction.
 #[derive(Debug, Clone, Default)]
 pub struct CallFacts {
     /// Per contract and entry point, the hash of each verifier-key version its state holds.
     pub(crate) operation_keys: BTreeMap<(ContractAddress, EntryPointBuf), OperationKeys>,
+    /// Per call (its communication commitment), its verified arguments.
+    pub(crate) arguments: BTreeMap<Fr, CallArguments>,
 }
 
 /// The SHA-256 of an operation's verifier keys, one per proof system the ledger supports.
@@ -178,6 +223,7 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
                             keys.for_version(P::proof_version_to_operation_version(&call.proof))
                         })
                         .cloned(),
+                    arguments: facts.arguments.get(&call.communication_commitment).cloned(),
                 };
                 let guaranteed = call.guaranteed_transcript.as_ref();
                 let fallible = call.fallible_transcript.as_ref();
@@ -283,6 +329,7 @@ struct CallIdentity<'a> {
     call: String,
     caller: Option<String>,
     verifier_key: Option<String>,
+    arguments: Option<CallArguments>,
 }
 
 fn call_interaction<D: DB>(
@@ -299,6 +346,7 @@ fn call_interaction<D: DB>(
         call: Some(identity.call.clone()),
         caller: identity.caller.clone(),
         verifier_key: identity.verifier_key.clone(),
+        arguments: identity.arguments.clone(),
         sent_to: token_amounts(&effects.unshielded_inputs),
         received_from: token_amounts(&effects.unshielded_outputs),
         payouts: payouts(&effects.claimed_unshielded_spends, wallet),
@@ -318,6 +366,7 @@ fn non_call_interaction(
         call: None,
         caller: None,
         verifier_key: None,
+        arguments: None,
         sent_to: Vec::new(),
         received_from: Vec::new(),
         payouts: Vec::new(),
@@ -398,6 +447,70 @@ pub(crate) fn fr_hex(fr: &Fr) -> String {
     fr.serialize(&mut bytes)
         .expect("serializing a field element into memory cannot fail");
     hex::encode(bytes)
+}
+
+/// Flatten an aligned value into its atoms, in order, following the alignment: an option segment
+/// contributes its 2-byte variant atom, then the chosen variant's atoms. The value is already known to
+/// fit its alignment (an [`AlignedValue`] cannot be built otherwise).
+pub(crate) fn atoms(value: &AlignedValue) -> Vec<Atom> {
+    let mut out = Vec::new();
+    let mut rest: &[ValueAtom] = &value.value.0;
+    flatten(&value.alignment.0, &mut rest, &mut out);
+    out
+}
+
+fn flatten(segments: &[AlignmentSegment], rest: &mut &[ValueAtom], out: &mut Vec<Atom>) {
+    for segment in segments {
+        let Some((first, tail)) = rest.split_first() else {
+            return;
+        };
+        match segment {
+            AlignmentSegment::Atom(atom) => {
+                out.push(atom_of(*atom, first));
+                *rest = tail;
+            }
+            AlignmentSegment::Option(variants) => {
+                let variant = AlignmentAtom::Bytes { length: 2 };
+                out.push(atom_of(variant, first));
+                *rest = tail;
+                let index = first
+                    .0
+                    .iter()
+                    .rev()
+                    .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
+                if let Some(chosen) = variants.get(index) {
+                    flatten(&chosen.0, rest, out);
+                }
+            }
+        }
+    }
+}
+
+fn atom_of(alignment: AlignmentAtom, value: &ValueAtom) -> Atom {
+    match alignment {
+        AlignmentAtom::Bytes { length } => {
+            let mut bytes = value.0.clone();
+            bytes.resize(length as usize, 0);
+            let uint = (length <= 16).then(|| {
+                bytes
+                    .iter()
+                    .rev()
+                    .fold(0u128, |acc, b| (acc << 8) | u128::from(*b))
+                    .to_string()
+            });
+            Atom::Bytes {
+                length,
+                hex: hex::encode(&bytes),
+                uint,
+            }
+        }
+        AlignmentAtom::Field => Atom::Field {
+            hex: hex::encode(&value.0),
+        },
+        AlignmentAtom::Compress => Atom::Compress {
+            hex: hex::encode(&value.0),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -876,5 +989,52 @@ mod tests {
         );
         assert_eq!(out[0].caller, None, "a direct call has no caller");
         assert!(out[0].call.is_some());
+    }
+
+    #[test]
+    fn atoms_lay_out_a_value_in_declaration_order() {
+        use midnight_base_crypto::fab::{Alignment, Value};
+        let bytes = |length| AlignmentSegment::Atom(AlignmentAtom::Bytes { length });
+        // (amount: Uint<64> = 1000, recipient: Bytes<32>, memo: a two-variant option holding Uint<8> 7)
+        let value = AlignedValue::new(
+            Value(vec![
+                ValueAtom(vec![0xe8, 0x03]),
+                ValueAtom(vec![0xAB; 32]),
+                ValueAtom(vec![1]),
+                ValueAtom(vec![7]),
+            ]),
+            Alignment(vec![
+                bytes(8),
+                bytes(32),
+                AlignmentSegment::Option(vec![Alignment(vec![]), Alignment(vec![bytes(1)])]),
+            ]),
+        )
+        .expect("the value fits its alignment");
+
+        assert_eq!(
+            atoms(&value),
+            vec![
+                Atom::Bytes {
+                    length: 8,
+                    hex: "e803000000000000".into(),
+                    uint: Some("1000".into()),
+                },
+                Atom::Bytes {
+                    length: 32,
+                    hex: hex::encode([0xABu8; 32]),
+                    uint: None,
+                },
+                Atom::Bytes {
+                    length: 2,
+                    hex: "0100".into(),
+                    uint: Some("1".into()),
+                },
+                Atom::Bytes {
+                    length: 1,
+                    hex: "07".into(),
+                    uint: Some("7".into()),
+                },
+            ]
+        );
     }
 }

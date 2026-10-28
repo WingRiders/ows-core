@@ -49,7 +49,7 @@ use transient_crypto::proofs::Proof as ZswapProof;
 use ows_core::policy::TransactionEffect;
 use ows_core::sync_cache::SyncCacheScope;
 
-use crate::contracts::{contract_interactions, CallFacts, ContractInteraction};
+use crate::contracts::{contract_interactions, CallFacts, ContractInteraction, Disclosures};
 use crate::policy_context::{DustRegistrationContext, FeeContext};
 use crate::UnshieldedUtxo;
 
@@ -1002,10 +1002,10 @@ impl BalancedPlan {
         )
     }
 
-    /// The contract actions the transaction being balanced carries — who it talks to, and how much each
-    /// contract declares it takes in and pays out. The counterpart the wallet-relative
-    /// [effects](Self::segment_effects) deliberately omit; the wallet's own balancing adds no contract
-    /// action, so these are entirely the dapp's.
+    /// The contract actions the transaction being balanced carries — who it talks to, what it asks of
+    /// them, and how much each contract declares it takes in and pays out. The counterpart the
+    /// wallet-relative [effects](Self::segment_effects) deliberately omit; the wallet's own balancing
+    /// adds no contract action, so these are entirely the dapp's.
     pub(crate) fn contracts(&self, wallet: &UserAddress) -> Vec<ContractInteraction> {
         contract_interactions(self.base.actions(), wallet, &self.facts)
     }
@@ -1230,7 +1230,9 @@ fn scan_shielded_inflow<P: midnight_storage::Storable<InMemoryDB>>(
 }
 
 /// What the wallet establishes about the calls of a transaction it is asked to complete, for the
-/// policy pass: the verifier key each called contract holds on chain.
+/// policy pass: the arguments the tooling disclosed (each checked against the transaction — a
+/// disclosure that opens nothing is refused), and the verifier key each called contract holds on
+/// chain.
 pub(crate) fn establish_call_facts<P>(
     actions: impl Iterator<
         Item = (
@@ -1239,11 +1241,13 @@ pub(crate) fn establish_call_facts<P>(
         ),
     >,
     indexer_url: &str,
+    disclosures: &Disclosures,
 ) -> Result<CallFacts, std::io::Error>
 where
     P: ProofKind<InMemoryDB>,
 {
     let actions: Vec<_> = actions.collect();
+    let arguments = crate::contracts::verify_disclosures(actions.iter().cloned(), disclosures)?;
     let addresses: BTreeSet<_> = actions
         .iter()
         .filter_map(|(_, action)| match action {
@@ -1259,7 +1263,10 @@ where
             &addresses,
         ))?
     };
-    Ok(CallFacts { operation_keys })
+    Ok(CallFacts {
+        operation_keys,
+        arguments,
+    })
 }
 
 /// The wallet-relative effects authorizing a plan will have, grouped by the transaction segment they
@@ -1652,6 +1659,7 @@ fn plan_unsealed_proven_standard_tx(
     sender_addr: &str,
     tx_bytes: &[u8],
     pay_fees: bool,
+    disclosures: &Disclosures,
     scope: &SyncCacheScope,
 ) -> Result<BalancedPlan, std::io::Error> {
     let mut r: &[u8] = tx_bytes;
@@ -1671,7 +1679,7 @@ fn plan_unsealed_proven_standard_tx(
     }
 
     // What the policy pass will learn about the transaction's calls, established before anything else.
-    let facts = establish_call_facts(base.actions(), indexer_url)?;
+    let facts = establish_call_facts(base.actions(), indexer_url, disclosures)?;
 
     // Claim every surplus for the wallet, then plan a shielded deficit against the wallet's own shielded
     // coins together with the shielded claims — a no-op when ledger `balance()` has neither. Pure
@@ -2055,6 +2063,7 @@ pub fn plan_unsealed_proven_tx(
     crypto_provider: &MidnightCryptoProvider,
     tx_bytes: &[u8],
     pay_fees: bool,
+    disclosures: &Disclosures,
     vault_path: Option<&Path>,
 ) -> Result<BalancedPlan, std::io::Error> {
     let sender_addr = crypto_provider
@@ -2075,6 +2084,7 @@ pub fn plan_unsealed_proven_tx(
         &sender_addr,
         tx_bytes,
         pay_fees,
+        disclosures,
         &scope,
     )
 }
@@ -2451,6 +2461,7 @@ mod tests {
                 &sender,
                 &bytes,
                 false,
+                &Disclosures::default(),
                 &scope,
             )
             .err()

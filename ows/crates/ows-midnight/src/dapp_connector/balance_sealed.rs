@@ -28,7 +28,7 @@ use super::build::{DesiredOutput, TransferKind};
 use super::make_intent::{DesiredInput, MakeIntentRequest, OfferPlan};
 use super::swap_offer;
 use super::{classify_unsealed_payload, ConnectorPlan, UnsealedKind};
-use crate::contracts::CallFacts;
+use crate::contracts::{CallFacts, Disclosures};
 
 /// A fully sealed (`proof,pedersen-schnorr`) Midnight transaction — the form a maker offer arrives in.
 type TxSealed = Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
@@ -343,13 +343,14 @@ fn not_standard() -> std::io::Error {
 }
 
 /// What the wallet establishes about the maker's calls before the policy pass: the verifier keys on
-/// chain.
+/// chain. A maker's calls are proven by the maker, so the taker's tooling has nothing to disclose
+/// about them.
 fn maker_call_facts(maker_bytes: &[u8], indexer_url: &str) -> Result<CallFacts, std::io::Error> {
     let tx = parse_maker(maker_bytes)?;
     let Transaction::Standard(base) = &tx else {
         return Err(not_standard());
     };
-    crate::balance_tx::establish_call_facts(base.actions(), indexer_url)
+    crate::balance_tx::establish_call_facts(base.actions(), indexer_url, &Disclosures::default())
 }
 
 /// A sealed-maker merge decided before the policy seam: the maker's sealed bytes, the taker's
