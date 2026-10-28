@@ -353,9 +353,7 @@ fn maker_call_facts(
         return Err(not_standard());
     };
     crate::balance_tx::establish_call_facts(
-        base.actions(),
-        base.guaranteed_coins.as_deref(),
-        &base.fallible_coins,
+        base,
         crypto_provider,
         indexer_url,
         &Disclosures::default(),

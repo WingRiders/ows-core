@@ -36,7 +36,7 @@ mod real_calls;
 
 pub(crate) use disclosure::verify_disclosures;
 pub use disclosure::Disclosures;
-pub(crate) use onchain::fetch_operation_keys;
+pub(crate) use onchain::{fetch_operations, operation_keys, verify_call_proofs};
 
 /// The guaranteed section, executed before every fallible one. A call's guaranteed transcript runs
 /// here whichever intent carried it; only its fallible transcript runs in that intent's own segment.
@@ -1182,8 +1182,9 @@ mod tests {
                 .unwrap(),
         ));
         let state = include_str!("../testdata/acc_state_stagenet.hex").trim();
+        let operations = onchain::contract_operations(contract, state).unwrap();
         let facts = CallFacts {
-            operation_keys: onchain::operation_keys(contract, state).unwrap(),
+            operation_keys: onchain::operation_keys(&operations).unwrap(),
             ..Default::default()
         };
         let deposit =
@@ -1205,6 +1206,76 @@ mod tests {
         );
         assert_eq!(out[0].caller, None, "a direct call has no caller");
         assert!(out[0].call.is_some());
+    }
+
+    /// The real stagenet ACC call and its contract's on-chain state, as the two fixtures above hold them.
+    fn real_acc_call() -> (
+        midnight_ledger::structure::StandardTransaction<
+            midnight_ledger::structure::Signature,
+            midnight_ledger::structure::ProofMarker,
+            transient_crypto::commitment::PureGeneratorPedersen,
+            InMemoryDB,
+        >,
+        BTreeMap<(ContractAddress, EntryPointBuf), onchain_runtime::state::ContractOperation>,
+    ) {
+        use midnight_ledger::structure::Transaction;
+        use midnight_serialize::tagged_deserialize;
+
+        let contract = ContractAddress(HashOutput(
+            hex::decode("f973e22e0a15c1c4ef9dd5d6d6c87f6c60728b6277e09421de8f780644477421")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ));
+        let state = include_str!("../testdata/acc_state_stagenet.hex").trim();
+        let operations = onchain::contract_operations(contract, state).unwrap();
+        let hex_str = include_str!("../testdata/contract_call_stagenet.hex").trim();
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+        let Transaction::Standard(base) = tagged_deserialize(&mut &bytes[..]).unwrap() else {
+            panic!("the fixture is a Standard transaction");
+        };
+        (base, operations)
+    }
+
+    #[test]
+    fn a_real_calls_proof_verifies_against_the_key_its_contract_holds_on_chain() {
+        let (base, operations) = real_acc_call();
+        onchain::verify_call_proofs(&base, &operations).unwrap();
+    }
+
+    /// What OWS does when the contract replaced its key between the proof and the read: the proof does
+    /// not verify against the key the policy would pin, so the wallet refuses before signing.
+    #[test]
+    fn a_real_calls_proof_against_a_key_its_contract_does_not_hold_is_refused() {
+        let (base, mut operations) = real_acc_call();
+        let deposit = operations
+            .keys()
+            .find(|(_, entry_point)| entry_point.0 == b"deposit_unshielded")
+            .unwrap()
+            .clone();
+        let other = operations
+            .iter()
+            .find(|(id, operation)| **id != deposit && operation.v2.is_some())
+            .map(|(_, operation)| operation.clone())
+            .expect("the account contract has another ZKIR v2 operation");
+        operations.insert(deposit, other);
+
+        let e = onchain::verify_call_proofs(&base, &operations).unwrap_err();
+        assert!(
+            e.to_string().contains(
+                "the proof of the call to deposit_unshielded on contract \
+                 f973e22e0a15c1c4ef9dd5d6d6c87f6c60728b6277e09421de8f780644477421 does not verify"
+            ),
+            "{e}"
+        );
+    }
+
+    /// A call to a contract with no on-chain state has no key to check against, so the check leaves it to
+    /// the ledger, which refuses it (`ContractNotPresent`).
+    #[test]
+    fn a_call_to_a_contract_without_on_chain_state_is_left_to_the_ledger() {
+        let (base, _) = real_acc_call();
+        onchain::verify_call_proofs(&base, &BTreeMap::new()).unwrap();
     }
 
     #[test]

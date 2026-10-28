@@ -1265,32 +1265,28 @@ fn scan_shielded_inflow<P: midnight_storage::Storable<InMemoryDB>>(
 /// What the wallet establishes about the calls of a transaction it is asked to complete, for the
 /// policy pass: the arguments and coins the tooling disclosed (each checked against the transaction —
 /// a disclosure that opens nothing is refused), the coins the transaction pays the wallet itself
-/// (decrypted), and the verifier key each called contract holds on chain.
-pub(crate) fn establish_call_facts<P, Q>(
-    actions: impl Iterator<
-        Item = (
-            u16,
-            midnight_ledger::structure::ContractAction<P, InMemoryDB>,
-        ),
-    >,
-    guaranteed: Option<&ZswapOffer<Q, InMemoryDB>>,
-    fallible: &MnHashMap<u16, ZswapOffer<Q, InMemoryDB>, InMemoryDB>,
+/// (decrypted), and the verifier key each called contract holds on chain — refusing a call whose
+/// proof does not verify against that key, since the policy would be judging a key the transaction
+/// could only land under after the contract replaced it.
+pub(crate) fn establish_call_facts<S, B>(
+    tx: &StandardTransaction<S, ProofMarker, B, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     indexer_url: &str,
     disclosures: &Disclosures,
 ) -> Result<CallFacts, std::io::Error>
 where
-    P: ProofKind<InMemoryDB>,
-    Q: midnight_storage::Storable<InMemoryDB>,
+    S: midnight_ledger::structure::SignatureKind<InMemoryDB>,
+    B: midnight_storage::Storable<InMemoryDB>
+        + midnight_ledger::structure::PedersenDowngradeable<InMemoryDB>,
 {
-    let actions: Vec<_> = actions.collect();
+    let actions: Vec<_> = tx.actions().collect();
     let (arguments, mut coins) =
         crate::contracts::verify_disclosures(actions.iter().cloned(), disclosures)?;
     let mut paid_to_wallet = Vec::new();
-    if let Some(offer) = guaranteed {
+    if let Some(offer) = tx.guaranteed_coins.as_deref() {
         paid_to_wallet.extend(crypto_provider.recognize_shielded_coins(offer));
     }
-    for pair in fallible.iter() {
+    for pair in tx.fallible_coins.iter() {
         paid_to_wallet.extend(crypto_provider.recognize_shielded_coins(pair.deref().1.deref()));
     }
     for (commitment, token, value) in paid_to_wallet {
@@ -1303,16 +1299,14 @@ where
             _ => None,
         })
         .collect();
-    let operation_keys = if addresses.is_empty() {
+    let operations = if addresses.is_empty() {
         BTreeMap::new()
     } else {
-        crate::block_on(crate::contracts::fetch_operation_keys(
-            indexer_url,
-            &addresses,
-        ))?
+        crate::block_on(crate::contracts::fetch_operations(indexer_url, &addresses))?
     };
+    crate::contracts::verify_call_proofs(tx, &operations)?;
     Ok(CallFacts {
-        operation_keys,
+        operation_keys: crate::contracts::operation_keys(&operations)?,
         arguments,
         coins,
     })
@@ -1763,14 +1757,7 @@ fn plan_unsealed_proven_standard_tx(
     }
 
     // What the policy pass will learn about the transaction's calls, established before anything else.
-    let facts = establish_call_facts(
-        base.actions(),
-        base.guaranteed_coins.as_deref(),
-        &base.fallible_coins,
-        crypto_provider,
-        indexer_url,
-        disclosures,
-    )?;
+    let facts = establish_call_facts(&base, crypto_provider, indexer_url, disclosures)?;
 
     // A transaction with nothing to fund or claim, whose fees someone else pays, needs nothing from the
     // wallet: pass it through as the dapp proved it — no inputs, no change, no signature.
