@@ -124,9 +124,12 @@ fn append_balance_overspend_hint(msg: &mut String) {
         || msg.contains("BalanceCheckOverspend")
     {
         msg.push_str(&format!(
-            "\n\nLedger error {LEDGER_BALANCE_CHECK_OVERSPEND} (BalanceCheckOverspend): the tx is \
-             cryptographically valid but not ledger-balanced. Swap-style makeIntent offers must be \
-             completed via balanceSealedTransaction before submit."
+            "\n\nLedger error {LEDGER_BALANCE_CHECK_OVERSPEND} (BalanceCheckOverspend): a segment \
+             spends more than it takes in once the node charges the DUST fee. OWS checks the value \
+             balance before it submits, so for a transaction it balanced this is the fee: the DUST \
+             section paid less than the fee the node charged at admission (fees are re-priced \
+             every block) — build and send it again. A swap-style makeIntent offer is imbalanced \
+             by design and must be completed via balanceSealedTransaction instead."
         ));
     }
 }
