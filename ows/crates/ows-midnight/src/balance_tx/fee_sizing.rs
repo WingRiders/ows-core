@@ -186,31 +186,84 @@ fn sync_spendable_dust_state(
     ))
 }
 
-/// Re-read the chain tip once the dust state is synced.
+/// Re-read the chain tip once the dust state is synced, and pick the `ctime` a DUST spend from that
+/// state must carry.
 ///
 /// The sync replays every ledger event the wallet has not seen — a handful when its snapshot is warm,
 /// tens of thousands on a cold cache — and the node re-prices fees *every block* while it runs. The tip
 /// handed to the sizing call was read before that replay, so pricing against it spends the whole drift
 /// margin before sizing even begins. The same staleness bounds a dust spend: its `ctime` has to land
 /// inside the ledger's validity window (`OutOfDustValidityWindow`), which a long replay can walk out of.
+/// So the fee and the intent TTL derive from the fresher tip — leaving only proving and submission
+/// between pricing and inclusion, which is what [`FEE_BLOCKS_MARGIN`] is sized for.
 ///
-/// So the tip is re-read here, and the fee, the dust ctime and the intent TTL all derive from the
-/// fresher one — leaving only proving and submission between pricing and inclusion, which is what
-/// [`FEE_BLOCKS_MARGIN`] is sized for.
+/// The `ctime` is held to the synced state: see [`aligned_dust_ctime`].
 fn reprice_after_sync(
     indexer_url: &str,
-    priced_at: Timestamp,
+    priced_at: Option<Timestamp>,
+    dust_state: &DustLocalState<InMemoryDB>,
 ) -> Result<(LedgerParameters, Timestamp), std::io::Error> {
-    let (params, tip_secs) = crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
-    let fresh = Timestamp::from_secs(tip_secs);
+    let tip = crate::block_on(crate::ledger_params::fetch_indexer_tip_with_dust_roots(
+        indexer_url,
+    ))?;
     // How far the chain ran while we synced is the whole reason this call exists, so say it: a warm
     // sync moves the tip by seconds, a cold one by hours, and the second case is unreadable from a
     // fee number alone.
-    let drift = tip_secs.saturating_sub(priced_at.to_secs());
+    let drift = priced_at.map_or(0, |t| tip.timestamp_secs.saturating_sub(t.to_secs()));
     if drift > 0 {
         eprintln!("[ows-midnight] dust sync advanced the tip by {drift}s; re-pricing the DUST fee");
     }
-    Ok((params, fresh))
+    let ctime = aligned_dust_ctime(dust_state, tip.timestamp_secs, tip.dust_roots.as_ref());
+    let grace = tip.ledger_parameters.dust.dust_grace_period;
+    if Timestamp::from_secs(tip.timestamp_secs) - ctime > grace {
+        return Err(err(format!(
+            "the synced DUST state ends at {}s, more than the {}s the node accepts behind the tip \
+             ({}s); sync again",
+            ctime.to_secs(),
+            grace.as_seconds(),
+            tip.timestamp_secs
+        )));
+    }
+    Ok((tip.ledger_parameters, ctime))
+}
+
+/// The `ctime` a DUST spend proved from `dust_state` must carry. The proof carries the state's two dust
+/// Merkle roots, and the node checks it against the roots it recorded for the last block at or before
+/// `ctime`. The state and the tip come from two reads of the indexer, so a block that changed the dust
+/// trees between them leaves them disagreeing, and a `ctime` taken from the tip then makes the node
+/// refuse the spend (ledger error 170, `InvalidDustSpendProof`) — intermittently, since only blocks that
+/// change the dust trees matter, and a resend re-syncs and re-reads both. So the tip's time is used only
+/// when the tip's roots are the state's (the chain has not changed the dust trees since the sync);
+/// otherwise the state's own `sync_time`, the time of the last block it folded, whose roots it carries
+/// by construction.
+pub(super) fn aligned_dust_ctime(
+    dust_state: &DustLocalState<InMemoryDB>,
+    tip_secs: u64,
+    tip_roots: Option<&crate::ledger_params::DustRoots>,
+) -> Timestamp {
+    let tip = Timestamp::from_secs(tip_secs);
+    match (tip_roots, local_dust_roots(dust_state)) {
+        (Some(tip_roots), Some(local)) if *tip_roots == local => tip.max(dust_state.sync_time),
+        _ => dust_state.sync_time,
+    }
+}
+
+/// The synced state's dust roots, serialized as the indexer reports them; `None` before the trees are
+/// hashed.
+fn local_dust_roots(
+    dust_state: &DustLocalState<InMemoryDB>,
+) -> Option<crate::ledger_params::DustRoots> {
+    use midnight_serialize::Serializable as _;
+    let hex_of = |root: Option<_>| {
+        let root: transient_crypto::merkle_tree::MerkleTreeDigest = root?;
+        let mut bytes = Vec::new();
+        root.serialize(&mut bytes).ok()?;
+        Some(hex::encode(bytes))
+    };
+    Some(crate::ledger_params::DustRoots {
+        commitment: hex_of(dust_state.commitment_tree.root())?,
+        generation: hex_of(dust_state.generating_tree.root())?,
+    })
 }
 
 /// The transaction context a DUST fee section is sized against: the proven standard tx and its
@@ -485,7 +538,11 @@ pub(super) fn size_dust_fee(
             // The sync just moved the chain on; re-price against where it actually is now. The loop
             // is self-correcting from here — a fee target the fresher params outgrow simply fails the
             // coverage check below and is raised on the next attempt.
-            let (fresh_params, fresh_ctime) = reprice_after_sync(ctx.indexer_url, dust_ctime)?;
+            let (fresh_params, fresh_ctime) = reprice_after_sync(
+                ctx.indexer_url,
+                Some(dust_ctime),
+                dust_state.as_ref().expect("dust state synced above"),
+            )?;
             params = fresh_params;
             dust_ctime = fresh_ctime;
             intent_ttl = chain_aligned_intent_ttl(dust_ctime);
@@ -720,8 +777,6 @@ pub(crate) fn size_merge_dust_fee(
     dust_seg: u16,
     binding_commitment: PedersenRandomness,
     crypto_provider: &MidnightCryptoProvider,
-    dust_ctime: Timestamp,
-    ledger_params: &LedgerParameters,
     indexer_url: &str,
     scope: &SyncCacheScope,
 ) -> Result<MergeDustFee, std::io::Error> {
@@ -731,11 +786,8 @@ pub(crate) fn size_merge_dust_fee(
     // it once up front — then re-price, since the sync moved the chain on (see `reprice_after_sync`).
     // Doing this before the first estimate keeps every number below on the same, fresher tip.
     let dust_state = sync_spendable_dust_state(indexer_url, crypto_provider, scope)?;
-    let (ledger_params, dust_ctime) = match reprice_after_sync(indexer_url, dust_ctime) {
-        Ok(fresh) => fresh,
-        // A re-price failure is not worth losing the sync over: fall back to the tip the caller read.
-        Err(_) => (ledger_params.clone(), dust_ctime),
-    };
+    // No fallback to the tip the caller read: that `ctime` would not match the synced state's roots.
+    let (ledger_params, dust_ctime) = reprice_after_sync(indexer_url, None, &dust_state)?;
     let intent_ttl = chain_aligned_intent_ttl(dust_ctime);
 
     // First estimate: the merged fee with no DUST section yet.
@@ -986,6 +1038,69 @@ mod tests {
             dust_spend_v_fee(7),
         ];
         assert_eq!(sum_dust_v_fee(spends.iter()), 3_507);
+    }
+
+    /// A synced dust state at `sync_time`, and the indexer's report of a tip whose dust roots are the
+    /// state's (`same`) or not.
+    fn synced_at(sync_time: u64) -> DustLocalState<InMemoryDB> {
+        let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
+        state.sync_time = Timestamp::from_secs(sync_time);
+        state
+    }
+
+    fn tip_roots(
+        state: &DustLocalState<InMemoryDB>,
+        same: bool,
+    ) -> crate::ledger_params::DustRoots {
+        let mut roots = local_dust_roots(state).expect("a blank tree is hashed");
+        if !same {
+            // A block after the sync added a dust commitment: the commitment tree's root moved.
+            roots.commitment = format!("73{}", "ab".repeat(32));
+        }
+        roots
+    }
+
+    /// The node checks a DUST spend proof against the dust roots of the last block at or before its
+    /// `ctime`, and the proof carries the synced state's roots. When no block has changed the dust trees
+    /// since the sync, the tip's roots are the state's and the tip's time is safe to use.
+    #[test]
+    fn a_spend_takes_the_tips_time_when_the_tip_has_the_synced_roots() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, true);
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, Some(&tip)),
+            Timestamp::from_secs(1_060)
+        );
+    }
+
+    /// A block that changed the dust trees landed between the sync and the tip read: a `ctime` at the
+    /// tip would check the proof against roots it was not built from (ledger error 170). The state's
+    /// own sync time names the block whose roots it carries.
+    #[test]
+    fn a_spend_takes_the_synced_states_time_when_the_tip_moved_the_dust_trees() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, false);
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, Some(&tip)),
+            Timestamp::from_secs(1_000)
+        );
+        // An indexer that does not report the roots cannot vouch for the tip either.
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, None),
+            Timestamp::from_secs(1_000)
+        );
+    }
+
+    /// The tip read can also lag the sync (a stale replica): never step back behind the block the
+    /// state was synced to.
+    #[test]
+    fn a_lagging_tip_never_moves_the_spend_behind_the_synced_state() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, true);
+        assert_eq!(
+            aligned_dust_ctime(&state, 994, Some(&tip)),
+            Timestamp::from_secs(1_000)
+        );
     }
 
     /// The live-run trigger for the proof-bearing fallback: a fully dust-registered wallet has no

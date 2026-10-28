@@ -582,8 +582,6 @@ fn plan_taker_half(
         &taker,
         complement.intent_segment,
         indexer_url,
-        &ledger_params,
-        tip,
         vault_path,
     )
     .map_err(|e| {
@@ -641,8 +639,6 @@ fn spend_fee(
     taker: &OfferPlan,
     taker_seg: u16,
     indexer_url: &str,
-    ledger_params: &midnight_ledger::structure::LedgerParameters,
-    tip: Timestamp,
     vault_path: Option<&Path>,
 ) -> Result<crate::balance_tx::MergeDustFee, std::io::Error> {
     let taker_base = taker.mock_proven(crypto_provider)?;
@@ -659,8 +655,6 @@ fn spend_fee(
         taker_seg,
         binding_commitment,
         crypto_provider,
-        tip,
-        ledger_params,
         indexer_url,
         &scope,
     )
@@ -1264,6 +1258,7 @@ mod tests {
         use super::*;
         use midnight_base_crypto::hash::HashOutput;
         use midnight_base_crypto::signatures::SigningKey;
+        use midnight_base_crypto::time::Timestamp;
         use midnight_coin_structure::coin::{
             Commitment, ShieldedTokenType, UnshieldedTokenType, UserAddress, NIGHT,
         };
