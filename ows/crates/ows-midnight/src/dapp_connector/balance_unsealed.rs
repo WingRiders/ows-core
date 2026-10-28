@@ -61,8 +61,9 @@ fn default_pay_fees() -> bool {
     true
 }
 
+/// The spec's options bag. Any other key is refused rather than ignored.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PayFeesOptions {
     #[serde(default = "default_pay_fees")]
     pay_fees: bool,
@@ -143,6 +144,14 @@ mod tests {
             parse_balance_unsealed_json(r#"{"tx":"0x00","options":{"payFees":false}}"#).unwrap();
         assert_eq!(req.tx_bytes, vec![0x00]);
         assert!(!req.pay_fees);
+    }
+
+    #[test]
+    fn rejects_an_unknown_option() {
+        let err = parse_balance_unsealed_json(r#"{"tx":"0x00","options":{"payfees":false}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
