@@ -3619,6 +3619,7 @@ version = "1.4.3"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",
+ "bytes",
  "futures-util",
  "hex",
  "jsonrpsee",
@@ -3643,6 +3644,7 @@ dependencies = [
  "subxt",
  "tokio",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]
