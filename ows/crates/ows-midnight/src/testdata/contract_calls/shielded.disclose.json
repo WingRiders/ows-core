@@ -1,0 +1,50 @@
+{
+  "calls": [
+    {
+      "address": "da2df721bfc0a39b463240c3fb4d6665d79ef380f3bf71bf2e3b02d9e9addf3b",
+      "entryPoint": "deposit_shielded",
+      "input": {
+        "value": [
+          "986e0a79e023628963706290fdb4ee689d6117b9dc56e4f72dda1d5a21be693b",
+          "1ff34b30e33b5a3e69037149ba1c787bed7dfd25274594e1ec8b391ff29fac93",
+          "e803"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 32
+            }
+          },
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 32
+            }
+          },
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 16
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [],
+        "alignment": []
+      },
+      "communicationCommitmentRand": "734ef815fe60b721930ad93f5af164d0eaf200a0be957f8feb1f90397046dfb04a"
+    }
+  ],
+  "coins": [
+    {
+      "nonce": "986e0a79e023628963706290fdb4ee689d6117b9dc56e4f72dda1d5a21be693b",
+      "color": "1ff34b30e33b5a3e69037149ba1c787bed7dfd25274594e1ec8b391ff29fac93",
+      "value": "1000"
+    }
+  ]
+}

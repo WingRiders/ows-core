@@ -343,14 +343,25 @@ fn not_standard() -> std::io::Error {
 }
 
 /// What the wallet establishes about the maker's calls before the policy pass: the verifier keys on
-/// chain. A maker's calls are proven by the maker, so the taker's tooling has nothing to disclose
-/// about them.
-fn maker_call_facts(maker_bytes: &[u8], indexer_url: &str) -> Result<CallFacts, std::io::Error> {
+/// chain and any coin they pay the wallet. A maker's calls are proven by the maker, so the taker's
+/// tooling has nothing to disclose about them.
+fn maker_call_facts(
+    maker_bytes: &[u8],
+    crypto_provider: &MidnightCryptoProvider,
+    indexer_url: &str,
+) -> Result<CallFacts, std::io::Error> {
     let tx = parse_maker(maker_bytes)?;
     let Transaction::Standard(base) = &tx else {
         return Err(not_standard());
     };
-    crate::balance_tx::establish_call_facts(base.actions(), indexer_url, &Disclosures::default())
+    crate::balance_tx::establish_call_facts(
+        base.actions(),
+        base.guaranteed_coins.as_deref(),
+        &base.fallible_coins,
+        crypto_provider,
+        indexer_url,
+        &Disclosures::default(),
+    )
 }
 
 /// A sealed-maker merge decided before the policy seam: the maker's sealed bytes, the taker's
@@ -456,7 +467,7 @@ fn plan_merge(
     vault_path: Option<&Path>,
 ) -> Result<MergePlan, std::io::Error> {
     let indexer_url = crate::wallet::resolve_indexer_url(chain_id, vault_path)?;
-    let facts = maker_call_facts(&maker_tx, &indexer_url)?;
+    let facts = maker_call_facts(&maker_tx, crypto_provider, &indexer_url)?;
     let (taker, fee) = plan_taker_half(
         chain_id,
         crypto_provider,

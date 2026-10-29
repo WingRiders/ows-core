@@ -1230,24 +1230,39 @@ fn scan_shielded_inflow<P: midnight_storage::Storable<InMemoryDB>>(
 }
 
 /// What the wallet establishes about the calls of a transaction it is asked to complete, for the
-/// policy pass: the arguments the tooling disclosed (each checked against the transaction — a
-/// disclosure that opens nothing is refused), and the verifier key each called contract holds on
-/// chain.
-pub(crate) fn establish_call_facts<P>(
+/// policy pass: the arguments and coins the tooling disclosed (each checked against the transaction —
+/// a disclosure that opens nothing is refused), the coins the transaction pays the wallet itself
+/// (decrypted), and the verifier key each called contract holds on chain.
+pub(crate) fn establish_call_facts<P, Q>(
     actions: impl Iterator<
         Item = (
             u16,
             midnight_ledger::structure::ContractAction<P, InMemoryDB>,
         ),
     >,
+    guaranteed: Option<&ZswapOffer<Q, InMemoryDB>>,
+    fallible: &MnHashMap<u16, ZswapOffer<Q, InMemoryDB>, InMemoryDB>,
+    crypto_provider: &MidnightCryptoProvider,
     indexer_url: &str,
     disclosures: &Disclosures,
 ) -> Result<CallFacts, std::io::Error>
 where
     P: ProofKind<InMemoryDB>,
+    Q: midnight_storage::Storable<InMemoryDB>,
 {
     let actions: Vec<_> = actions.collect();
-    let arguments = crate::contracts::verify_disclosures(actions.iter().cloned(), disclosures)?;
+    let (arguments, mut coins) =
+        crate::contracts::verify_disclosures(actions.iter().cloned(), disclosures)?;
+    let mut paid_to_wallet = Vec::new();
+    if let Some(offer) = guaranteed {
+        paid_to_wallet.extend(crypto_provider.recognize_shielded_coins(offer));
+    }
+    for pair in fallible.iter() {
+        paid_to_wallet.extend(crypto_provider.recognize_shielded_coins(pair.deref().1.deref()));
+    }
+    for (commitment, token, value) in paid_to_wallet {
+        coins.insert(commitment, (token, value));
+    }
     let addresses: BTreeSet<_> = actions
         .iter()
         .filter_map(|(_, action)| match action {
@@ -1266,6 +1281,7 @@ where
     Ok(CallFacts {
         operation_keys,
         arguments,
+        coins,
     })
 }
 
@@ -1679,7 +1695,14 @@ fn plan_unsealed_proven_standard_tx(
     }
 
     // What the policy pass will learn about the transaction's calls, established before anything else.
-    let facts = establish_call_facts(base.actions(), indexer_url, disclosures)?;
+    let facts = establish_call_facts(
+        base.actions(),
+        base.guaranteed_coins.as_deref(),
+        &base.fallible_coins,
+        crypto_provider,
+        indexer_url,
+        disclosures,
+    )?;
 
     // Claim every surplus for the wallet, then plan a shielded deficit against the wallet's own shielded
     // coins together with the shielded claims — a no-op when ledger `balance()` has neither. Pure

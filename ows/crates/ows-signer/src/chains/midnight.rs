@@ -2,7 +2,9 @@ use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
 use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
 use midnight_base_crypto::time::Timestamp;
-use midnight_coin_structure::coin::{Info as CoinInfo, QualifiedInfo, ShieldedTokenType};
+use midnight_coin_structure::coin::{
+    Commitment as CoinCommitment, Info as CoinInfo, QualifiedInfo, ShieldedTokenType,
+};
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{
     DustActions, DustLocalState, DustOutput, DustPublicKey, DustRegistration, DustSecretKey,
@@ -660,6 +662,18 @@ impl MidnightCryptoProvider {
         &self,
         offer: &ZswapOffer<P, InMemoryDB>,
     ) -> Vec<(ShieldedTokenType, u128)> {
+        self.recognize_shielded_coins(offer)
+            .into_iter()
+            .map(|(_, token, value)| (token, value))
+            .collect()
+    }
+
+    /// The same receipts as [`Self::recognize_shielded_inflow`], each with the commitment it is
+    /// recognized by — so a coin a contract pays the wallet can be matched to the contract's claim.
+    pub fn recognize_shielded_coins<P: midnight_storage::Storable<InMemoryDB>>(
+        &self,
+        offer: &ZswapOffer<P, InMemoryDB>,
+    ) -> Vec<(CoinCommitment, ShieldedTokenType, u128)> {
         offer
             .outputs
             .iter_deref()
@@ -669,7 +683,8 @@ impl MidnightCryptoProvider {
                     .as_ref()
                     .and_then(|ciph| self.shielded_keys.try_decrypt(ciph))?;
                 let recipient = transfer::Recipient::User(self.shielded_keys.coin_public_key());
-                (ci.commitment(&recipient) == o.coin_com).then_some((ci.type_, ci.value))
+                (ci.commitment(&recipient) == o.coin_com)
+                    .then_some((o.coin_com, ci.type_, ci.value))
             })
             .collect()
     }

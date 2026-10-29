@@ -15,14 +15,16 @@ use std::collections::BTreeMap;
 
 use midnight_base_crypto::fab::{AlignedValue, AlignmentAtom, AlignmentSegment, ValueAtom};
 use midnight_base_crypto::hash::HashOutput;
-use midnight_coin_structure::coin::{PublicAddress, TokenType as LedgerTokenType, UserAddress};
+use midnight_coin_structure::coin::{
+    Commitment, PublicAddress, ShieldedTokenType, TokenType as LedgerTokenType, UserAddress,
+};
 use midnight_coin_structure::contract::ContractAddress;
 use midnight_ledger::structure::{
     ContractAction, ContractCall, ContractOperationVersion, ProofKind,
 };
 use midnight_serialize::Serializable as _;
 use midnight_storage::db::DB;
-use midnight_storage::storage::HashMap as MnHashMap;
+use midnight_storage::storage::{HashMap as MnHashMap, HashSet as MnHashSet};
 use onchain_runtime::context::{ClaimedUnshieldedSpendsKey, Effects};
 use onchain_runtime::state::EntryPointBuf;
 use transient_crypto::curve::Fr;
@@ -66,8 +68,10 @@ pub enum ContractActionKind {
 /// The amounts are the ones the **contract's transcript declares**, not proven wallet movement: they
 /// equal what the wallet sends and receives only when the wallet is the contract's sole counterparty
 /// in that segment (the normal shape for a single wallet-funded call), and they are only as
-/// trustworthy as the transcript is — meaningful for a proven or sealed transaction. For what the
-/// wallet itself moves, read the effects.
+/// trustworthy as the transcript is — meaningful for a proven or sealed transaction. Value moving
+/// between two contracts of the same tree shows on both records: the payer's `payouts` name the payee
+/// contract, the payee's `sent_to` takes it in. For what the wallet itself moves, read the effects —
+/// they count every movement of the wallet's value exactly once.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContractInteraction {
     pub segment: u16,
@@ -108,6 +112,12 @@ pub struct ContractInteraction {
     pub received_from: Vec<(String, String)>,
     /// The unshielded payouts the call declares, one per token and recipient.
     pub payouts: Vec<Payout>,
+    /// Per token, the unshielded value the contract mints (its own token type).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub minted: Vec<(String, String)>,
+    /// The shielded coins the contract takes in, pays out, spends and mints.
+    #[serde(skip_serializing_if = "ShieldedFlows::is_empty")]
+    pub shielded: ShieldedFlows,
 }
 
 /// Who a contract's declared unshielded payout goes to.
@@ -162,15 +172,60 @@ pub enum Atom {
     Compress { hex: String },
 }
 
+/// A call's shielded movement. A shielded coin's value is hidden in its commitment, so each coin is
+/// named by its commitment and carries its token and value only when the wallet can open it: a coin
+/// the tooling disclosed (checked against the commitment) or one paid to the wallet itself (which it
+/// decrypts).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ShieldedFlows {
+    /// Coins the contract receives — what its counterparties send it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sent_to: Vec<ShieldedCoin>,
+    /// Coins the contract creates for someone — what its counterparties receive from it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub received_from: Vec<ShieldedCoin>,
+    /// How many of its own coins the contract spends.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spends: usize,
+    /// Per token, the shielded value the contract mints (its own token type).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub minted: Vec<(String, String)>,
+}
+
+impl ShieldedFlows {
+    fn is_empty(&self) -> bool {
+        self.sent_to.is_empty()
+            && self.received_from.is_empty()
+            && self.spends == 0
+            && self.minted.is_empty()
+    }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// One shielded coin a call claims, by commitment; `token` and `value` when the wallet opened it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShieldedCoin {
+    pub commitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
 /// What the wallet established about a transaction's calls beyond what the bytes say, before the
-/// policy pass: the verifier keys on chain, and the arguments the tooling disclosed, each checked
-/// against the transaction.
+/// policy pass: the verifier keys on chain, and the arguments and coins the tooling disclosed (each
+/// checked against the transaction) or the wallet decrypted.
 #[derive(Debug, Clone, Default)]
 pub struct CallFacts {
     /// Per contract and entry point, the hash of each verifier-key version its state holds.
     pub(crate) operation_keys: BTreeMap<(ContractAddress, EntryPointBuf), OperationKeys>,
     /// Per call (its communication commitment), its verified arguments.
     pub(crate) arguments: BTreeMap<Fr, CallArguments>,
+    /// Per coin commitment, the coin's token type and value.
+    pub(crate) coins: BTreeMap<Commitment, (ShieldedTokenType, u128)>,
 }
 
 /// The SHA-256 of an operation's verifier keys, one per proof system the ledger supports.
@@ -233,6 +288,7 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
                         &identity,
                         &transcript.effects,
                         wallet,
+                        facts,
                     ));
                 }
                 if let Some(transcript) = fallible {
@@ -241,6 +297,7 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
                         &identity,
                         &transcript.effects,
                         wallet,
+                        facts,
                     ));
                 }
                 if guaranteed.is_none() && fallible.is_none() {
@@ -251,6 +308,7 @@ pub(crate) fn contract_interactions<P: ProofKind<D>, D: DB>(
                         &identity,
                         &Effects::<D>::default(),
                         wallet,
+                        facts,
                     ));
                 }
             }
@@ -337,11 +395,13 @@ fn call_interaction<D: DB>(
     identity: &CallIdentity<'_>,
     effects: &Effects<D>,
     wallet: &UserAddress,
+    facts: &CallFacts,
 ) -> ContractInteraction {
+    let address = identity.address;
     ContractInteraction {
         segment,
         kind: ContractActionKind::Call,
-        address: hex::encode(identity.address.0 .0),
+        address: hex::encode(address.0 .0),
         entry_point: Some(identity.entry_point.clone()),
         call: Some(identity.call.clone()),
         caller: identity.caller.clone(),
@@ -350,6 +410,17 @@ fn call_interaction<D: DB>(
         sent_to: token_amounts(&effects.unshielded_inputs),
         received_from: token_amounts(&effects.unshielded_outputs),
         payouts: payouts(&effects.claimed_unshielded_spends, wallet),
+        minted: minted(&effects.unshielded_mints, |domain| {
+            address.custom_unshielded_token_type(domain).0 .0
+        }),
+        shielded: ShieldedFlows {
+            sent_to: shielded_coins(&effects.claimed_shielded_receives, facts),
+            received_from: shielded_coins(&effects.claimed_shielded_spends, facts),
+            spends: effects.claimed_nullifiers.iter().count(),
+            minted: minted(&effects.shielded_mints, |domain| {
+                address.custom_shielded_token_type(domain).0 .0
+            }),
+        },
     }
 }
 
@@ -370,6 +441,8 @@ fn non_call_interaction(
         sent_to: Vec::new(),
         received_from: Vec::new(),
         payouts: Vec::new(),
+        minted: Vec::new(),
+        shielded: ShieldedFlows::default(),
     }
 }
 
@@ -413,11 +486,49 @@ fn token_amounts<D: DB>(amounts: &MnHashMap<LedgerTokenType, u128, D>) -> Vec<(S
         let total = by_token.entry(wire_token_type(token)).or_default();
         *total = total.saturating_add(value);
     }
+    nonzero_amounts(by_token)
+}
+
+/// A transcript's mints, per token: the minting contract's own token type for each domain separator.
+fn minted<D: DB>(
+    mints: &MnHashMap<HashOutput, u64, D>,
+    token_of: impl Fn(HashOutput) -> [u8; 32],
+) -> Vec<(String, String)> {
+    let mut by_token: BTreeMap<String, u128> = BTreeMap::new();
+    for (domain, value) in mints.clone() {
+        let total = by_token.entry(hex::encode(token_of(domain))).or_default();
+        *total = total.saturating_add(u128::from(value));
+    }
+    nonzero_amounts(by_token)
+}
+
+fn nonzero_amounts(by_token: BTreeMap<String, u128>) -> Vec<(String, String)> {
     by_token
         .into_iter()
         .filter(|(_, v)| *v != 0)
         .map(|(token, v)| (token, v.to_string()))
         .collect()
+}
+
+/// Shielded coins by commitment, sorted, opened where the wallet established the coin.
+fn shielded_coins<D: DB>(
+    commitments: &MnHashSet<Commitment, D>,
+    facts: &CallFacts,
+) -> Vec<ShieldedCoin> {
+    let mut coins: Vec<ShieldedCoin> = commitments
+        .iter()
+        .map(|commitment| {
+            let commitment: &Commitment = &commitment;
+            let opened = facts.coins.get(commitment);
+            ShieldedCoin {
+                commitment: hex::encode(commitment.0 .0),
+                token: opened.map(|(token, _)| hex::encode(token.0 .0)),
+                value: opened.map(|(_, value)| value.to_string()),
+            }
+        })
+        .collect();
+    coins.sort_by(|a, b| a.commitment.cmp(&b.commitment));
+    coins
 }
 
 /// A ledger token type as the wire string the policy context uses elsewhere: the 32-byte hex of the
@@ -909,6 +1020,111 @@ mod tests {
             );
             assert_eq!(out[1].caller, None);
         }
+    }
+
+    /// A mint is of the minting contract's own token: the type the ledger derives from its address.
+    #[test]
+    fn a_mint_is_of_the_minting_contracts_own_token() {
+        let domain = HashOutput([0x09; 32]);
+        let mut effects = Effects::<InMemoryDB>::default();
+        effects.unshielded_mints = effects.unshielded_mints.insert(domain, 7);
+        effects.shielded_mints = effects.shielded_mints.insert(domain, 9);
+
+        let out = contract_interactions(
+            [(
+                1u16,
+                call_with(0xAA, "mint", Fr::from(1u64), with_effects(effects)),
+            )]
+            .into_iter(),
+            &wallet(),
+            &CallFacts::default(),
+        );
+
+        let minter = address(0xAA);
+        assert_eq!(
+            out[0].minted,
+            vec![(
+                hex::encode(minter.custom_unshielded_token_type(domain).0 .0),
+                "7".into()
+            )]
+        );
+        assert_eq!(
+            out[0].shielded.minted,
+            vec![(
+                hex::encode(minter.custom_shielded_token_type(domain).0 .0),
+                "9".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_shielded_coin_a_contract_claims_carries_its_value_only_when_opened() {
+        let (opened, sealed, paid) = (
+            Commitment(HashOutput([0x01; 32])),
+            Commitment(HashOutput([0x02; 32])),
+            Commitment(HashOutput([0x03; 32])),
+        );
+        let mut effects = Effects::<InMemoryDB>::default();
+        effects.claimed_shielded_receives = effects
+            .claimed_shielded_receives
+            .insert(opened)
+            .insert(sealed);
+        effects.claimed_shielded_spends = effects.claimed_shielded_spends.insert(paid);
+        let color = ShieldedTokenType(HashOutput([0x77; 32]));
+        let facts = CallFacts {
+            coins: [(opened, (color, 500)), (paid, (color, 20))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let out = contract_interactions(
+            [(
+                1u16,
+                call_with(
+                    0xAA,
+                    "deposit_shielded",
+                    Fr::from(1u64),
+                    with_effects(effects),
+                ),
+            )]
+            .into_iter(),
+            &wallet(),
+            &facts,
+        );
+
+        let shielded = &out[0].shielded;
+        assert_eq!(
+            shielded.sent_to,
+            vec![
+                ShieldedCoin {
+                    commitment: hex::encode([0x01u8; 32]),
+                    token: Some(hex::encode([0x77u8; 32])),
+                    value: Some("500".into()),
+                },
+                ShieldedCoin {
+                    commitment: hex::encode([0x02u8; 32]),
+                    token: None,
+                    value: None,
+                },
+            ]
+        );
+        assert_eq!(shielded.received_from[0].value.as_deref(), Some("20"));
+        // An unshielded-only call says nothing shielded, so the policy context stays lean.
+        let plain = contract_interactions(
+            [(
+                1u16,
+                call_with(0xAA, "noop", Fr::from(2u64), Some(transcript(&[], &[]))),
+            )]
+            .into_iter(),
+            &wallet(),
+            &facts,
+        );
+        assert!(!serde_json::to_value(&plain[0])
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("shielded"));
     }
 
     #[test]
