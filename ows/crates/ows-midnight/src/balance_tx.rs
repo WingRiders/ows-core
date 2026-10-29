@@ -654,6 +654,61 @@ fn empty_intent_skeleton() -> Intent<MnSig, ProofMarker, PedersenRandomness, InM
     }
 }
 
+/// A dust registration the dapp's transaction carries that the wallet signs: one of the wallet's own
+/// NIGHT to the wallet's own DUST address, in the intent at `intent_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CarriedRegistration {
+    intent_id: u16,
+    allow_fee_payment: u128,
+}
+
+/// Accept a dust registration the dapp put in the transaction only when it registers the wallet's own
+/// NIGHT to the wallet's own DUST address: any other target would give that NIGHT's DUST generation
+/// away, and `None` (a deregistration) would switch it off. The signer enforces the same target rule;
+/// checking here fails the request before anything is proven. Without `pay_fees` the wallet folds its
+/// NIGHT inputs into the dapp's lowest intent, where an allowance would pay the dapp's fee from the
+/// DUST those inputs accrued, so it must be 0. With `pay_fees` the allowance counts as the wallet's
+/// DUST outflow.
+fn check_carried_registration(
+    intent_id: u16,
+    reg: &DustRegistration<MnSig, InMemoryDB>,
+    wallet_vk: &VerifyingKey,
+    wallet_dust_address: &DustPublicKey,
+    pay_fees: bool,
+) -> Result<CarriedRegistration, std::io::Error> {
+    if reg.night_key != *wallet_vk {
+        return Err(err(
+            "transaction carries a dust registration for another NIGHT key, which the wallet \
+             cannot sign",
+        ));
+    }
+    match reg.dust_address.as_deref() {
+        Some(addr) if addr == wallet_dust_address => {}
+        Some(_) => {
+            return Err(err(
+                "transaction carries a dust registration to another dust address; the wallet only \
+                 signs one to its own",
+            ))
+        }
+        None => {
+            return Err(err(
+                "transaction carries a dust deregistration, which the wallet refuses to sign",
+            ))
+        }
+    }
+    if !pay_fees && reg.allow_fee_payment != 0 {
+        return Err(err(format!(
+            "transaction carries a dust registration allowing a fee payment of {} with payFees \
+             false; without fees the wallet signs a carried registration only when it allows none",
+            reg.allow_fee_payment
+        )));
+    }
+    Ok(CarriedRegistration {
+        intent_id,
+        allow_fee_payment: reg.allow_fee_payment,
+    })
+}
+
 /// The next unused intent segment id: one past the current maximum. Intents never sit at segment 0
 /// (reserved for the guaranteed section), so this is always `>= 1`. Errors when an intent already
 /// sits at the last segment (`u16::MAX`), which the ledger allows.
@@ -853,6 +908,8 @@ pub struct BalancedPlan {
     shielded: Option<ShieldedFundingPlan>,
     dust: DustFeePlan,
     consolidation: Option<Consolidation>,
+    /// The dust registrations the dapp's transaction carries, which the wallet signs as they are.
+    carried_registrations: Vec<CarriedRegistration>,
 }
 
 impl BalancedPlan {
@@ -869,8 +926,9 @@ impl BalancedPlan {
     ///   shielded viewing key — inflow in the segment its offer rides. So the shielded effect is the
     ///   wallet's true net movement, not just an outflow bound (recognizing a receipt needs no spend
     ///   key; only recognizing a spend does).
-    /// - **dust** — the DUST the fee section burns (a generationless registration burns none), attributed
-    ///   to the guaranteed segment `0`: the fee pays for the guaranteed computation and is always charged.
+    /// - **dust** — the DUST the fee section burns (a generationless registration burns none), plus the
+    ///   fee allowance of each registration the dapp's transaction carries, attributed to the guaranteed
+    ///   segment `0`: the fee pays for the guaranteed computation and is always charged.
     ///
     /// The policy seam interprets guaranteed (`0`) versus fallible (`>= 1`); here we only attribute.
     pub(crate) fn segment_effects(
@@ -912,13 +970,20 @@ impl BalancedPlan {
             &self.base.fallible_coins,
             crypto_provider,
         );
+        let dust_outflow = self
+            .carried_registrations
+            .iter()
+            .try_fold(self.dust.dust_outflow(), |sum, reg| {
+                sum.checked_add(reg.allow_fee_payment)
+            })
+            .ok_or_else(|| err("the fee's DUST outflow overflows u128"))?;
         plan_segment_effects(
             &addresses,
             &wallet_ua,
             &offers,
             shielded_plans,
             &shielded_inflow,
-            self.dust.dust_outflow(),
+            dust_outflow,
         )
     }
 
@@ -935,23 +1000,38 @@ impl BalancedPlan {
         self.dust.fee_context()
     }
 
-    /// The dust registrations the wallet signs in this plan: its own fee registration, which rides
-    /// the balancing intent and registers the wallet's NIGHT to the wallet's own DUST address.
+    /// The dust registrations the wallet signs in this plan, by intent: those the dapp's transaction
+    /// carries and the wallet's own fee registration, which rides the balancing intent. Each registers
+    /// the wallet's NIGHT to the wallet's own DUST address; the balancer refuses any other.
     pub(crate) fn dust_registrations(
         &self,
         addresses: &MidnightAddresses,
     ) -> Vec<DustRegistrationContext> {
-        self.dust
+        let carried = self
+            .carried_registrations
+            .iter()
+            .map(|reg| (reg.intent_id, true, reg.allow_fee_payment));
+        let own_fee = self
+            .dust
             .registrations()
             .into_iter()
-            .map(|reg| DustRegistrationContext {
-                intent_id: self.seg_id,
-                night_address: addresses.unshielded.clone(),
-                dust_address: addresses.dust.clone(),
-                allow_fee_payment: reg.allow_fee_payment.to_string(),
-                replaces_delegation: None,
-            })
-            .collect()
+            .map(|reg| (self.seg_id, false, reg.allow_fee_payment));
+        let mut out: Vec<DustRegistrationContext> = carried
+            .chain(own_fee)
+            .map(
+                |(intent_id, carried, allow_fee_payment)| DustRegistrationContext {
+                    intent_id,
+                    carried,
+                    night_address: addresses.unshielded.clone(),
+                    dust_address: addresses.dust.clone(),
+                    own: true,
+                    allow_fee_payment: allow_fee_payment.to_string(),
+                    replaces_delegation: None,
+                },
+            )
+            .collect();
+        out.sort_by_key(|reg| reg.intent_id);
+        out
     }
 
     /// Put real proofs into a plan built over a mock-proven transaction, so the plan the policy seam
@@ -1441,6 +1521,10 @@ fn plan_unsealed_proven_standard_tx(
     // fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
     let adding_dust = adding_dust(pay_fees, indexer_url)?;
+    let wallet_dust_address = crypto_provider
+        .dust_public_key()
+        .map_err(|e| err(e.to_string()))?;
+    let mut carried_registrations = Vec::new();
     let mut fallible_outputs_by_seg: BTreeMap<u16, Vec<UtxoOutput>> = BTreeMap::new();
     let mut has_preexisting_dust = false;
     let mut chosen: Option<(
@@ -1452,19 +1536,20 @@ fn plan_unsealed_proven_standard_tx(
         let seg_id = *seg_sp.deref();
         let intent = intent_sp.deref();
         // A dust section the tx already carries is fine — the wallet's own dust rides a fresh intent
-        // below, since an intent holds only one dust section (spec §L961-967). But it must not carry a
-        // dust *registration*, whatever it names. A proof-authorized dust *spend* passes through
-        // untouched, while a registration is signature-authorized: a foreign one needs a signer the
-        // wallet lacks, and one for the wallet's own NIGHT would be signed without the policy pass
-        // seeing it, its fee allowance paying the dapp's fee from the generationless DUST of the
-        // wallet's NIGHT inputs. The wallet adds its own registration when it pays fees.
+        // below, since an intent holds only one dust section (spec §L961-967). A proof-authorized dust
+        // *spend* passes through untouched, while a *registration* is signature-authorized, so the
+        // wallet signs it: only one of its own NIGHT to its own DUST address, which the policy pass
+        // sees with the rest of the plan.
         if let Some(da) = intent.dust_actions.as_ref() {
             has_preexisting_dust = true;
-            if !da.deref().registrations.is_empty() {
-                return Err(err(
-                    "transaction carries a dust registration; the wallet registers its own NIGHT \
-                     when it pays fees and signs no registration a dapp supplies",
-                ));
+            for reg in da.deref().registrations.iter_deref() {
+                carried_registrations.push(check_carried_registration(
+                    seg_id,
+                    reg,
+                    sender_vk,
+                    &wallet_dust_address,
+                    pay_fees,
+                )?);
             }
         }
         if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
@@ -1694,6 +1779,7 @@ fn plan_unsealed_proven_standard_tx(
         shielded,
         dust,
         consolidation,
+        carried_registrations,
     })
 }
 
@@ -2073,49 +2159,176 @@ mod tests {
         }
     }
 
-    /// The balancer refuses every registration a dapp's transaction carries, the wallet's own NIGHT to
-    /// its own dust address included: with payFees false its allowance would pay the dapp's fee from the
-    /// wallet's NIGHT, and nothing of it reaches the policy pass. It fails before any network call.
+    /// A registration of `night_key`'s NIGHT to `dust_address` (`None` deregisters) allowing the fee
+    /// `allow_fee_payment`.
+    fn registration(
+        night_key: &VerifyingKey,
+        dust_address: Option<DustPublicKey>,
+        allow_fee_payment: u128,
+    ) -> DustRegistration<MnSig, InMemoryDB> {
+        DustRegistration {
+            night_key: night_key.clone(),
+            dust_address: dust_address.map(Sp::new),
+            allow_fee_payment,
+            signature: None,
+        }
+    }
+
+    /// A carried registration is signed only for the wallet's own NIGHT to the wallet's own DUST
+    /// address, and with payFees false only when it allows no fee payment, since the wallet's NIGHT
+    /// inputs would back it. With payFees true its allowance is kept, for the effects to count.
     #[test]
-    fn a_carried_dust_registration_is_refused() {
+    fn a_carried_registration_must_register_the_wallets_night_to_its_own_dust() {
+        let vk = wallet_vk();
+        let other_vk = MidnightSigningKey::from_bytes(&hex::decode(OTHER_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let own = own_dust_address();
+        let elsewhere = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x33u8; 32]));
+        let check = |night_key: &VerifyingKey,
+                     dust_address: Option<DustPublicKey>,
+                     allow_fee_payment: u128,
+                     pay_fees: bool| {
+            check_carried_registration(
+                5,
+                &registration(night_key, dust_address, allow_fee_payment),
+                &vk,
+                &own,
+                pay_fees,
+            )
+        };
+
+        assert_eq!(
+            check(&vk, Some(own), 0, false).unwrap(),
+            CarriedRegistration {
+                intent_id: 5,
+                allow_fee_payment: 0,
+            }
+        );
+        assert_eq!(
+            check(&vk, Some(own), 100_000, true).unwrap(),
+            CarriedRegistration {
+                intent_id: 5,
+                allow_fee_payment: 100_000,
+            }
+        );
+        for (night_key, dust_address, allow, pay_fees, expected) in [
+            (&vk, Some(own), 100_000, false, "with payFees false"),
+            (&vk, Some(elsewhere), 0, false, "another dust address"),
+            (&vk, Some(elsewhere), 0, true, "another dust address"),
+            (&vk, None, 0, false, "deregistration"),
+            (&vk, None, 0, true, "deregistration"),
+            (&other_vk, Some(own), 0, false, "another NIGHT key"),
+        ] {
+            let msg = check(night_key, dust_address, allow, pay_fees)
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(expected), "{msg}");
+        }
+    }
+
+    /// The planner applies that rule to every registration in the dapp's transaction before any
+    /// network call. One it accepts lets planning go on to fetch the wallet's coins, which fails here
+    /// against an unreachable indexer for a reason that is not the registration.
+    #[test]
+    fn the_planner_checks_each_carried_registration_before_any_network_call() {
         let provider = MidnightSigner::mainnet()
             .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
             .unwrap();
         let vk = provider.unshielded_verifying_key().unwrap();
-        let other_vk = MidnightSigningKey::from_bytes(&hex::decode(OTHER_SEED_HEX).unwrap())
-            .unwrap()
-            .verifying_key();
         let own = provider.dust_public_key().unwrap();
         let elsewhere = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x33u8; 32]));
         let sender = provider
             .addresses(&MidnightNetwork::from_chain_id("midnight:mainnet"))
             .unwrap()
             .unshielded;
-
-        for (night_key, dust_address) in [
-            (&vk, Some(own)),
-            (&vk, Some(elsewhere)),
-            (&vk, None),
-            (&other_vk, Some(own)),
-        ] {
-            let tx = build_proven_unshielded_tx(
-                &vk,
-                Some(dust_registration_to(night_key, dust_address)),
-            );
-            let msg = plan_unsealed_proven_standard_tx(
+        let scope = SyncCacheScope {
+            vault_path: Some(std::env::temp_dir().join("ows-midnight-carried-registration-test")),
+            ..Default::default()
+        };
+        let plan_error = |reg: DustRegistration<MnSig, InMemoryDB>| {
+            let dust = DustActions {
+                spends: vec![].into(),
+                registrations: vec![reg].into(),
+                ctime: Timestamp::from_secs(0),
+            };
+            let tx =
+                TxProven::Standard(base_with_intents(vec![(1, intent_with(None, Some(dust)))]));
+            let mut bytes = Vec::new();
+            tagged_serialize(&tx, &mut bytes).unwrap();
+            plan_unsealed_proven_standard_tx(
                 "http://127.0.0.1:1/api/v3/graphql",
                 &provider,
                 &vk,
                 &sender,
-                &tx,
+                &bytes,
                 false,
-                &SyncCacheScope::default(),
+                &scope,
             )
             .err()
-            .expect("a carried registration must be refused")
-            .to_string();
-            assert!(msg.contains("carries a dust registration"), "{msg}");
+            .expect("planning cannot finish without an indexer")
+            .to_string()
+        };
+
+        for (reg, expected) in [
+            (registration(&vk, Some(own), 1), "with payFees false"),
+            (
+                registration(&vk, Some(elsewhere), 0),
+                "another dust address",
+            ),
+            (registration(&vk, None, 0), "deregistration"),
+        ] {
+            let msg = plan_error(reg);
+            assert!(msg.contains(expected), "{msg}");
         }
+        let past_the_check = plan_error(registration(&vk, Some(own), 0));
+        assert!(!past_the_check.contains("registration"), "{past_the_check}");
+    }
+
+    /// With payFees true a carried registration's allowance is the wallet's DUST outflow, on top of its
+    /// own fee section, and the registration is listed for the policy beside the wallet's own.
+    #[test]
+    fn a_carried_registrations_allowance_counts_as_the_wallets_dust_outflow() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
+            .unwrap();
+        let addresses = provider
+            .addresses(&MidnightNetwork::from_chain_id("midnight:mainnet"))
+            .unwrap();
+        let vk = provider.unshielded_verifying_key().unwrap();
+        let own = provider.dust_public_key().unwrap();
+        let mut plan = plan_paying(DustFeePlan::Registration(dust_registration_to(
+            &vk,
+            Some(own),
+        )));
+        plan.carried_registrations = vec![CarriedRegistration {
+            intent_id: 1,
+            allow_fee_payment: 70_000,
+        }];
+
+        let effects = plan.segment_effects("midnight:mainnet", &provider).unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].segment, 0);
+        assert_eq!(
+            effects[0].effects,
+            vec![TransactionEffect {
+                address: addresses.dust.clone(),
+                diff: vec![("dust".to_string(), "-70000".to_string())],
+            }]
+        );
+
+        let registrations = plan.dust_registrations(&addresses);
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|r| (r.intent_id, r.carried, r.allow_fee_payment.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, true, "70000"), (3, false, "100000")]
+        );
+        assert!(registrations.iter().all(|r| r.own
+            && r.night_address == addresses.unshielded
+            && r.dust_address == addresses.dust
+            && r.replaces_delegation.is_none()));
     }
 
     #[test]
@@ -3048,6 +3261,7 @@ mod tests {
             shielded: None,
             dust: DustFeePlan::None,
             consolidation: None,
+            carried_registrations: vec![],
         };
         let bytes = authorize_proven_tx("midnight:mainnet", &provider, plan).unwrap();
         let Transaction::Standard(stx) = tagged_deserialize::<TxProven>(&mut &bytes[..]).unwrap()
@@ -3077,6 +3291,7 @@ mod tests {
             shielded: None,
             dust: DustFeePlan::None,
             consolidation: Some(consolidation),
+            carried_registrations: vec![],
         }
     }
 
@@ -3229,6 +3444,7 @@ mod tests {
             shielded: None,
             dust,
             consolidation: None,
+            carried_registrations: vec![],
         }
     }
 
@@ -3255,8 +3471,10 @@ mod tests {
             plan.dust_registrations(&addresses),
             vec![DustRegistrationContext {
                 intent_id: 3,
+                carried: false,
                 night_address: addresses.unshielded.clone(),
                 dust_address: addresses.dust.clone(),
+                own: true,
                 allow_fee_payment: "100000".to_string(),
                 replaces_delegation: None,
             }]
