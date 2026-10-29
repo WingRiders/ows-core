@@ -6,12 +6,16 @@
 //! commitment — public, in the transaction — is `transient_commit(input ‖ output, rand)`. The tooling
 //! holds `input`, `output` and `rand` (it built the call), so it can hand them over, and the wallet
 //! recomputes the commitment: a disclosure that opens a call's commitment *is* that call's arguments,
-//! one that opens none is refused outright.
+//! one that opens none is refused outright. A shielded coin a contract claims is bound the same way,
+//! by its coin commitment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use midnight_base_crypto::fab::{AlignedValue, Alignment, Value, ValueAtom};
+use midnight_base_crypto::hash::HashOutput;
+use midnight_coin_structure::coin::{Commitment, Info as CoinInfo, Nonce, ShieldedTokenType};
 use midnight_coin_structure::contract::ContractAddress;
+use midnight_coin_structure::transfer::Recipient;
 use midnight_ledger::construct::communication_commitment;
 use midnight_ledger::structure::{ContractAction, ProofKind};
 use midnight_serialize::Deserializable;
@@ -22,12 +26,14 @@ use transient_crypto::curve::Fr;
 use super::{atoms, entry_point_label, fr_hex, CallArguments};
 
 /// The `disclose` member of a `balanceUnsealedTransaction` request: the calls whose arguments the
-/// tooling reveals. Every entry must match the transaction.
+/// tooling reveals and the shielded coins it opens. Every entry must match the transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Disclosures {
     #[serde(default)]
     pub calls: Vec<CallDisclosure>,
+    #[serde(default)]
+    pub coins: Vec<CoinOpening>,
 }
 
 /// One call's `input` (its arguments) and `output` (its result) as the ledger's `ContractCallPrototype`
@@ -55,15 +61,33 @@ pub struct WireAlignedValue {
     pub alignment: Alignment,
 }
 
+/// A shielded coin's opening: its nonce, token type (`color`) and value. It opens a coin a contract in
+/// the transaction receives or pays out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoinOpening {
+    pub nonce: String,
+    pub color: String,
+    pub value: String,
+}
+
 /// Check every disclosure against the transaction's calls. Returns each opened call's arguments, keyed
-/// by its communication commitment. A disclosure that opens nothing in the transaction is an error: the
-/// tooling claimed something about this transaction that is not true of it, and a policy must not see
-/// the claim.
+/// by its communication commitment, and each opened coin's token and value, keyed by its commitment.
+/// A disclosure that opens nothing in the transaction is an error: the tooling claimed something about
+/// this transaction that is not true of it, and a policy must not see the claim.
+#[allow(clippy::type_complexity)]
 pub(crate) fn verify_disclosures<P: ProofKind<D>, D: DB>(
     actions: impl Iterator<Item = (u16, ContractAction<P, D>)>,
     disclosures: &Disclosures,
-) -> Result<BTreeMap<Fr, CallArguments>, std::io::Error> {
+) -> Result<
+    (
+        BTreeMap<Fr, CallArguments>,
+        BTreeMap<Commitment, (ShieldedTokenType, u128)>,
+    ),
+    std::io::Error,
+> {
     let mut calls: BTreeMap<Fr, (ContractAddress, String)> = BTreeMap::new();
+    let mut claimed_coins: BTreeMap<Commitment, ContractAddress> = BTreeMap::new();
     for (_, action) in actions {
         let ContractAction::Call(call) = action else {
             continue;
@@ -72,6 +96,21 @@ pub(crate) fn verify_disclosures<P: ProofKind<D>, D: DB>(
             call.communication_commitment,
             (call.address, entry_point_label(&call.entry_point)),
         );
+        let transcripts = call
+            .guaranteed_transcript
+            .iter()
+            .chain(call.fallible_transcript.iter());
+        for transcript in transcripts {
+            let effects = &transcript.effects;
+            for commitment in effects
+                .claimed_shielded_receives
+                .iter()
+                .chain(effects.claimed_shielded_spends.iter())
+            {
+                let commitment: &Commitment = &commitment;
+                claimed_coins.insert(*commitment, call.address);
+            }
+        }
     }
 
     let mut arguments = BTreeMap::new();
@@ -122,7 +161,22 @@ pub(crate) fn verify_disclosures<P: ProofKind<D>, D: DB>(
         );
     }
 
-    Ok(arguments)
+    let contracts: BTreeSet<ContractAddress> = claimed_coins.values().copied().collect();
+    let mut coins = BTreeMap::new();
+    for (i, opening) in disclosures.coins.iter().enumerate() {
+        let info = coin_info(opening).map_err(|e| invalid(format!("disclose.coins[{i}]: {e}")))?;
+        let opened = contracts.iter().find_map(|address| {
+            let commitment = info.commitment(&Recipient::Contract(*address));
+            (claimed_coins.get(&commitment) == Some(address)).then_some(commitment)
+        });
+        let Some(commitment) = opened else {
+            return Err(invalid(format!(
+                "disclose.coins[{i}] opens no shielded coin a contract in the transaction claims"
+            )));
+        };
+        coins.insert(commitment, (info.type_, info.value));
+    }
+    Ok((arguments, coins))
 }
 
 fn invalid(msg: String) -> std::io::Error {
@@ -154,6 +208,24 @@ fn parse_fr(hex_str: &str) -> Result<Fr, String> {
         return Err("trailing bytes after the field element".into());
     }
     Ok(fr)
+}
+
+fn coin_info(opening: &CoinOpening) -> Result<CoinInfo, String> {
+    let bytes32 = |name: &str, h: &str| -> Result<[u8; 32], String> {
+        let bytes =
+            hex::decode(h.strip_prefix("0x").unwrap_or(h)).map_err(|e| format!("{name}: {e}"))?;
+        bytes
+            .try_into()
+            .map_err(|_| format!("{name} must be 32 bytes"))
+    };
+    Ok(CoinInfo {
+        nonce: Nonce(HashOutput(bytes32("nonce", &opening.nonce)?)),
+        type_: ShieldedTokenType(HashOutput(bytes32("color", &opening.color)?)),
+        value: opening
+            .value
+            .parse()
+            .map_err(|e| format!("value {:?}: {e}", opening.value))?,
+    })
 }
 
 #[cfg(test)]
@@ -242,10 +314,11 @@ mod tests {
             ContractAction::Call(c) => c.communication_commitment,
             _ => unreachable!(),
         };
-        let arguments = verify_disclosures(
+        let (arguments, _) = verify_disclosures(
             [(1u16, action)].into_iter(),
             &Disclosures {
                 calls: vec![disclosure],
+                coins: vec![],
             },
         )
         .unwrap();
@@ -270,6 +343,7 @@ mod tests {
             [(1u16, action)].into_iter(),
             &Disclosures {
                 calls: vec![disclosure],
+                coins: vec![],
             },
         )
         .unwrap_err();
@@ -284,6 +358,7 @@ mod tests {
             [(1u16, action.clone())].into_iter(),
             &Disclosures {
                 calls: vec![disclosure.clone()],
+                coins: vec![],
             },
         )
         .unwrap_err();
@@ -295,10 +370,52 @@ mod tests {
             [(1u16, action)].into_iter(),
             &Disclosures {
                 calls: vec![disclosure],
+                coins: vec![],
             },
         )
         .unwrap_err();
         assert!(e.to_string().contains("names address"), "{e}");
+    }
+
+    #[test]
+    fn a_coin_opening_must_open_a_coin_a_contract_in_the_transaction_claims() {
+        let info = CoinInfo {
+            nonce: Nonce(HashOutput([0x31; 32])),
+            type_: ShieldedTokenType(HashOutput([0x77; 32])),
+            value: 500,
+        };
+        let commitment = info.commitment(&Recipient::Contract(address(0xAA)));
+        let mut effects = Effects::<InMemoryDB>::default();
+        effects.claimed_shielded_receives = effects.claimed_shielded_receives.insert(commitment);
+        let action = call(0xAA, "deposit_shielded", Fr::from(1u64), effects);
+        let opening = CoinOpening {
+            nonce: hex::encode([0x31u8; 32]),
+            color: hex::encode([0x77u8; 32]),
+            value: "500".into(),
+        };
+
+        let (_, coins) = verify_disclosures(
+            [(1u16, action.clone())].into_iter(),
+            &Disclosures {
+                calls: vec![],
+                coins: vec![opening.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(coins[&commitment], (info.type_, 500));
+
+        let e = verify_disclosures(
+            [(1u16, action)].into_iter(),
+            &Disclosures {
+                calls: vec![],
+                coins: vec![CoinOpening {
+                    value: "5000".into(),
+                    ..opening
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("opens no shielded coin"), "{e}");
     }
 
     #[test]
@@ -313,7 +430,8 @@ mod tests {
                 "output": { "value": [], "alignment": [] },
                 "communicationCommitmentRand": "00",
                 "entryPoint": "withdraw"
-            }]
+            }],
+            "coins": [{ "nonce": "00", "color": "00", "value": "1" }]
         }"#;
         let parsed: Disclosures = serde_json::from_str(json).unwrap();
         assert_eq!(aligned(&parsed.calls[0].input).unwrap(), amount(1000));

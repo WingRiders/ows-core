@@ -134,6 +134,8 @@ mod tests {
                 sent_to: vec![("00".repeat(32), "5".to_string())],
                 received_from: vec![],
                 payouts: vec![],
+                minted: vec![],
+                shielded: Default::default(),
             }],
             fee: FeeContext::none(),
             dust_registrations: vec![],
