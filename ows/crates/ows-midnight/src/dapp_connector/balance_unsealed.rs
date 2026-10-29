@@ -2,6 +2,8 @@
 //! planning. The dapp hands the wallet an already-**proven** (`proof,embedded-fr`) unsealed tx; the
 //! wallet balances it against its own inputs, then signs and seals.
 
+use std::path::Path;
+
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
@@ -100,6 +102,7 @@ pub(super) fn plan(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     json: &str,
+    vault_path: Option<&Path>,
 ) -> Result<ConnectorPlan, std::io::Error> {
     let request = parse_balance_unsealed_json(json)?;
     match classify_unsealed_payload(&request.tx_bytes) {
@@ -111,6 +114,7 @@ pub(super) fn plan(
                 crypto_provider,
                 &request.tx_bytes,
                 request.pay_fees,
+                vault_path,
             )?;
             Ok(ConnectorPlan::BalanceUnsealed(Box::new(plan)))
         }
