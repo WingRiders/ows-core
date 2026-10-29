@@ -288,37 +288,109 @@ impl DustFeePlan {
     }
 }
 
-/// Whether `tx`'s DUST section covers the fee the node will charge. Mirrors the node's fee gate
-/// (`well_formed` computes `fees(params, true)` then rejects any segment/token whose `balance` of that
-/// fee goes negative): unlike `tx_balance_imbalances` (which uses `balance(None)` and so ignores the
-/// fee entirely), this charges the real fee, so a DUST section that only satisfies structural balance
-/// but under-covers the fee is correctly rejected. `fees(_, true)` enforces the guaranteed-compute
-/// time-to-dismiss bound; a tx still too small to satisfy it is reported as not-covered so the caller
-/// keeps growing the section (the proof-bearing spend adds the bytes that lift the bound).
-fn dust_section_covers_fee<B>(
-    tx: &Transaction<MnSig, ProofMarker, B, InMemoryDB>,
+/// How the node's fee gate judges a transaction. The gate (`well_formed`) computes `fees(params,
+/// true)` — which refuses a transaction whose validation and guaranteed work take longer to check than
+/// its size buys it (`OutsideTimeToDismiss`: at least `min_time_to_dismiss`, more for larger
+/// transactions), the mempool wall a small call plus a funding offer runs into — then rejects any
+/// segment/token whose `balance` of that fee goes negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FeeGate {
+    /// Admitted: the DUST section covers the fee.
+    Covered,
+    /// The DUST section pays less than the fee.
+    Uncovered,
+    /// Refused whatever DUST it carries: checking it takes `time_to_dismiss`, a transaction of `size`
+    /// bytes may take at most `allowed`. Only more bytes per unit of work get it through — a
+    /// proof-bearing DUST spend adds both, a registration adds work and almost no bytes.
+    TooCostlyForItsSize {
+        time_to_dismiss: midnight_base_crypto::cost_model::CostDuration,
+        allowed: midnight_base_crypto::cost_model::CostDuration,
+        size: u64,
+    },
+}
+
+impl std::fmt::Display for FeeGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeeGate::Covered => write!(f, "the DUST section covers the fee"),
+            FeeGate::Uncovered => write!(f, "the DUST section pays less than the fee"),
+            FeeGate::TooCostlyForItsSize {
+                time_to_dismiss,
+                allowed,
+                size,
+            } => write!(
+                f,
+                "the node would refuse it at the mempool (OutsideTimeToDismiss): it takes \
+                 {time_to_dismiss:?} to check, a {size}-byte transaction may take at most {allowed:?}"
+            ),
+        }
+    }
+}
+
+/// Judge `tx` as the node's fee gate does — see [`FeeGate`]. Unlike `tx_balance_imbalances` (which
+/// uses `balance(None)` and so ignores the fee entirely), this charges the real fee, so a DUST section
+/// that only satisfies structural balance but under-covers the fee is correctly rejected.
+pub(super) fn fee_gate<T: FeeChecked>(
+    tx: &T,
     params: &LedgerParameters,
-) -> Result<bool, std::io::Error>
-where
-    B: midnight_storage::Storable<InMemoryDB>
-        + midnight_ledger::structure::PedersenDowngradeable<InMemoryDB>
-        + midnight_serialize::Serializable,
-    Transaction<MnSig, ProofMarker, B, InMemoryDB>: midnight_serialize::Serializable,
-{
+) -> Result<FeeGate, std::io::Error> {
     use midnight_ledger::error::FeeCalculationError;
-    let fee = match tx.fees(params, true) {
+    let fee = match tx.gate_fees(params) {
         Ok(f) => f,
-        // `OutsideTimeToDismiss` means the tx's guaranteed compute exceeds the size-derived
-        // time-to-dismiss bound — not coverable by more dust as-is, so report not-covered and let the
-        // caller grow the section (the proof-bearing spend adds the bytes that lift the bound).
-        Err(FeeCalculationError::OutsideTimeToDismiss { .. }) => return Ok(false),
+        Err(FeeCalculationError::OutsideTimeToDismiss {
+            time_to_dismiss,
+            allowed_time_to_dismiss,
+            size,
+        }) => {
+            return Ok(FeeGate::TooCostlyForItsSize {
+                time_to_dismiss,
+                allowed: allowed_time_to_dismiss,
+                size,
+            })
+        }
         Err(e) => return Err(err(format!("DUST fee check failed: {e:?}"))),
     };
-    let balances = tx
-        .balance(Some(fee))
-        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?;
-    Ok(balances.into_iter().all(|(_, bal)| bal >= 0))
+    let covered = tx
+        .gate_balance(fee)
+        .map_err(|e| err(format!("transaction balance check failed: {e}")))?;
+    Ok(if covered {
+        FeeGate::Covered
+    } else {
+        FeeGate::Uncovered
+    })
 }
+
+/// The two ledger calls the fee gate makes, for an unsealed or a sealed transaction alike.
+pub(super) trait FeeChecked {
+    fn gate_fees(
+        &self,
+        params: &LedgerParameters,
+    ) -> Result<u128, midnight_ledger::error::FeeCalculationError>;
+    /// Whether every segment and token still balances once `fee` is charged.
+    fn gate_balance(&self, fee: u128) -> Result<bool, String>;
+}
+
+macro_rules! fee_checked {
+    ($binding:ty) => {
+        impl FeeChecked for Transaction<MnSig, ProofMarker, $binding, InMemoryDB> {
+            fn gate_fees(
+                &self,
+                params: &LedgerParameters,
+            ) -> Result<u128, midnight_ledger::error::FeeCalculationError> {
+                self.fees(params, true)
+            }
+            fn gate_balance(&self, fee: u128) -> Result<bool, String> {
+                Ok(self
+                    .balance(Some(fee))
+                    .map_err(|e| format!("{e:?}"))?
+                    .into_iter()
+                    .all(|(_, bal)| bal >= 0))
+            }
+        }
+    };
+}
+fee_checked!(PedersenRandomness);
+fee_checked!(PureGeneratorPedersen);
 
 /// Size the DUST fee section that balances the transaction, **without** real proving. The fee depends
 /// on the tx (dust-section bytes included), so estimate → build section → re-check, converging within
@@ -365,6 +437,9 @@ pub(super) fn size_dust_fee(
 
     // The dust state is expensive to sync, so pull it only when the spend fallback is first needed.
     let mut dust_state: Option<DustLocalState<InMemoryDB>> = None;
+    // The last time the gate refused a candidate for its size, not its fee — what to report when no
+    // candidate gets through, since "the fee is not covered" would send the caller after more DUST.
+    let mut wall: Option<FeeGate> = None;
 
     for attempt in 0..MAX_FEE_ITERS {
         if let Some(reg) = try_registration_dust_actions(
@@ -385,17 +460,28 @@ pub(super) fn size_dust_fee(
                     intent_ttl,
                 ),
             );
-            if dust_section_covers_fee(&tx_check, &params)? {
-                return Ok((DustFeePlan::Registration(reg), intent_ttl));
+            match fee_gate(&tx_check, &params)? {
+                FeeGate::Covered => return Ok((DustFeePlan::Registration(reg), intent_ttl)),
+                refused @ FeeGate::TooCostlyForItsSize { .. } => wall = Some(refused),
+                FeeGate::Uncovered => {}
             }
         }
+        // Past here only a proof-bearing DUST spend can pay. When the registration was refused for its
+        // size, say so alongside whatever stops the spend: a wallet with no generated DUST cannot clear
+        // the wall at all, and that is the actionable part.
+        let with_wall = |e: std::io::Error| match &wall {
+            Some(refused) => err(format!(
+                "paying the DUST fee by registration: {refused}; paying it with a DUST spend \
+                 instead: {e}"
+            )),
+            None => e,
+        };
 
         if dust_state.is_none() {
-            dust_state = Some(sync_spendable_dust_state(
-                ctx.indexer_url,
-                ctx.crypto_provider,
-                ctx.scope,
-            )?);
+            dust_state = Some(
+                sync_spendable_dust_state(ctx.indexer_url, ctx.crypto_provider, ctx.scope)
+                    .map_err(with_wall)?,
+            );
             // The sync just moved the chain on; re-price against where it actually is now. The loop
             // is self-correcting from here — a fee target the fresher params outgrow simply fails the
             // coverage check below and is raised on the next attempt.
@@ -415,7 +501,7 @@ pub(super) fn size_dust_fee(
         let dust_actions = ctx
             .crypto_provider
             .mock_dust_spends(synced, &plan, &ctx.stx.network_id)
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| with_wall(err(e.to_string())))?;
         let tx_check = wrap_proven_standard(
             ctx.stx,
             ctx.seg_id,
@@ -427,21 +513,24 @@ pub(super) fn size_dust_fee(
                 intent_ttl,
             ),
         );
-        if dust_section_covers_fee(&tx_check, &params)? {
-            return Ok((
-                DustFeePlan::Spend {
-                    plan,
-                    dust_state: Box::new(synced.clone()),
-                    ledger_params: Box::new(params.clone()),
-                },
-                intent_ttl,
-            ));
+        match fee_gate(&tx_check, &params)? {
+            FeeGate::Covered => {
+                return Ok((
+                    DustFeePlan::Spend {
+                        plan,
+                        dust_state: Box::new(synced.clone()),
+                        ledger_params: Box::new(params.clone()),
+                    },
+                    intent_ttl,
+                ))
+            }
+            refused @ FeeGate::TooCostlyForItsSize { .. } => wall = Some(refused),
+            FeeGate::Uncovered => wall = None,
         }
 
         // Re-estimate against the section we just built — margined, and via `fees_with_margin`'s
-        // `enforce_time_to_dismiss: false`, so a tx still under the time-to-dismiss bound grows its
-        // section here instead of erroring out (which is what `dust_section_covers_fee` returning
-        // not-covered for `OutsideTimeToDismiss` asks the loop to do).
+        // `enforce_time_to_dismiss: false`, so a tx still over the time-to-dismiss bound grows its
+        // section here instead of erroring out (the bytes of more spends are what lift the bound).
         let actual_fee = with_drift_margin(
             tx_check
                 .fees_with_margin(&params, FEE_BLOCKS_MARGIN)
@@ -455,6 +544,12 @@ pub(super) fn size_dust_fee(
             .max(fee_target.saturating_add(1))
             .max(dust_paid.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {
+            if let Some(refused) = wall {
+                return Err(err(format!(
+                    "cannot pay for this transaction: {refused}, and {MAX_FEE_ITERS} DUST \
+                     sections did not lift it"
+                )));
+            }
             return Err(err(format!(
                 "failed to cover the DUST fee after {MAX_FEE_ITERS} attempts \
                  (target={fee_target}, paid={dust_paid}, fee={actual_fee})"
@@ -581,12 +676,18 @@ pub(crate) fn size_merge_registration_fee(
         };
         let merged =
             merged_with_taker_dust(maker, taker_base, dust_seg, Some(reg.clone()), intent_ttl)?;
-        if dust_section_covers_fee(&merged, ledger_params)? {
-            return Ok(Some(MergeRegistrationFee {
-                dust_actions: reg,
-                intent_ttl,
-                binding_commitment,
-            }));
+        match fee_gate(&merged, ledger_params)? {
+            FeeGate::Covered => {
+                return Ok(Some(MergeRegistrationFee {
+                    dust_actions: reg,
+                    intent_ttl,
+                    binding_commitment,
+                }))
+            }
+            // A registration adds work and almost no bytes, so a larger one never clears the wall; the
+            // taker pays with a DUST spend instead.
+            FeeGate::TooCostlyForItsSize { .. } => return Ok(None),
+            FeeGate::Uncovered => {}
         }
         fee_target = with_drift_margin(
             merged

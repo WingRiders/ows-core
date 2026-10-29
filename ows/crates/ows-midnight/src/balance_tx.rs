@@ -1942,6 +1942,21 @@ fn plan_unsealed_proven_standard_tx(
         None => None,
     };
 
+    // The same offer without the coin reserved for a registration, for when the fee ends up paid by a
+    // DUST spend instead: that coin would back nothing and only add guaranteed work — an input and its
+    // change, a quarter of the time-to-dismiss a small call-plus-offer transaction can spare.
+    let unreserved = match &registration_reserve {
+        Some(_) => Some(build_unshielded_balancing_offer(
+            &pool,
+            &mut claimed.clone(),
+            sender_vk,
+            sender_addr,
+            &guaranteed_deficits,
+            outputs_in.clone(),
+            None,
+        )?),
+        None => None,
+    };
     let (offer, selected) = build_unshielded_balancing_offer(
         &pool,
         &mut claimed,
@@ -2024,28 +2039,42 @@ fn plan_unsealed_proven_standard_tx(
     // hour-past-tip TTL need the chain time, so fetch the tip once (it also carries the ledger
     // parameters used to size the fee). The fee is sized here without real proving; the proof-bearing
     // spend is realized post-seam by the signer.
+    let mut offer = offer;
     let (dust, intent_ttl) = if adding_dust {
         let (ledger_params, tip_secs) = dust_tip.expect("dust tip fetched above when adding_dust");
         let dust_ctime = Timestamp::from_secs(tip_secs);
         let dust_pk = crypto_provider
             .dust_public_key()
             .map_err(|e| err(e.to_string()))?;
-        let night_vk = sender_vk.clone();
-        fee_sizing::size_dust_fee(&DustFeeContext {
-            stx: &stx_for_sizing,
-            seg_id,
-            intent_in: &intent_in,
-            offer: &offer,
-            fallible_offer: chosen_fallible.as_ref(),
-            selected: &selected,
-            dust_pk,
-            night_vk,
-            crypto_provider,
-            dust_ctime,
-            ledger_params: &ledger_params,
-            indexer_url,
-            scope,
-        })?
+        let size = |offer: &UnshieldedOffer<MnSig, InMemoryDB>, selected: &[UnshieldedUtxo]| {
+            fee_sizing::size_dust_fee(&DustFeeContext {
+                stx: &stx_for_sizing,
+                seg_id,
+                intent_in: &intent_in,
+                offer,
+                fallible_offer: chosen_fallible.as_ref(),
+                selected,
+                dust_pk,
+                night_vk: sender_vk.clone(),
+                crypto_provider,
+                dust_ctime,
+                ledger_params: &ledger_params,
+                indexer_url,
+                scope,
+            })
+        };
+        let sized = size(&offer, &selected)?;
+        match unreserved {
+            Some((lean, lean_selected))
+                if matches!(sized.0, DustFeePlan::Spend { .. })
+                    && lean.inputs.len() < offer.inputs.len() =>
+            {
+                let resized = size(&lean, &lean_selected)?;
+                offer = lean;
+                resized
+            }
+            _ => sized,
+        }
     } else {
         (DustFeePlan::None, intent_in.ttl)
     };
@@ -5185,6 +5214,229 @@ mod tests {
                 b"midnight:transaction[v12](signature[v2],proof,pedersen-schnorr[v1]):"
             ),
             "the passed-through transaction seals without the wallet"
+        );
+    }
+
+    /// Midnight stagenet's ledger parameters (`block { ledgerParameters }` on its indexer, block
+    /// 1054696): the fee prices and the time-to-dismiss bound its nodes admit transactions by — 2µs per
+    /// byte, at least 15ms.
+    fn stagenet_params() -> LedgerParameters {
+        let bytes =
+            hex::decode(include_str!("testdata/stagenet_ledger_params.hex").trim()).unwrap();
+        tagged_deserialize(&mut &bytes[..]).unwrap()
+    }
+
+    /// A real call with the wallet's funding offer, paid for by a generationless registration: the
+    /// offer's NIGHT input and change are guaranteed work, the registration adds no bytes to pay for it.
+    fn single_call_paid_by_registration() -> (TxProven, LedgerParameters) {
+        let params = stagenet_params();
+        let wallet = wallet_vk();
+        let reserve = night_pool_utxo(
+            &sender_vk_hex(),
+            50 * midnight_ledger::structure::STARS_PER_NIGHT,
+            9,
+            0,
+        );
+        let base = real_call_tx("single");
+        let (offer, selected) = build_unshielded_balancing_offer(
+            std::slice::from_ref(&reserve),
+            &mut Vec::new(),
+            &wallet,
+            "sender",
+            &[],
+            Vec::new(),
+            Some(&reserve),
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        let (seg_id, intent_in) = only_intent(&base);
+        let registration = DustActions {
+            spends: vec![].into(),
+            registrations: vec![DustRegistration {
+                allow_fee_payment: 1_000_000_000_000_000,
+                dust_address: Some(Sp::new(own_dust_address())),
+                night_key: wallet,
+                signature: None,
+            }]
+            .into(),
+            ctime: Timestamp::from_secs(2_000_000),
+        };
+        let tx = wrap_proven_standard(
+            &base,
+            seg_id,
+            assemble_proven_intent(&offer, None, &intent_in, Some(registration), intent_in.ttl),
+        );
+        (tx, params)
+    }
+
+    /// The mempool wall, on a real transaction: `Single.record` costs 6.3ms to check; the wallet's
+    /// NIGHT input and change, which a registration needs in the guaranteed section, add 9.5ms; and a
+    /// 3635-byte transaction may take at most stagenet's 15ms floor. The gate says so in the node's own
+    /// numbers, rather than "the fee is not covered".
+    #[test]
+    fn a_small_call_paid_for_by_registration_hits_the_mempool_wall() {
+        use midnight_base_crypto::cost_model::CostDuration;
+        let (tx, params) = single_call_paid_by_registration();
+        let verdict = fee_sizing::fee_gate(&tx, &params).unwrap();
+        let fee_sizing::FeeGate::TooCostlyForItsSize {
+            time_to_dismiss,
+            allowed,
+            size,
+        } = verdict
+        else {
+            panic!("the gate admits it: {verdict}");
+        };
+        assert_eq!(size, 3635);
+        assert_eq!(allowed, CostDuration::from_picoseconds(15_000_000_000));
+        let ms = time_to_dismiss.into_picoseconds() / 1_000_000;
+        assert!((15_800..15_900).contains(&ms), "{verdict}");
+        // The call alone fits with room to spare: it is the guaranteed NIGHT that does not.
+        let alone =
+            Transaction::Standard(real_call_tx("single")).time_to_dismiss(&params.cost_model);
+        assert!(alone.into_picoseconds() < 7_000_000_000, "{alone:?}");
+    }
+
+    /// When the registration hits the wall and a DUST spend cannot be made either, the fee loop says
+    /// why the registration failed — a wallet with no generated DUST cannot get such a transaction
+    /// past the mempool, and "the fee is not covered" would send its owner after more DUST.
+    #[test]
+    fn the_fee_loop_reports_the_mempool_wall_not_a_shortfall() {
+        let (tx, params) = single_call_paid_by_registration();
+        let Transaction::Standard(stx) = &tx else {
+            unreachable!()
+        };
+        let base = real_call_tx("single");
+        let (seg_id, intent_in) = only_intent(&base);
+        let reserve = night_pool_utxo(
+            &sender_vk_hex(),
+            50 * midnight_ledger::structure::STARS_PER_NIGHT,
+            9,
+            0,
+        );
+        let wallet = wallet_vk();
+        let (offer, selected) = build_unshielded_balancing_offer(
+            std::slice::from_ref(&reserve),
+            &mut Vec::new(),
+            &wallet,
+            "sender",
+            &[],
+            Vec::new(),
+            Some(&reserve),
+        )
+        .unwrap();
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
+            .unwrap();
+        let e = fee_sizing::size_dust_fee(&DustFeeContext {
+            stx: &base,
+            seg_id,
+            intent_in: &intent_in,
+            offer: &offer,
+            fallible_offer: None,
+            selected: &selected,
+            dust_pk: own_dust_address(),
+            night_vk: wallet,
+            crypto_provider: &provider,
+            dust_ctime: Timestamp::from_secs(1_000 + 30 * 24 * 3600),
+            ledger_params: &params,
+            // Nothing listens here: the DUST-spend fallback cannot sync, as for a wallet whose DUST
+            // state is unreachable or empty.
+            indexer_url: "http://127.0.0.1:9",
+            scope: &SyncCacheScope::default(),
+        })
+        .err()
+        .expect("neither a registration nor a DUST spend can pay")
+        .to_string();
+        assert!(stx.intents.iter().count() == 1);
+        assert!(
+            e.starts_with("paying the DUST fee by registration: the node would refuse it at the mempool (OutsideTimeToDismiss)"),
+            "{e}"
+        );
+        assert!(e.contains("paying it with a DUST spend instead:"), "{e}");
+    }
+
+    /// Every contract-call transaction OWS funded on stagenet and the node admitted, as the chain holds
+    /// it, passes the gate the fee loop sizes against — under stagenet's own parameters. Each paid with
+    /// one DUST spend (two for the shielded deposit), whose proof bytes lift the bound a registration
+    /// cannot. Time to dismiss against what each size allows: single 8.6/15ms, composed 18.2/26.7ms,
+    /// value 20.3/21.9ms, value_forward 19.5/20.9ms, shielded 16.8/52.5ms — a wallet-funded call tree
+    /// sits within 10% of the wall, which is why the wallet spends no NIGHT the fee does not need.
+    #[test]
+    fn contract_call_transactions_the_node_admitted_pass_the_fee_gate() {
+        use transient_crypto::commitment::PureGeneratorPedersen;
+        let params = stagenet_params();
+        for (name, hex_str) in [
+            (
+                "single",
+                include_str!("testdata/contract_calls/single_landed.hex"),
+            ),
+            (
+                "composed",
+                include_str!("testdata/contract_calls/composed_landed.hex"),
+            ),
+            (
+                "value",
+                include_str!("testdata/contract_calls/value_landed.hex"),
+            ),
+            (
+                "value_forward",
+                include_str!("testdata/contract_calls/value_forward_landed.hex"),
+            ),
+            (
+                "shielded",
+                include_str!("testdata/contract_calls/shielded_landed.hex"),
+            ),
+        ] {
+            let bytes = hex::decode(hex_str.trim()).unwrap();
+            let tx: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
+                tagged_deserialize(&mut &bytes[..]).unwrap();
+            assert_eq!(
+                fee_sizing::fee_gate(&tx, &params).unwrap(),
+                fee_sizing::FeeGate::Covered,
+                "{name}"
+            );
+        }
+    }
+
+    /// The coin reserved for a registration costs a guaranteed input and its change. When the fee is
+    /// paid by a DUST spend instead, planning drops it: on the real wallet-funded payment, funded from
+    /// a registered coin with an unregistered one reserved, it costs 3.4ms of time to dismiss — twice
+    /// the 1.6ms of headroom the landed transaction had, so keeping it would have been refused.
+    #[test]
+    fn a_reserved_coin_the_fee_does_not_use_costs_the_wall_headroom() {
+        let params = stagenet_params();
+        let wallet = wallet_vk();
+        let mut registered = night_pool_utxo(&sender_vk_hex(), 100_000_000, 1, 0);
+        registered.registered_for_dust_generation = true;
+        let reserve = night_pool_utxo(&sender_vk_hex(), 5_000_000, 2, 0);
+        let pool = vec![registered, reserve.clone()];
+        let base = real_call_tx("value");
+        let (seg_id, intent_in) = only_intent(&base);
+        let ttd = |reserve: Option<&UnshieldedUtxo>| {
+            let (offer, _) = build_unshielded_balancing_offer(
+                &pool,
+                &mut Vec::new(),
+                &wallet,
+                "sender",
+                &[(NIGHT, 1_000_000)],
+                Vec::new(),
+                reserve,
+            )
+            .unwrap();
+            let tx = wrap_proven_standard(
+                &base,
+                seg_id,
+                assemble_proven_intent(&offer, None, &intent_in, None, intent_in.ttl),
+            );
+            (offer.inputs.len(), tx.time_to_dismiss(&params.cost_model))
+        };
+        let (with_inputs, with) = ttd(Some(&reserve));
+        let (lean_inputs, lean) = ttd(None);
+        assert_eq!((with_inputs, lean_inputs), (2, 1));
+        let saved = with - lean;
+        assert!(
+            saved.into_picoseconds() > 3_000_000_000,
+            "the reserve costs {saved:?} of time to dismiss"
         );
     }
 }
