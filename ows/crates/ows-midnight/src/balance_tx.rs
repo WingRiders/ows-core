@@ -911,6 +911,17 @@ pub(super) struct ShieldedFundingPlan {
 /// in the signer.
 pub struct BalancedPlan {
     base: StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    /// What the wallet adds to the transaction, or `None` when the transaction asks nothing of it: no
+    /// value to fund or claim, and its fees paid by someone else (`payFees: false`) — a sponsored
+    /// transaction, which the wallet passes through untouched and signs nothing for.
+    contribution: Option<Contribution>,
+    /// What the wallet established about the transaction's calls for the policy pass.
+    facts: CallFacts,
+}
+
+/// The wallet's part of a [`BalancedPlan`]: its inputs, change and claims, folded into one intent (and
+/// per-segment fallible offers), its shielded funding, and the DUST fee.
+struct Contribution {
     seg_id: u16,
     intent_in: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     unshielded_offer: UnshieldedOffer<MnSig, InMemoryDB>,
@@ -920,11 +931,10 @@ pub struct BalancedPlan {
     intent_ttl: Timestamp,
     shielded: Option<ShieldedFundingPlan>,
     dust: DustFeePlan,
+    /// The wallet's fallible NIGHT consolidation, beside the transaction rather than in it.
     consolidation: Option<Consolidation>,
     /// The dust registrations the dapp's transaction carries, which the wallet signs as they are.
     carried_registrations: Vec<CarriedRegistration>,
-    /// What the wallet established about the transaction's calls for the policy pass.
-    facts: CallFacts,
 }
 
 impl BalancedPlan {
@@ -961,21 +971,39 @@ impl BalancedPlan {
         );
         // The wallet funds unshielded tokens through the guaranteed offer (segment 0) and any
         // per-segment fallible offer; each keeps its own segment so the policy can tell guaranteed
-        // from fallible movement.
-        let mut offers = vec![(0u16, &self.unshielded_offer)];
-        offers.extend(
-            self.fallible_offers
+        // from fallible movement. A transaction the wallet passes through moves none of its value.
+        let mut offers = Vec::new();
+        let mut shielded_plans: &[ShieldedSpendPlan] = &[];
+        let mut dust_outflow = 0;
+        if let Some(contribution) = &self.contribution {
+            offers.push((0u16, &contribution.unshielded_offer));
+            offers.extend(
+                contribution
+                    .fallible_offers
+                    .iter()
+                    .map(|(seg, offer)| (*seg, offer)),
+            );
+            // The consolidation nets to zero when it pays the wallet back, as it is built to; counted
+            // all the same, so one that did not would show as an outflow.
+            offers.extend(
+                contribution
+                    .consolidation
+                    .iter()
+                    .map(|c| (c.segment, &c.offer)),
+            );
+            shielded_plans = contribution
+                .shielded
+                .as_ref()
+                .map(|funding| funding.plans.as_slice())
+                .unwrap_or(&[]);
+            dust_outflow = contribution
+                .carried_registrations
                 .iter()
-                .map(|(seg, offer)| (*seg, offer)),
-        );
-        // The consolidation nets to zero when it pays the wallet back, as it is built to; counted all
-        // the same, so one that did not would show as an outflow.
-        offers.extend(self.consolidation.iter().map(|c| (c.segment, &c.offer)));
-        let shielded_plans = self
-            .shielded
-            .as_ref()
-            .map(|funding| funding.plans.as_slice())
-            .unwrap_or(&[]);
+                .try_fold(contribution.dust.dust_outflow(), |sum, reg| {
+                    sum.checked_add(reg.allow_fee_payment)
+                })
+                .ok_or_else(|| err("the fee's DUST outflow overflows u128"))?;
+        }
         // Shielded receipts the dapp routes to the wallet — the inflow the wallet's own funding plan
         // (spent coins + self-change) does not carry. Recognized here by trial-decrypting the base
         // offers' outputs (viewing tier, no network), keyed by the segment each offer rides: the
@@ -985,13 +1013,6 @@ impl BalancedPlan {
             &self.base.fallible_coins,
             crypto_provider,
         );
-        let dust_outflow = self
-            .carried_registrations
-            .iter()
-            .try_fold(self.dust.dust_outflow(), |sum, reg| {
-                sum.checked_add(reg.allow_fee_payment)
-            })
-            .ok_or_else(|| err("the fee's DUST outflow overflows u128"))?;
         plan_segment_effects(
             &addresses,
             &wallet_ua,
@@ -1012,25 +1033,33 @@ impl BalancedPlan {
 
     /// How the wallet pays this plan's DUST fee, and the most DUST that can take.
     pub(crate) fn fee_context(&self) -> FeeContext {
-        self.dust.fee_context()
+        self.contribution
+            .as_ref()
+            .map_or_else(FeeContext::none, |contribution| {
+                contribution.dust.fee_context()
+            })
     }
 
     /// The dust registrations the wallet signs in this plan, by intent: those the dapp's transaction
     /// carries and the wallet's own fee registration, which rides the balancing intent. Each registers
-    /// the wallet's NIGHT to the wallet's own DUST address; the balancer refuses any other.
+    /// the wallet's NIGHT to the wallet's own DUST address; the balancer refuses any other. A
+    /// transaction the wallet passes through carries none.
     pub(crate) fn dust_registrations(
         &self,
         addresses: &MidnightAddresses,
     ) -> Vec<DustRegistrationContext> {
-        let carried = self
+        let Some(contribution) = &self.contribution else {
+            return Vec::new();
+        };
+        let carried = contribution
             .carried_registrations
             .iter()
             .map(|reg| (reg.intent_id, true, reg.allow_fee_payment));
-        let own_fee = self
+        let own_fee = contribution
             .dust
             .registrations()
             .into_iter()
-            .map(|reg| (self.seg_id, false, reg.allow_fee_payment));
+            .map(|reg| (contribution.seg_id, false, reg.allow_fee_payment));
         let mut out: Vec<DustRegistrationContext> = carried
             .chain(own_fee)
             .map(
@@ -1064,8 +1093,10 @@ impl BalancedPlan {
             ));
         }
         // A reused balancing intent was cloned from the mock-proven base; rebuild it from the real one.
-        if let Some(intent) = real.intents.get(&self.seg_id) {
-            self.intent_in = (*intent).clone();
+        if let Some(contribution) = &mut self.contribution {
+            if let Some(intent) = real.intents.get(&contribution.seg_id) {
+                contribution.intent_in = (*intent).clone();
+            }
         }
         self.base = real;
         Ok(())
@@ -1105,19 +1136,21 @@ impl BalancedPlan {
         };
         BalancedPlan {
             base,
-            seg_id,
-            intent_in,
-            unshielded_offer: UnshieldedOffer {
-                inputs: vec![].into(),
-                outputs: vec![].into(),
-                signatures: vec![].into(),
-            },
-            fallible_offers,
-            intent_ttl,
-            shielded: None,
-            dust,
-            consolidation: None,
-            carried_registrations: vec![],
+            contribution: Some(Contribution {
+                seg_id,
+                intent_in,
+                unshielded_offer: UnshieldedOffer {
+                    inputs: vec![].into(),
+                    outputs: vec![].into(),
+                    signatures: vec![].into(),
+                },
+                fallible_offers,
+                intent_ttl,
+                shielded: None,
+                dust,
+                consolidation: None,
+                carried_registrations: vec![],
+            }),
             facts: CallFacts::default(),
         }
     }
@@ -1663,6 +1696,41 @@ pub(crate) fn ensure_tx_network_id_matches_chain(
     Ok(())
 }
 
+/// Whether a transaction needs anything from the wallet: a shortfall to fund or a surplus to claim, in
+/// either value domain and any segment, a dust registration for it to sign, or — when the wallet pays
+/// the fees — the fee. A transaction that needs nothing is sponsored: someone else balanced it and pays
+/// for it.
+fn needs_the_wallet(
+    tx: &TxProven,
+    wallet: UserAddress,
+    paying_fees: bool,
+) -> Result<bool, std::io::Error> {
+    if paying_fees || carries_a_dust_registration(tx) {
+        return Ok(true);
+    }
+    let claims = surplus_claims(tx, wallet)?;
+    Ok(!ledger_unshielded_deficits(tx)?.is_empty()
+        || !ledger_shielded_deficits(tx)?.is_empty()
+        || !claims.guaranteed.is_empty()
+        || !claims.fallible.is_empty()
+        || !claims.shielded.is_empty())
+}
+
+/// Whether any intent of `tx` carries a dust registration. The planner accepts only one of the wallet's
+/// own NIGHT, which the wallet must sign.
+fn carries_a_dust_registration(tx: &TxProven) -> bool {
+    let Transaction::Standard(stx) = tx else {
+        return false;
+    };
+    stx.intents.iter().any(|pair| {
+        pair.deref()
+            .1
+            .dust_actions
+            .as_ref()
+            .is_some_and(|da| da.registrations.iter().next().is_some())
+    })
+}
+
 /// Plan (but do not authorize) the balancing of an already-proven (`proof,embedded-fr`) unsealed
 /// Standard transaction: parse it, plan the wallet's shielded funding, build the balanced unshielded
 /// offer, and size the DUST fee — all without real proving. The returned [`BalancedPlan`] carries no
@@ -1704,6 +1772,21 @@ fn plan_unsealed_proven_standard_tx(
         disclosures,
     )?;
 
+    // A transaction with nothing to fund or claim, whose fees someone else pays, needs nothing from the
+    // wallet: pass it through as the dapp proved it — no inputs, no change, no signature.
+    let adding_dust = adding_dust(pay_fees, indexer_url)?;
+    if !needs_the_wallet(
+        &Transaction::Standard(base.clone()),
+        UserAddress::from(sender_vk.clone()),
+        adding_dust,
+    )? {
+        return Ok(BalancedPlan {
+            base,
+            contribution: None,
+            facts,
+        });
+    }
+
     // Claim every surplus for the wallet, then plan a shielded deficit against the wallet's own shielded
     // coins together with the shielded claims — a no-op when ledger `balance()` has neither. Pure
     // selection: no spend, no prove.
@@ -1719,7 +1802,6 @@ fn plan_unsealed_proven_standard_tx(
     // mints/withdrawals net positive and are claimed instead), reject shapes the wallet cannot authorize, and
     // fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
-    let adding_dust = adding_dust(pay_fees, indexer_url)?;
     let wallet_dust_address = crypto_provider
         .dust_public_key()
         .map_err(|e| err(e.to_string()))?;
@@ -1970,15 +2052,17 @@ fn plan_unsealed_proven_standard_tx(
 
     Ok(BalancedPlan {
         base,
-        seg_id,
-        intent_in,
-        unshielded_offer: offer,
-        fallible_offers,
-        intent_ttl,
-        shielded,
-        dust,
-        consolidation,
-        carried_registrations,
+        contribution: Some(Contribution {
+            seg_id,
+            intent_in,
+            unshielded_offer: offer,
+            fallible_offers,
+            intent_ttl,
+            shielded,
+            dust,
+            consolidation,
+            carried_registrations,
+        }),
         facts,
     })
 }
@@ -1998,6 +2082,20 @@ pub fn authorize_proven_tx(
     vault_path: Option<&Path>,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut base = plan.base;
+    let Some(plan) = plan.contribution else {
+        // Nothing to add: hand the transaction back exactly as the dapp proved it.
+        let tx_out = Transaction::Standard(base);
+        let imbalances = tx_balance_imbalances(&tx_out)?;
+        if !imbalances.is_empty() {
+            return Err(err(format!(
+                "a transaction the wallet passes through must already balance ({})",
+                imbalances.join("; ")
+            )));
+        }
+        let mut out = Vec::new();
+        tagged_serialize(&tx_out, &mut out).map_err(|e| err(format!("serialize tx: {e}")))?;
+        return Ok(out);
+    };
 
     // Shielded: the signer builds + proves the witnesses; route each proven fragment to the offer the
     // signer bound it to — segment 0 into the guaranteed offer, segment N>=1 into `fallible_coins[N]`.
@@ -2523,7 +2621,7 @@ mod tests {
             &vk,
             Some(own),
         )));
-        plan.carried_registrations = vec![CarriedRegistration {
+        plan.contribution.as_mut().unwrap().carried_registrations = vec![CarriedRegistration {
             intent_id: 1,
             allow_fee_payment: 70_000,
         }];
@@ -3505,19 +3603,21 @@ mod tests {
             .unwrap();
         let plan = BalancedPlan {
             base: base_with_intents(vec![]),
-            seg_id: 1,
-            intent_in: empty_intent_skeleton(),
-            unshielded_offer: UnshieldedOffer {
-                inputs: vec![].into(),
-                outputs: vec![].into(),
-                signatures: vec![].into(),
-            },
-            fallible_offers: vec![],
-            intent_ttl: Timestamp::from_secs(0),
-            shielded: None,
-            dust: DustFeePlan::None,
-            consolidation: None,
-            carried_registrations: vec![],
+            contribution: Some(Contribution {
+                seg_id: 1,
+                intent_in: empty_intent_skeleton(),
+                unshielded_offer: UnshieldedOffer {
+                    inputs: vec![].into(),
+                    outputs: vec![].into(),
+                    signatures: vec![].into(),
+                },
+                fallible_offers: vec![],
+                intent_ttl: Timestamp::from_secs(0),
+                shielded: None,
+                dust: DustFeePlan::None,
+                consolidation: None,
+                carried_registrations: vec![],
+            }),
             facts: CallFacts::default(),
         };
         let bytes = authorize_proven_tx("midnight:mainnet", &provider, plan, None).unwrap();
@@ -3638,15 +3738,17 @@ mod tests {
         for (fee, dust) in [("spend", spend), ("registration", registration)] {
             let plan = BalancedPlan {
                 base: base.clone(),
-                seg_id: 1,
-                intent_in: dapp.clone(),
-                unshielded_offer: guaranteed.clone(),
-                fallible_offers: vec![(1, fallible.clone())],
-                intent_ttl: Timestamp::from_secs(3_600),
-                shielded: None,
-                dust,
-                consolidation: Some(consolidation.clone()),
-                carried_registrations: vec![],
+                contribution: Some(Contribution {
+                    seg_id: 1,
+                    intent_in: dapp.clone(),
+                    unshielded_offer: guaranteed.clone(),
+                    fallible_offers: vec![(1, fallible.clone())],
+                    intent_ttl: Timestamp::from_secs(3_600),
+                    shielded: None,
+                    dust,
+                    consolidation: Some(consolidation.clone()),
+                    carried_registrations: vec![],
+                }),
                 facts: CallFacts::default(),
             };
             let bytes = authorize_proven_tx("midnight:mainnet", &provider, plan, Some(&vault))
@@ -3715,19 +3817,21 @@ mod tests {
     ) -> BalancedPlan {
         BalancedPlan {
             base,
-            seg_id: 1,
-            intent_in: intent_with(None, None),
-            unshielded_offer: UnshieldedOffer {
-                inputs: vec![].into(),
-                outputs: vec![].into(),
-                signatures: vec![].into(),
-            },
-            fallible_offers: vec![],
-            intent_ttl: Timestamp::from_secs(0),
-            shielded: None,
-            dust: DustFeePlan::None,
-            consolidation: Some(consolidation),
-            carried_registrations: vec![],
+            contribution: Some(Contribution {
+                seg_id: 1,
+                intent_in: intent_with(None, None),
+                unshielded_offer: UnshieldedOffer {
+                    inputs: vec![].into(),
+                    outputs: vec![].into(),
+                    signatures: vec![].into(),
+                },
+                fallible_offers: vec![],
+                intent_ttl: Timestamp::from_secs(0),
+                shielded: None,
+                dust: DustFeePlan::None,
+                consolidation: Some(consolidation),
+                carried_registrations: vec![],
+            }),
             facts: CallFacts::default(),
         }
     }
@@ -3803,7 +3907,9 @@ mod tests {
         plan.replace_mock_proofs(Transaction::Standard(base.clone()))
             .expect("the real transfer matches the plan");
         assert!(
-            plan.consolidation.is_some(),
+            plan.contribution
+                .as_ref()
+                .is_some_and(|c| c.consolidation.is_some()),
             "the consolidation must survive"
         );
 
@@ -3869,19 +3975,21 @@ mod tests {
     fn plan_paying(dust: DustFeePlan) -> BalancedPlan {
         BalancedPlan {
             base: base_with_intents(vec![]),
-            seg_id: 3,
-            intent_in: empty_intent_skeleton(),
-            unshielded_offer: UnshieldedOffer {
-                inputs: vec![].into(),
-                outputs: vec![].into(),
-                signatures: vec![].into(),
-            },
-            fallible_offers: vec![],
-            intent_ttl: Timestamp::from_secs(0),
-            shielded: None,
-            dust,
-            consolidation: None,
-            carried_registrations: vec![],
+            contribution: Some(Contribution {
+                seg_id: 3,
+                intent_in: empty_intent_skeleton(),
+                unshielded_offer: UnshieldedOffer {
+                    inputs: vec![].into(),
+                    outputs: vec![].into(),
+                    signatures: vec![].into(),
+                },
+                fallible_offers: vec![],
+                intent_ttl: Timestamp::from_secs(0),
+                shielded: None,
+                dust,
+                consolidation: None,
+                carried_registrations: vec![],
+            }),
             facts: CallFacts::default(),
         }
     }
@@ -5007,5 +5115,76 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A real call tree that moves no value, its fees paid by a sponsor (`payFees: false`), needs
+    /// nothing from the wallet; anything it does need — the fee, or value to fund — makes it the
+    /// wallet's to balance.
+    #[test]
+    fn only_a_sponsored_transaction_that_moves_none_of_the_wallets_value_needs_nothing() {
+        let wallet = UserAddress::from(wallet_vk());
+        for name in ["single", "composed"] {
+            let tx = Transaction::Standard(real_call_tx(name));
+            assert!(!needs_the_wallet(&tx, wallet, false).unwrap(), "{name}");
+            assert!(
+                needs_the_wallet(&tx, wallet, true).unwrap(),
+                "{name}: the fee"
+            );
+        }
+        for name in ["value", "value_forward", "shielded"] {
+            let tx = Transaction::Standard(real_call_tx(name));
+            assert!(
+                needs_the_wallet(&tx, wallet, false).unwrap(),
+                "{name}: value to fund"
+            );
+        }
+    }
+
+    /// The wallet passes a sponsored transaction through exactly as the dapp proved it: the same bytes,
+    /// no movement in the effects the policy pass sees, and no signature — the signer finds no wallet
+    /// input to sign for, and the transaction still seals.
+    #[test]
+    fn a_sponsored_transaction_passes_through_unsigned_and_unchanged() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
+            .unwrap();
+        let base = real_call_tx("composed");
+        let mut original = Vec::new();
+        tagged_serialize(&Transaction::Standard(base.clone()), &mut original).unwrap();
+        let plan = BalancedPlan {
+            base,
+            contribution: None,
+            facts: CallFacts::default(),
+        };
+
+        assert_eq!(
+            plan.segment_effects("midnight:stagenet", &provider)
+                .unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            plan.contracts(&UserAddress::from(wallet_vk())).len(),
+            3,
+            "the policy still sees the whole call tree"
+        );
+
+        let bytes = authorize_proven_tx("midnight:stagenet", &provider, plan, None).unwrap();
+        assert_eq!(bytes, original, "passed through unchanged");
+        assert_eq!(
+            hex::encode(&bytes),
+            include_str!("testdata/contract_calls/composed.tx.hex").trim()
+        );
+
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let signed = signer.sign_transaction(key.expose(), &bytes).unwrap();
+        assert!(signed.signature.is_empty(), "the wallet signs nothing");
+        let sealed = signer.encode_signed_transaction(&bytes, &signed).unwrap();
+        assert!(
+            sealed.starts_with(
+                b"midnight:transaction[v12](signature[v2],proof,pedersen-schnorr[v1]):"
+            ),
+            "the passed-through transaction seals without the wallet"
+        );
     }
 }

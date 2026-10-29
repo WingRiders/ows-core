@@ -165,7 +165,15 @@ fn plan_from_pool(
         ttl: Some(ttl),
         ..request
     };
-    let offer = plan_offer_from_pool(chain_id, crypto_provider, &request, pool, None, vault_path)?;
+    let offer = plan_offer_from_pool(
+        chain_id,
+        crypto_provider,
+        &request,
+        pool,
+        None,
+        false,
+        vault_path,
+    )?;
     Ok(IntentPlan {
         request,
         offer,
@@ -431,17 +439,19 @@ pub(super) fn wallet_unshielded_pool(
 /// Decide a maker offer from the wallet's unshielded coins `pool`: pick the coins its unshielded
 /// inputs spend and build the frame, and pick the shielded coins its shielded inputs spend. `reserve`
 /// is a NIGHT coin to spend as well, balance-neutrally (its whole value returns to the maker), so that a
-/// fee registration riding the offer's intent can draw on the DUST it has generated. Inert: nothing is
-/// proven or signed.
+/// fee registration riding the offer's intent can draw on the DUST it has generated. `carries_fee` says
+/// the offer's intent will carry a DUST fee, so it may hold nothing else. Inert: nothing is proven or
+/// signed.
 pub(super) fn plan_offer_from_pool(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     req: &MakeIntentRequest,
     pool: &[crate::UnshieldedUtxo],
     reserve: Option<&crate::UnshieldedUtxo>,
+    carries_fee: bool,
     vault_path: Option<&Path>,
 ) -> Result<OfferPlan, std::io::Error> {
-    let (frame, spent) = offer_frame(chain_id, crypto_provider, req, pool, reserve)?;
+    let (frame, spent) = offer_frame(chain_id, crypto_provider, req, pool, reserve, carries_fee)?;
     let shielded_in: Vec<&DesiredInput> = req
         .desired_inputs
         .iter()
@@ -472,6 +482,7 @@ fn offer_frame(
     req: &MakeIntentRequest,
     pool: &[crate::UnshieldedUtxo],
     reserve: Option<&crate::UnshieldedUtxo>,
+    carries_fee: bool,
 ) -> Result<(PreimageTx, Vec<crate::UnshieldedUtxo>), std::io::Error> {
     let signer = MidnightSigner::from_chain_id(chain_id);
     let (unshielded_in, shielded_in): (Vec<_>, Vec<_>) = req
@@ -492,14 +503,15 @@ fn offer_frame(
         &unshielded_in,
         &unshielded_out,
         &shielded_out,
-        !shielded_in.is_empty(),
+        !shielded_in.is_empty() || carries_fee,
         req.ttl,
     )
 }
 
 impl OfferPlan {
     /// The same offer without a reserved coin: the frame built again from `pool` with nothing reserved,
-    /// and the shielded coins kept as they were picked.
+    /// and the shielded coins kept as they were picked. Its intent still carries the fee, now paid by a
+    /// DUST spend.
     pub(super) fn without_reserve(
         self,
         chain_id: &str,
@@ -507,7 +519,7 @@ impl OfferPlan {
         req: &MakeIntentRequest,
         pool: &[crate::UnshieldedUtxo],
     ) -> Result<OfferPlan, std::io::Error> {
-        let (frame, spent) = offer_frame(chain_id, crypto_provider, req, pool, None)?;
+        let (frame, spent) = offer_frame(chain_id, crypto_provider, req, pool, None, true)?;
         Ok(OfferPlan {
             frame,
             spent,
@@ -572,9 +584,9 @@ impl OfferPlan {
 /// Construct the `proof-preimage` maker frame: the maker's unshielded inputs (with change back to the
 /// maker) + unshielded/shielded outputs, deliberately imbalanced, and the unshielded coins it spends.
 /// The intent keys at `segment` (`intentId`), but the shielded outputs ride the guaranteed section (see
-/// [`GUARANTEED_SEGMENT`]). Shielded *inputs* are authorized separately, after proving, so
-/// `has_shielded_in` keeps the empty-offer guard from firing when the maker's only contribution is
-/// shielded inputs.
+/// [`GUARANTEED_SEGMENT`]). `contributes_later` keeps the empty-offer guard from firing when the
+/// intent's contribution is added after proving: shielded inputs, which are authorized separately, or
+/// the DUST fee a sponsor's half of a merge exists to carry.
 #[allow(clippy::too_many_arguments)]
 fn build_make_intent_frame(
     chain_id: &str,
@@ -586,7 +598,7 @@ fn build_make_intent_frame(
     unshielded_in: &[&DesiredInput],
     unshielded_out: &[&DesiredOutput],
     shielded_out: &[&DesiredOutput],
-    has_shielded_in: bool,
+    contributes_later: bool,
     ttl: Option<Timestamp>,
 ) -> Result<(PreimageTx, Vec<crate::UnshieldedUtxo>), std::io::Error> {
     let sender_vk = crypto_provider
@@ -606,7 +618,7 @@ fn build_make_intent_frame(
         unshielded_out,
     )?;
     let zswap_offer = build_shielded_output_offer(signer, GUARANTEED_SEGMENT, shielded_out)?;
-    if unshielded_offer.is_none() && zswap_offer.is_none() && !has_shielded_in {
+    if unshielded_offer.is_none() && zswap_offer.is_none() && !contributes_later {
         return Err(err("makeIntent produced no offer"));
     }
 
