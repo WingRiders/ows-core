@@ -306,11 +306,9 @@ pub(super) fn sealed_maker_complement(
         complement.desired_inputs.is_empty(),
         complement.desired_outputs.is_empty(),
     ) {
-        (false, false) => Ok(complement),
-        (true, true) => Err(std::io::Error::other(
-            "the maker transaction is already balanced, so there is nothing for a taker to \
-             complete; paying the fee of another transaction is not supported",
-        )),
+        // An already balanced maker needs only its fee, which a taker that pays it (a sponsor) carries
+        // alone; `plan_merge` refuses one whose taker does not.
+        (false, false) | (true, true) => Ok(complement),
         _ => Err(std::io::Error::other(
             "refusing a one-sided maker offer: a swap must both give and want a token (MIP-0006)",
         )),
@@ -501,6 +499,12 @@ fn plan_taker_half(
     vault_path: Option<&Path>,
 ) -> Result<(OfferPlan, Option<MergeFee>), std::io::Error> {
     let paying = crate::balance_tx::adding_dust(pay_fees, indexer_url)?;
+    if !paying && complement.desired_inputs.is_empty() && complement.desired_outputs.is_empty() {
+        return Err(std::io::Error::other(
+            "the maker transaction is already balanced and the taker does not pay its fee, so there \
+             is nothing for a taker to complete",
+        ));
+    }
     let spends_unshielded = complement
         .desired_inputs
         .iter()
@@ -517,6 +521,7 @@ fn plan_taker_half(
             complement,
             &pool,
             None,
+            false,
             vault_path,
         )?;
         return Ok((taker, None));
@@ -549,6 +554,7 @@ fn plan_taker_half(
                 complement,
                 &pool,
                 Some(reserve),
+                true,
                 vault_path,
             )?;
             if let Some(reg) = registration_fee(
@@ -569,6 +575,7 @@ fn plan_taker_half(
             complement,
             &pool,
             None,
+            true,
             vault_path,
         )?,
     };
@@ -867,6 +874,27 @@ mod merge_tests {
         );
     }
 
+    /// An already balanced maker leaves a taker only its fee; a taker that does not pay it has nothing to
+    /// complete, and is told so before anything is fetched.
+    #[test]
+    fn an_already_balanced_maker_is_refused_when_the_taker_does_not_pay_its_fee() {
+        let complement =
+            complement_from_balance(BTreeMap::new(), &BTreeSet::new(), "u", "s").unwrap();
+        let refused = plan_taker_half(
+            "midnight:stagenet",
+            &provider(),
+            &[],
+            &complement,
+            false,
+            "http://127.0.0.1:1/api/v4/graphql",
+            None,
+        );
+        let Err(e) = refused else {
+            panic!("an already balanced maker must be refused");
+        };
+        assert!(e.to_string().contains("already balanced"), "{e}");
+    }
+
     #[test]
     fn dust_dimension_is_skipped() {
         let mut bal = BTreeMap::new();
@@ -979,6 +1007,7 @@ mod merge_tests {
             &complement,
             pool,
             reserve.as_ref(),
+            true,
             None,
         )
         .unwrap();
@@ -1510,6 +1539,7 @@ mod tests {
                 &complement,
                 &pool,
                 None,
+                false,
                 None,
             )
             .unwrap();
@@ -1529,6 +1559,7 @@ mod tests {
                 &complement,
                 &pool,
                 Some(&reserve),
+                true,
                 None,
             )
             .unwrap();
