@@ -717,7 +717,10 @@ exist depending on the wallet's NIGHT registration state:
 Fee sizing is done by mock-proving the shielded/dust fragments offline (through the crypto
 provider's `build_preimage_dust_spends`) so the fee is right before the real proof is
 built. The best-Dust NIGHT coin is reserved for the fee registration, and leftover NIGHT is
-rotated through a fallible offer so change returns cleanly.
+rotated through a fallible offer so change returns cleanly. Which mode a plan takes, the most
+DUST it can burn and the registration it signs reach the policy pass as `chain_extra.fee` and
+`chain_extra.dust_registrations` (see
+[How the wallet pays](#how-the-wallet-pays--chain_extrafee-and-chain_extradust_registrations)).
 
 ### The effect model (what the policy seam gates on)
 
@@ -1179,6 +1182,55 @@ called = {c["address"] for c in extra.get("contracts", []) if c["kind"] == "call
 unknown = called - {"9f3c…"}
 print(json.dumps({"allow": not unknown,
                   "reason": f"unapproved contracts: {sorted(unknown)}"}))
+```
+
+### How the wallet pays — `chain_extra.fee` and `chain_extra.dust_registrations`
+
+`segment_effects` counts the DUST a fee *spends* out of what the wallet holds. A generationless
+registration spends none of it: it pays from DUST the wallet's unregistered NIGHT has accrued but
+not yet been credited with, so it shows nothing there. It still pays the fee, and it points where
+that NIGHT generates DUST. Two sibling keys show both:
+
+```json
+"fee": { "mode": "registration", "dust_burned": "60000" },
+"dust_registrations": [
+  { "intent_id": 4,
+    "night_address": "mn_addr_preview1…",
+    "dust_address": "mn_dust_preview1…",
+    "allow_fee_payment": "60000",
+    "replaces_delegation": null }
+]
+```
+
+- **`fee.mode`** — how the wallet pays the fee: `spend` (a proof-bearing spend of DUST it holds),
+  `registration` (a generationless registration of its unregistered NIGHT, listed in
+  `dust_registrations`), or `none` (no fee section: `payFees: false`, or a `makeIntent` maker
+  offer, which the taker pays for).
+- **`fee.dust_burned`** — the most DUST the fee can take, as a decimal string. A spend takes
+  exactly this, and `segment_effects` shows it as a `dust` outflow in segment 0. A registration
+  takes at most its `allow_fee_payment`, which the ledger draws from the generationless DUST of
+  the NIGHT it registers; whatever the fee leaves is credited to the wallet's DUST address. To cap
+  what fees cost in DUST whichever way they are paid, cap `fee.dust_burned`.
+- **`dust_registrations`** — every dust registration the wallet signs. The wallet's own fee
+  registration rides its balancing intent and points the wallet's NIGHT key (`night_address`) at
+  the wallet's own DUST address (`dust_address`). Dust actions apply before any segment executes,
+  whichever intent carries them, so an entry names its intent (`intent_id`), not a segment.
+- **`replaces_delegation`** — whether the registration moves an existing delegation of that NIGHT
+  key to a different DUST address. On chain a registration overwrites the key's delegation, and a
+  key delegated elsewhere can still hold NIGHT coins that generate nothing (those it held before
+  the delegation), which is exactly when the wallet picks the registration path. The indexer
+  reports whether a NIGHT coin generates DUST, not where its key is delegated, so the wallet
+  cannot tell: the field is always `null` (unknown) today. Where the wallet's NIGHT may be
+  delegated to another DUST address, deny any transaction with a non-empty `dust_registrations`.
+  The wallet prefers a registration whenever it holds an unregistered NIGHT coin, so such a policy
+  refuses those transactions rather than moving them to a spend.
+
+```python
+fee = extra.get("fee") or {}
+if int(fee.get("dust_burned", "0")) > 1_000_000_000:
+    verdict(False, f"fee may burn {fee['dust_burned']} DUST specks")
+if extra.get("dust_registrations"):
+    verdict(False, "registers NIGHT for DUST generation")
 ```
 
 ### Why the design consumes an executable policy rather than a built-in rule
