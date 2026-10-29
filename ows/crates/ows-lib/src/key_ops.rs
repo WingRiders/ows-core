@@ -468,6 +468,7 @@ fn decrypt_key_from_api_key(
         ))
     })?;
 
+    let index = crate::ops::signing_index(wallet, chain_type, index)?;
     let envelope: CryptoEnvelope = serde_json::from_value(envelope_value.clone())?;
     let secret = decrypt(&envelope, token)?;
     crate::ops::secret_to_signing_key(&secret, &wallet.key_type, chain_type, index)
@@ -706,6 +707,67 @@ mod tests {
         );
         let sign_result = result.unwrap();
         assert!(!sign_result.signature.is_empty());
+    }
+
+    /// A token signing without an index, as the CLI does by default, signs with the Midnight
+    /// account the wallet stored rather than account 0.
+    #[test]
+    fn api_key_midnight_message_defaults_to_the_wallets_stored_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().to_path_buf();
+        let passphrase = "test-pass";
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let info = crate::ops::import_wallet_mnemonic(
+            "mn-agent",
+            phrase,
+            Some(passphrase),
+            Some(2),
+            Some(&vault),
+        )
+        .unwrap();
+        let stored = &info
+            .accounts
+            .iter()
+            .find(|a| a.chain_id == "midnight:mainnet")
+            .unwrap()
+            .address;
+        let preview = ows_signer::chains::MidnightSigner::preview()
+            .reencode_unshielded_address(stored)
+            .unwrap();
+        let policy = ows_core::Policy {
+            id: "midnight-preview".to_string(),
+            name: "Midnight preview".to_string(),
+            version: 1,
+            created_at: "2026-03-22T10:00:00Z".to_string(),
+            rules: vec![PolicyRule::AllowedChains {
+                chain_ids: vec!["midnight:preview".to_string()],
+            }],
+            executable: None,
+            config: None,
+            action: PolicyAction::Deny,
+        };
+        policy_store::save_policy(&policy, Some(&vault)).unwrap();
+        let (token, _) = create_api_key(
+            "midnight-agent",
+            &[info.id],
+            &[policy.id],
+            passphrase,
+            None,
+            Some(&vault),
+        )
+        .unwrap();
+
+        let chain = ows_core::parse_chain("midnight:preview").unwrap();
+        sign_message_with_api_key(
+            &token,
+            "mn-agent",
+            &chain,
+            b"hello",
+            None,
+            Some(&preview),
+            Some(&vault),
+        )
+        .expect("the token signs with the stored account's key");
     }
 
     #[test]
