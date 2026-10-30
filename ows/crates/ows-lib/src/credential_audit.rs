@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+use ows_core::policy::TypedDataContext;
 use ows_core::Credential;
 use serde::Serialize;
 
@@ -76,6 +77,26 @@ pub(crate) fn deleted(credential: &Credential, vault_path: Option<&Path>) {
         "credential_deleted",
         None,
         format!("credential_id={}, name={}", credential.id, credential.name),
+        vault_path,
+    );
+}
+
+/// A signature is a bearer artifact, so each one is traced, with the account and the circuit the
+/// request names.
+pub(crate) fn signed(
+    credential_id: &str,
+    chain_id: &str,
+    request: &TypedDataContext,
+    vault_path: Option<&Path>,
+) {
+    append(
+        "credential_signed",
+        Some(chain_id),
+        format!(
+            "credential_id={credential_id}, verifying_contract={}, primary_type={}, actor=owner, outcome=allowed",
+            request.verifying_contract.as_deref().unwrap_or("none"),
+            request.primary_type,
+        ),
         vault_path,
     );
 }

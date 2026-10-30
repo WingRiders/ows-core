@@ -33,6 +33,25 @@ pub struct CredentialInfo {
     pub created_at: String,
 }
 
+/// A credential's signature over an authorisation request.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialSignature {
+    /// Hex of the scheme's signature bytes.
+    pub signature: String,
+    /// The signature as the named fields the verifier takes it in, as the scheme renders them.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CredentialSignature {
+    /// The object `ows credential sign --json` and the bindings return: the scheme's fields,
+    /// and the signature bytes as hex under `signature`.
+    pub fn to_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut json = self.fields.clone();
+        json.insert("signature".to_string(), self.signature.clone().into());
+        json
+    }
+}
+
 /// Result from a signing operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignResult {
