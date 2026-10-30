@@ -12,6 +12,9 @@ OWS extends the Ethereum Keystore v3 format with per-chain type adaptations, sto
 ├── wallets/
 │   ├── <wallet-id>.json           # Encrypted wallet file (one per wallet)
 │   └── ...
+├── credentials/
+│   ├── <credential-id>.json       # Credential file (one per credential)
+│   └── ...
 ├── keys/
 │   ├── <key-id>.json              # API key + encrypted wallet secrets (one per key)
 │   └── ...
@@ -28,6 +31,8 @@ OWS extends the Ethereum Keystore v3 format with per-chain type adaptations, sto
 ~/.ows/                       drwx------  (700)
 ~/.ows/wallets/               drwx------  (700)
 ~/.ows/wallets/*.json         -rw-------  (600)
+~/.ows/credentials/           drwx------  (700)
+~/.ows/credentials/*.json     -rw-------  (600)
 ~/.ows/keys/                  drwx------  (700)
 ~/.ows/keys/*.json            -rw-------  (600)
 ~/.ows/policies/              drwxr-xr-x  (755)
@@ -36,7 +41,7 @@ OWS extends the Ethereum Keystore v3 format with per-chain type adaptations, sto
 ~/.ows/logs/audit.jsonl       -rw-------  (600)
 ```
 
-The `wallets/` and `keys/` directories contain encrypted secrets and MUST be readable only by the owner. Implementations MUST verify permissions on startup and refuse to operate if these directories are world-readable or group-readable.
+The `wallets/`, `credentials/` and `keys/` directories contain encrypted secrets and MUST be readable only by the owner. Implementations MUST verify permissions on startup and refuse to operate if these directories are world-readable or group-readable.
 
 The `policies/` directory uses relaxed permissions (755/644) because policy files are not secret — they contain rule definitions and paths to executables, not key material.
 
@@ -90,6 +95,39 @@ Each wallet is stored as a single JSON file extending the Ethereum Keystore v3 s
 | `accounts` | array | yes | Derived accounts (see Account object) |
 | `crypto` | object | yes | Encryption parameters (see Crypto object) |
 | `key_type` | string | yes | `mnemonic` (BIP-39) or `private_key` (raw) |
+| `metadata` | object | no | Extensible metadata |
+
+## Credential File Format
+
+A credential is a key that another account (for example a contract) registered as one of its signers. It is **not a wallet**: it has no accounts, address or balance, its key is generated or imported but never derived, and it is stored in `~/.ows/credentials/`, which no wallet command reads. Each credential is a JSON file `~/.ows/credentials/<id>.json` with the same filesystem permissions as wallet files (directory `700`, file `600`).
+
+```json
+{
+  "ows_version": 2,
+  "id": "5d1f0c2e-8a3b-4c6d-9e7f-1a2b3c4d5e6f",
+  "name": "device-key",
+  "created_at": "2026-10-30T12:00:00Z",
+  "chain": "midnight",
+  "scheme": "jubjub",
+  "public_key": "<scheme-specific public key>",
+  "origin": "generated",
+  "crypto": { "...": "same Crypto object as a wallet file" }
+}
+```
+
+### Field Definitions
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `ows_version` | integer | yes | Schema version (currently `2`). A file of any other version is refused rather than read in part. |
+| `id` | string | yes | UUID v4 credential identifier. It names the file, so it must be a plain file name. |
+| `name` | string | yes | Human-readable credential name |
+| `created_at` | string | yes | ISO 8601 creation timestamp |
+| `chain` | string | yes | Chain the credential belongs to |
+| `scheme` | string | yes | Credential scheme within the chain |
+| `public_key` | string | yes | Public key in the scheme's canonical text encoding |
+| `origin` | string | yes | `generated` (created by OWS) or `imported` |
+| `crypto` | object | yes | Encryption parameters (see Crypto object) |
 | `metadata` | object | no | Extensible metadata |
 
 ## API Key File Format
