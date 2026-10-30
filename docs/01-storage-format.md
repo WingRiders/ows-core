@@ -165,11 +165,15 @@ Each API key is stored as a JSON file in `~/.ows/keys/`. The key file contains m
 | `token_hash` | string | yes | SHA-256 hex digest of the raw token. The raw token (`ows_key_<64 hex chars>`) is shown once at creation and never stored. |
 | `created_at` | string | yes | ISO 8601 creation timestamp |
 | `wallet_ids` | array | yes | Wallet IDs this key is authorized to access |
+| `credential_ids` | array | no | Credential IDs this key is authorized to sign with. Omitted when empty. |
 | `policy_ids` | array | yes | Policy IDs evaluated on every request made with this key |
 | `expires_at` | string | no | ISO 8601 expiry timestamp. `null` means no expiry. |
 | `wallet_secrets` | object | yes | Map of wallet ID → CryptoEnvelope. Each entry is the wallet's decrypted secret re-encrypted under HKDF(token), whether that secret is a mnemonic phrase or private-key JSON. |
+| `credential_secrets` | object | no | Map of credential ID → CryptoEnvelope. Each entry is the credential's secret key re-encrypted under HKDF(token). Omitted when empty. |
 
 The `keys/` directory and its contents use the same strict permissions as `wallets/` (`700` for the directory, `600` for files) because `wallet_secrets` contains encrypted key material and `token_hash` must be protected against local reads.
+
+`credential_ids` and `credential_secrets` are both omitted when empty, so a key file written before credentials existed loads unchanged, and a key with no credentials is written without them. A key can reach wallets, credentials, or both. Deleting a credential removes its ID and its encrypted copy from every key file.
 
 Revoking an API key means deleting the key file. The encrypted secret copies are destroyed. The original wallet file and other API keys are unaffected.
 
@@ -242,7 +246,7 @@ All signing operations are appended to `~/.ows/logs/audit.jsonl`:
 }
 ```
 
-Current CLI audit operations:
+Current audit operations. The CLI writes the wallet and policy records. The library writes the credential records, including the per-credential `create_api_key` and `revoke_api_key` records, so the Node and Python bindings write them too:
 
 | Operation | Scope | Recorded when |
 |---|---|---|
@@ -251,7 +255,9 @@ Current CLI audit operations:
 | `sign_message` | wallet | a message or EVM typed-data signing is **attempted** |
 | `broadcast_transaction` | wallet | signed bytes are submitted to a node |
 | `read_balance` | wallet | an API token unseals a Midnight account key to read its balances, whether the policy allows it or not |
-| `create_api_key`, `revoke_api_key` | wallet | an agent credential is minted or revoked — one record per wallet the key reaches |
+| `create_api_key`, `revoke_api_key` | wallet | an agent credential is minted or revoked — one record per wallet the key reaches, and one vault-scoped record per credential the key reaches |
+| `credential_created`, `credential_imported`, `credential_deleted` | credential | the vault's credential set changes |
+| `credential_signed` | credential | a credential signing is **attempted**, whether or not a policy allows it. The record carries the verifying contract and primary type |
 | `create_policy`, `delete_policy` | vault | the policy set changes |
 
 Signing and broadcasting are recorded separately, because they are separable: a signature — on Midnight, a fully sealed and submittable transaction — can be produced by one party and submitted by another, so a `broadcast_transaction` record alone does not account for every artifact a wallet has released.

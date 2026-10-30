@@ -91,6 +91,8 @@ Agent calls: sign_transaction(wallet, chain, tx, "ows_key_a1b2c3...")
 13. Return signature
 ```
 
+A credential request follows the same flow with these differences. The agent calls `sign_with_credential(credential, chain, request, token)`. Step 4 checks that the credential is in the key's `credential_ids`. The chain and the request are checked against the credential's scheme before any policy runs. Policies see a `sign_typed_data` request with `credential_id` set and `wallet_id` empty. The secret comes from `key.credential_secrets` in step 9. See [Credentials](#credentials).
+
 ### Revocation
 
 Delete the API key file. The encrypted secret copy is gone. `SHA256(T)` matches nothing. The token is useless. The original wallet and other API keys are unaffected.
@@ -128,7 +130,7 @@ Time-bound access (compares `PolicyContext.timestamp` to this ISO-8601 string).
 
 ### `allowed_typed_data_contracts`
 
-Restricts which smart contracts an API key can sign EIP-712 typed data for. The rule checks the `domain.verifyingContract` field of the typed data against an allowlist of addresses.
+Restricts which smart contracts an API key can sign EIP-712 typed data for. The rule checks the `domain.verifyingContract` field of the typed data against an allowlist of addresses. It also applies to credential requests, where `verifying_contract` is the account contract the request names.
 
 ```json
 {
@@ -243,7 +245,7 @@ The base JSON object available to policy evaluation:
 
 | Field | Type | Always Present | Description |
 |---|---|---|---|
-| `chain_id` | string | yes | CAIP-2 chain identifier |
+| `chain_id` | string | yes | CAIP-2 chain identifier. On a credential request the caller chooses it and the signature does not bind it, so treat it as advisory. |
 | `wallet_id` | string | yes | Wallet ID in scope for this request. Empty (`""`) when the request signs with a credential rather than a wallet. |
 | `api_key_id` | string | yes | The ID of the API key making this request |
 | `credential_id` | string | no | The ID of the credential being signed with. Present only for credential requests (always `sign_typed_data`), where `wallet_id` is empty; omitted for wallet requests. |
@@ -311,6 +313,21 @@ Present only for `sign_typed_data` calls. Omitted entirely for `sign_message` an
 ```
 
 All fields except `primary_type` and `raw_json` are optional (the EIP-712 domain can omit any field). Executable policies can use `raw_json` to inspect the full typed data structure including message fields.
+
+Credential requests also arrive as `sign_typed_data` and reuse this object, although an authorisation request is not EIP-712 typed data. The credential's scheme fills it from the request: `verifying_contract` is the account contract the request names, `primary_type` names what the request authorises, `domain_name` is the request's scheme, and `raw_json` is the request as it was sent. A chain's own document gives the full mapping and what its signature binds.
+
+## Credentials
+
+A credential is a key that another account registered as one of its signers. It is not a wallet. An API key reaches a credential through `credential_ids`, and `ows key create --credential <name>` adds one. The token holds its own encrypted copy of the credential's secret, as it does for a wallet.
+
+A credential signs only the authorisation request its scheme accepts. Each request goes through the same policy engine as typed data:
+
+- `request_type` is `sign_typed_data`.
+- `credential_id` is set and `wallet_id` is `""`.
+- `typed_data` is the scheme's description of the request. The slot is reused: the request is not EIP-712, but `allowed_typed_data_contracts` and executable policies read the slot as they do for EIP-712.
+- `chain_id` is chosen by the caller and is not bound by the signature. A policy must not rely on it to limit where a signature can be used.
+
+A deny happens before the secret is decrypted. The scheme, its request format and its cautions for policy authors are in the chain's document, for example [Midnight](midnight#account-device-keys-ows-credential).
 
 ## PolicyResult
 

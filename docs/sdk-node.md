@@ -62,6 +62,20 @@ interface SignResult {
 interface SendResult {
   txHash: string;         // Transaction hash
 }
+
+interface CredentialInfo {
+  id: string;             // UUID v4
+  name: string;
+  chain: string;          // e.g. "<chain>"
+  scheme: string;         // Signature scheme within the chain
+  publicKey: string;      // Scheme's canonical text encoding
+  origin: string;         // "generated" or "imported"
+  createdAt: string;      // ISO 8601
+}
+
+// The signature as hex under `signature`, plus the scheme's named fields: the object
+// `ows credential sign --json` prints
+type CredentialSignature = Record<string, any>;
 ```
 
 ### Mnemonic
@@ -438,9 +452,9 @@ deletePolicy("base-only");
 
 ### API Key Management
 
-#### `createApiKey(name, walletIds, policyIds, passphrase, expiresAt?, vaultPath?)`
+#### `createApiKey(name, walletIds, policyIds, passphrase, expiresAt?, vaultPath?, credentialIds?)`
 
-Create an API key for agent access to wallets. Returns the raw token (shown once &mdash; caller must save it) and key metadata.
+Create an API key for agent access to wallets and, optionally, credentials. Returns the raw token (shown once &mdash; caller must save it) and key metadata.
 
 ```javascript
 const key = createApiKey(
@@ -462,6 +476,7 @@ console.log(key.name);
 | `passphrase` | `string` | &mdash; | Vault passphrase (needed to re-encrypt wallet secrets for the key) |
 | `expiresAt` | `string` | `undefined` | ISO 8601 expiry timestamp |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
+| `credentialIds` | `string[]` | `[]` | Credential names or IDs this key can sign with |
 
 **Returns:** `ApiKeyResult` &mdash; `{ token: string, id: string, name: string }`
 
@@ -488,6 +503,56 @@ revokeApiKey("key-id");
 |-------|------|---------|-------------|
 | `id` | `string` | &mdash; | API key ID |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
+
+### Credentials
+
+A credential is a key that another account registered as one of its signers. It is not a wallet: it has no addresses, its key is generated or imported and never derived, and no function returns it. It signs only the authorisation request its scheme accepts. A chain's document gives its scheme, request format and signature fields, for example [Midnight](midnight#account-device-keys-ows-credential).
+
+Each credential function writes the same audit record to `<vault>/logs/audit.jsonl` as the matching `ows credential` command.
+
+#### `createCredential(name, chain, scheme?, passphrase?, vaultPath?)`
+
+Generate a credential key and store it encrypted under `passphrase`, which may not be empty or an `ows_key_...` token. `scheme` defaults to the chain's scheme.
+
+```javascript
+const credential = createCredential("device-key", "<chain>", undefined, "my-passphrase");
+console.log(credential.publicKey); // register this with the account
+```
+
+**Returns:** `CredentialInfo`
+
+#### `importCredential(name, chain, secretHex, scheme?, passphrase?, vaultPath?)`
+
+Store an existing credential key, encrypted under `passphrase` as `createCredential` does. `secretHex` is in the scheme's import format. The key may also live elsewhere, and OWS cannot stop another signer from using it. The origin is recorded as `"imported"`.
+
+**Returns:** `CredentialInfo`
+
+#### `listCredentials(vaultPath?)`
+
+List all credentials. The key is never returned.
+
+**Returns:** `CredentialInfo[]`
+
+#### `getCredential(nameOrId, vaultPath?)`
+
+Look up a credential by name or UUID.
+
+**Returns:** `CredentialInfo`
+
+#### `deleteCredential(nameOrId, vaultPath?)`
+
+Delete a credential. Its ID and encrypted copy are also removed from every API key. Any registration of the public key with an account stays until the account removes it.
+
+#### `signWithCredential(nameOrId, chain, request, passphrase?, vaultPath?)`
+
+Sign an authorisation request, given as a JSON string. `chain` must be the credential's chain. `passphrase` is the owner's passphrase or an `ows_key_...` token. With a token, the key's policies run first, and the key must have been created with this credential in `credentialIds`.
+
+```javascript
+const sig = signWithCredential("device-key", "<chain>:<network>", requestJson, "ows_key_...");
+console.log(sig); // the signature hex and the fields the account's verifier takes
+```
+
+**Returns:** `CredentialSignature`, the same object `ows credential sign --json` prints
 
 ## Custom Vault Path
 

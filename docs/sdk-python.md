@@ -66,6 +66,17 @@ All functions return Python dicts. Wallet functions return:
 {
     "tx_hash": "0xabc...",
 }
+
+# CredentialInfo
+{
+    "id": "5d1f0c2e-...",             # UUID v4
+    "name": "device-key",
+    "chain": "...",                   # Chain the credential is for
+    "scheme": "...",                  # Signature scheme within the chain
+    "public_key": "...",              # Scheme's canonical text encoding
+    "origin": "generated",            # or "imported"
+    "created_at": "2026-10-30T...",   # ISO 8601
+}
 ```
 
 ### Mnemonic
@@ -313,6 +324,12 @@ from ows import (
     get_policy,
     delete_policy,
     create_api_key,
+    create_credential,
+    import_credential,
+    list_credentials,
+    get_credential,
+    delete_credential,
+    sign_with_credential,
     list_api_keys,
     revoke_api_key,
 )
@@ -324,9 +341,34 @@ from ows import (
 | `list_policies(vault_path=None)` | List all registered policies |
 | `get_policy(id, vault_path=None)` | Load a single policy by ID |
 | `delete_policy(id, vault_path=None)` | Delete a policy |
-| `create_api_key(name, wallet_ids, policy_ids, passphrase, expires_at=None, vault_path=None)` | Create an API key and return `{"token", "id", "name"}` |
+| `create_api_key(name, wallet_ids, policy_ids, passphrase, expires_at=None, vault_path=None, credential_ids=None)` | Create an API key and return `{"token", "id", "name"}`. `credential_ids` lets the key sign with those credentials |
 | `list_api_keys(vault_path=None)` | List API keys (metadata only, no tokens) |
 | `revoke_api_key(id, vault_path=None)` | Delete an API key file |
+
+## Credentials
+
+A credential is a key that another account registered as one of its signers. It is not a wallet: it has no addresses, its key is generated or imported and never derived, and no function returns it. It signs only the authorisation request its scheme accepts. A chain's document gives its scheme, request format and signature fields, for example [Midnight](midnight#account-device-keys-ows-credential).
+
+Each credential function writes the same audit record to `<vault>/logs/audit.jsonl` as the matching `ows credential` command.
+
+| Function | Description |
+|----------|-------------|
+| `create_credential(name, chain, scheme=None, passphrase=None, vault_path=None)` | Generate a credential key and return a `CredentialInfo` dict. `passphrase` may not be empty or an `ows_key_...` token. `scheme` defaults to the chain's scheme |
+| `import_credential(name, chain, secret_hex, scheme=None, passphrase=None, vault_path=None)` | Store an existing credential key, given as hex in the scheme's import format, under a passphrase as `create_credential` does. The key may also live elsewhere, and OWS cannot stop another signer from using it |
+| `list_credentials(vault_path=None)` | List credentials (public keys only) |
+| `get_credential(name_or_id, vault_path=None)` | Look up a credential by name or ID |
+| `delete_credential(name_or_id, vault_path=None)` | Delete a credential and its copy in every API key. It does not remove the public key from any account that registered it |
+| `sign_with_credential(name_or_id, chain, request, passphrase=None, vault_path=None)` | Sign an authorisation request (a JSON string) and return a dict with the signature as hex under `signature` and the scheme's named fields, the object `ows credential sign --json` prints |
+
+`chain` must be the credential's chain. `passphrase` is the owner's passphrase or an `ows_key_...` token. With a token, the key's policies run first, and the key must have been created with this credential in `credential_ids`.
+
+```python
+credential = create_credential("device-key", "<chain>", passphrase="my-passphrase")
+print(credential["public_key"])  # register this with the account
+
+sig = sign_with_credential("device-key", "<chain>:<network>", request_json, "ows_key_...")
+print(sig)  # the signature hex and the fields the account's verifier takes
+```
 
 ## Custom Vault Path
 
