@@ -1185,12 +1185,24 @@ mod tests {
                 "ows-signer/src/credential.rs",
                 include_str!("../../ows-signer/src/credential.rs"),
             ),
+            (
+                "ows-cli/src/commands/credential.rs",
+                include_str!("../../ows-cli/src/commands/credential.rs"),
+            ),
+            (
+                "ows-cli/src/commands/key.rs",
+                include_str!("../../ows-cli/src/commands/key.rs"),
+            ),
         ];
         // Files that also hold wallet code, which may name a chain, are scanned only in their
         // credential items.
         let shared_files = [
             ("ows-lib/src/types.rs", include_str!("types.rs")),
             ("ows-lib/src/key_ops.rs", include_str!("key_ops.rs")),
+            (
+                "ows-cli/src/main.rs",
+                include_str!("../../ows-cli/src/main.rs"),
+            ),
         ];
 
         let mut generic: Vec<(&str, String)> = whole_files

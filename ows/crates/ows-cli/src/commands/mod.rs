@@ -1,4 +1,5 @@
 pub mod config;
+pub mod credential;
 pub mod derive;
 pub mod fund;
 pub mod generate;
