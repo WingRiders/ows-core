@@ -1,3 +1,4 @@
+pub mod credential_store;
 pub mod error;
 pub mod key_ops;
 pub mod key_store;
