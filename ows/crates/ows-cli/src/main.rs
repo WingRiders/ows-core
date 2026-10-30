@@ -23,6 +23,11 @@ enum Commands {
         #[command(subcommand)]
         subcommand: WalletCommands,
     },
+    /// Manage credentials: keys that sign authorisation requests but are not wallets
+    Credential {
+        #[command(subcommand)]
+        subcommand: CredentialCommands,
+    },
     /// Sign messages and transactions
     Sign {
         #[command(subcommand)]
@@ -309,6 +314,60 @@ enum PolicyCommands {
 }
 
 #[derive(Subcommand)]
+enum CredentialCommands {
+    /// Generate a new credential key
+    Create {
+        /// Credential name
+        #[arg(long)]
+        name: String,
+        /// Chain the credential is for, as a name, namespace or chain id
+        #[arg(long)]
+        chain: String,
+        /// Signature scheme (defaults to the chain's)
+        #[arg(long)]
+        scheme: Option<String>,
+    },
+    /// Import an existing credential key (hex from OWS_PRIVATE_KEY env or stdin)
+    Import {
+        /// Credential name
+        #[arg(long)]
+        name: String,
+        /// Chain the credential is for, as a name, namespace or chain id
+        #[arg(long)]
+        chain: String,
+        /// Signature scheme (defaults to the chain's)
+        #[arg(long)]
+        scheme: Option<String>,
+    },
+    /// List all credentials
+    List,
+    /// Delete a credential from the vault
+    Delete {
+        /// Credential name or ID
+        #[arg(long)]
+        credential: String,
+        /// Confirm deletion (required)
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Sign an authorisation request with a credential (OWS_PASSPHRASE may hold an ows_key_ token)
+    Sign {
+        /// Credential name or ID
+        #[arg(long)]
+        credential: String,
+        /// Chain, as <chain>:<network>
+        #[arg(long)]
+        chain: String,
+        /// The authorisation request, as JSON
+        #[arg(long)]
+        request: String,
+        /// Output the signature as the scheme's named fields, in JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum KeyCommands {
     /// Create an API key for agent access to wallets
     Create {
@@ -318,6 +377,9 @@ enum KeyCommands {
         /// Wallet name or ID (repeatable)
         #[arg(long = "wallet")]
         wallets: Vec<String>,
+        /// Credential name or ID (repeatable)
+        #[arg(long = "credential")]
+        credentials: Vec<String>,
         /// Policy ID to attach (repeatable)
         #[arg(long = "policy")]
         policies: Vec<String>,
@@ -423,6 +485,29 @@ fn run(cli: Cli) -> Result<(), CliError> {
             WalletCommands::List => commands::wallet::list(),
             WalletCommands::Info => commands::info::run(),
         },
+        Commands::Credential { subcommand } => match subcommand {
+            CredentialCommands::Create {
+                name,
+                chain,
+                scheme,
+            } => commands::credential::create(&name, &chain, scheme.as_deref()),
+            CredentialCommands::Import {
+                name,
+                chain,
+                scheme,
+            } => commands::credential::import(&name, &chain, scheme.as_deref()),
+            CredentialCommands::List => commands::credential::list(),
+            CredentialCommands::Delete {
+                credential,
+                confirm,
+            } => commands::credential::delete(&credential, confirm),
+            CredentialCommands::Sign {
+                credential,
+                chain,
+                request,
+                json,
+            } => commands::credential::sign(&credential, &chain, &request, json),
+        },
         Commands::Sign { subcommand } => match subcommand {
             SignCommands::Message {
                 chain,
@@ -506,9 +591,16 @@ fn run(cli: Cli) -> Result<(), CliError> {
             KeyCommands::Create {
                 name,
                 wallets,
+                credentials,
                 policies,
                 expires_at,
-            } => commands::key::create(&name, &wallets, &policies, expires_at.as_deref()),
+            } => commands::key::create(
+                &name,
+                &wallets,
+                &credentials,
+                &policies,
+                expires_at.as_deref(),
+            ),
             KeyCommands::List => commands::key::list(),
             KeyCommands::Revoke { id, confirm } => commands::key::revoke(&id, confirm),
         },
