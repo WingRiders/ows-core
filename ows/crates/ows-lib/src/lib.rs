@@ -7,6 +7,7 @@ pub mod near_rpc;
 pub mod ops;
 pub mod policy_engine;
 pub mod policy_store;
+mod record_store;
 mod sui_grpc;
 pub mod types;
 pub mod vault;

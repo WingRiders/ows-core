@@ -1,76 +1,28 @@
-use ows_core::{Config, EncryptedWallet};
-use std::fs;
+use ows_core::EncryptedWallet;
 use std::path::{Path, PathBuf};
 
 use crate::error::OwsLibError;
+use crate::record_store::{self, Lookup, VaultRecord};
 
-/// Set directory permissions to 0o700 (owner-only).
-#[cfg(unix)]
-fn set_dir_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o700);
-    if let Err(e) = fs::set_permissions(path, perms) {
-        eprintln!(
-            "warning: failed to set permissions on {}: {e}",
-            path.display()
-        );
+pub use crate::record_store::{check_vault_permissions, resolve_vault_path};
+
+impl VaultRecord for EncryptedWallet {
+    const DIR: &'static str = "wallets";
+    const SECRET: bool = true;
+    fn id(&self) -> &str {
+        &self.id
     }
-}
-
-/// Set file permissions to 0o600 (owner read/write only).
-#[cfg(unix)]
-fn set_file_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o600);
-    if let Err(e) = fs::set_permissions(path, perms) {
-        eprintln!(
-            "warning: failed to set permissions on {}: {e}",
-            path.display()
-        );
+    fn name(&self) -> &str {
+        &self.name
     }
-}
-
-/// Warn if a directory has permissions more open than 0o700.
-#[cfg(unix)]
-pub fn check_vault_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = fs::metadata(path) {
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            eprintln!(
-                "warning: {} has permissions {:04o}, expected 0700",
-                path.display(),
-                mode
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn set_dir_permissions(_path: &Path) {}
-
-#[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) {}
-
-#[cfg(not(unix))]
-pub fn check_vault_permissions(_path: &Path) {}
-
-/// Resolve the vault path: use explicit path if provided, otherwise default (~/.ows).
-pub fn resolve_vault_path(vault_path: Option<&Path>) -> PathBuf {
-    match vault_path {
-        Some(p) => p.to_path_buf(),
-        None => Config::default().vault_path,
+    fn created_at(&self) -> &str {
+        &self.created_at
     }
 }
 
 /// Returns the wallets directory, creating it with strict permissions if necessary.
 pub fn wallets_dir(vault_path: Option<&Path>) -> Result<PathBuf, OwsLibError> {
-    let lws_dir = resolve_vault_path(vault_path);
-    let dir = lws_dir.join("wallets");
-    fs::create_dir_all(&dir)?;
-    set_dir_permissions(&lws_dir);
-    set_dir_permissions(&dir);
-    Ok(dir)
+    record_store::dir::<EncryptedWallet>(vault_path)
 }
 
 /// Save an encrypted wallet file with strict permissions.
@@ -78,12 +30,7 @@ pub fn save_encrypted_wallet(
     wallet: &EncryptedWallet,
     vault_path: Option<&Path>,
 ) -> Result<(), OwsLibError> {
-    let dir = wallets_dir(vault_path)?;
-    let path = dir.join(format!("{}.json", wallet.id));
-    let json = serde_json::to_string_pretty(wallet)?;
-    fs::write(&path, json)?;
-    set_file_permissions(&path);
-    Ok(())
+    record_store::save(wallet, vault_path)
 }
 
 /// Load all encrypted wallets from the vault.
@@ -92,38 +39,18 @@ pub fn save_encrypted_wallet(
 pub fn list_encrypted_wallets(
     vault_path: Option<&Path>,
 ) -> Result<Vec<EncryptedWallet>, OwsLibError> {
-    let dir = wallets_dir(vault_path)?;
-    check_vault_permissions(&dir);
+    record_store::list(vault_path)
+}
 
-    let mut wallets = Vec::new();
-
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(wallets),
-        Err(e) => return Err(e.into()),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<EncryptedWallet>(&contents) {
-                Ok(w) => wallets.push(w),
-                Err(e) => {
-                    eprintln!("warning: skipping {}: {e}", path.display());
-                }
-            },
-            Err(e) => {
-                eprintln!("warning: skipping {}: {e}", path.display());
-            }
-        }
+fn wallet_error(lookup: Lookup, name_or_id: &str) -> OwsLibError {
+    match lookup {
+        Lookup::NotFound => OwsLibError::WalletNotFound(name_or_id.to_string()),
+        Lookup::Ambiguous { count } => OwsLibError::AmbiguousWallet {
+            name: name_or_id.to_string(),
+            count,
+        },
+        Lookup::Failed(e) => e,
     }
-
-    wallets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(wallets)
 }
 
 /// Look up a wallet by exact ID first, then by name (case-sensitive).
@@ -132,40 +59,17 @@ pub fn load_wallet_by_name_or_id(
     name_or_id: &str,
     vault_path: Option<&Path>,
 ) -> Result<EncryptedWallet, OwsLibError> {
-    let wallets = list_encrypted_wallets(vault_path)?;
-
-    // Try exact ID match first
-    if let Some(w) = wallets.iter().find(|w| w.id == name_or_id) {
-        return Ok(w.clone());
-    }
-
-    // Try name match (case-sensitive)
-    let matches: Vec<&EncryptedWallet> = wallets.iter().filter(|w| w.name == name_or_id).collect();
-    match matches.len() {
-        0 => Err(OwsLibError::WalletNotFound(name_or_id.to_string())),
-        1 => Ok(matches[0].clone()),
-        n => Err(OwsLibError::AmbiguousWallet {
-            name: name_or_id.to_string(),
-            count: n,
-        }),
-    }
+    record_store::find(name_or_id, vault_path).map_err(|l| wallet_error(l, name_or_id))
 }
 
 /// Delete a wallet file from the vault by ID.
 pub fn delete_wallet_file(id: &str, vault_path: Option<&Path>) -> Result<(), OwsLibError> {
-    let dir = wallets_dir(vault_path)?;
-    let path = dir.join(format!("{id}.json"));
-    if !path.exists() {
-        return Err(OwsLibError::WalletNotFound(id.to_string()));
-    }
-    fs::remove_file(&path)?;
-    Ok(())
+    record_store::delete::<EncryptedWallet>(id, vault_path).map_err(|l| wallet_error(l, id))
 }
 
 /// Check whether a wallet with the given name already exists in the vault.
 pub fn wallet_name_exists(name: &str, vault_path: Option<&Path>) -> Result<bool, OwsLibError> {
-    let wallets = list_encrypted_wallets(vault_path)?;
-    Ok(wallets.iter().any(|w| w.name == name))
+    record_store::name_exists::<EncryptedWallet>(name, vault_path)
 }
 
 #[cfg(test)]
