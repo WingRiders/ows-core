@@ -363,3 +363,122 @@ def test_sign_typed_data_respects_allowed_typed_data_contracts(vault_dir):
     ows.revoke_api_key(key["id"], vault_path_opt=vault_dir)
     ows.delete_policy("td-contract-only", vault_path_opt=vault_dir)
     ows.delete_wallet(wallet["id"], vault_path_opt=vault_dir)
+
+
+ACCOUNT = "a19612afc371b1a4d2fc2410377da895ff7ca406e74449b75dcc32a2b6df7964"
+COLOR = "5cd36fe5ed159246257b476bb67bc8266290581ef3844fcabd7c134b3f8b03ea"
+RECIPIENT = "b0c1d2e3f405162738495a6b7c8d9eafb0c1d2e3f405162738495a6b7c8d9e00"
+
+
+def withdraw_unshielded():
+    return json.dumps({
+        "scheme": "midnight:account:auth:v1",
+        "account": ACCOUNT,
+        "circuit": "withdraw_unshielded",
+        "args": [
+            {"type": "Bytes<32>", "value": COLOR},
+            {"type": "Uint<128>", "value": "3000000"},
+            {"type": "UserAddress", "value": "0x" + RECIPIENT},
+        ],
+        "witnesses": [],
+        "authNonce": "3",
+    })
+
+
+def test_credential_create_list_sign_delete(vault_dir):
+    cred = ows.create_credential("passport-device", "midnight", passphrase="pw", vault_path_opt=vault_dir)
+    assert cred["name"] == "passport-device"
+    assert cred["chain"] == "midnight"
+    assert cred["origin"] == "generated"
+    assert len(cred["public_key"]) == 128
+    assert not any("secret" in k or "crypto" in k for k in cred)
+
+    listed = ows.list_credentials(vault_path_opt=vault_dir)
+    assert [c["public_key"] for c in listed] == [cred["public_key"]]
+    assert ows.get_credential("passport-device", vault_path_opt=vault_dir)["id"] == cred["id"]
+
+    sig = ows.sign_with_credential(
+        "passport-device", "midnight", withdraw_unshielded(), passphrase="pw", vault_path_opt=vault_dir
+    )
+    assert sorted(sig) == ["grindNonce", "pk", "scheme", "sigR", "sigS", "signature"]
+    assert sig["scheme"] == "midnight:account:auth:v1"
+    assert sig["pk"] == cred["public_key"]
+    assert len(sig["sigR"]) == 128 and int(sig["sigR"], 16) >= 0
+    assert len(sig["sigS"]) == 64 and int(sig["sigS"], 16) >= 0
+    assert isinstance(sig["grindNonce"], int)
+    assert sig["signature"] == sig["sigR"] + sig["sigS"] + format(sig["grindNonce"], "016x")
+
+    ows.delete_credential(cred["id"], vault_path_opt=vault_dir)
+    assert ows.list_credentials(vault_path_opt=vault_dir) == []
+
+
+def test_credential_import_is_marked_imported(vault_dir):
+    cred = ows.import_credential("imported", "midnight", "00" * 31 + "7b", passphrase="pw", vault_path_opt=vault_dir)
+    assert cred["origin"] == "imported"
+    assert len(cred["public_key"]) == 128
+
+
+def test_credential_wrong_chain_is_refused(vault_dir):
+    ows.create_credential("c", "midnight", passphrase="pw", vault_path_opt=vault_dir)
+    with pytest.raises(Exception):
+        ows.sign_with_credential("c", "evm", withdraw_unshielded(), passphrase="pw", vault_path_opt=vault_dir)
+
+
+def test_api_key_with_credential_ids(vault_dir):
+    wallet = ows.create_wallet("w", passphrase="pw", vault_path_opt=vault_dir)
+    cred = ows.create_credential("c", "midnight", passphrase="pw", vault_path_opt=vault_dir)
+    plain = ows.create_api_key("plain", [wallet["id"]], [], "pw", vault_path_opt=vault_dir)
+    assert plain["token"].startswith("ows_key_")
+    key = ows.create_api_key(
+        "with-cred", [wallet["id"]], [], "pw", vault_path_opt=vault_dir, credential_ids=[cred["id"]]
+    )
+    sig = ows.sign_with_credential(
+        "c", "midnight", withdraw_unshielded(), passphrase=key["token"], vault_path_opt=vault_dir
+    )
+    assert sig["pk"] == cred["public_key"]
+    assert len(sig["sigR"]) == 128
+
+
+def test_list_api_keys_hides_credential_secrets(vault_dir):
+    wallet = ows.create_wallet("w", passphrase="pw", vault_path_opt=vault_dir)
+    cred = ows.create_credential("c", "midnight", passphrase="pw", vault_path_opt=vault_dir)
+    ows.create_api_key(
+        "with-cred", [wallet["id"]], [], "pw", vault_path_opt=vault_dir, credential_ids=[cred["id"]]
+    )
+    [listed] = ows.list_api_keys(vault_path_opt=vault_dir)
+    assert listed["credential_ids"] == [cred["id"]]
+    assert "wallet_secrets" not in listed
+    assert "credential_secrets" not in listed
+
+
+def test_credential_audit_records_match_the_cli(vault_dir):
+    cred = ows.create_credential("c", "midnight", passphrase="pw", vault_path_opt=vault_dir)
+    ows.sign_with_credential(
+        "c", "midnight:preview", withdraw_unshielded(), passphrase="pw", vault_path_opt=vault_dir
+    )
+    key = ows.create_api_key("agent", [], [], "pw", vault_path_opt=vault_dir, credential_ids=[cred["id"]])
+    ows.revoke_api_key(key["id"], vault_path_opt=vault_dir)
+    ows.delete_credential("c", vault_path_opt=vault_dir)
+    with open(f"{vault_dir}/logs/audit.jsonl") as f:
+        log = [json.loads(line) for line in f]
+    assert [r["operation"] for r in log] == [
+        "credential_created",
+        "credential_signed",
+        "create_api_key",
+        "revoke_api_key",
+        "credential_deleted",
+    ]
+    assert log[1]["chain_id"] == "midnight:preview"
+    assert log[1]["details"].startswith(f"credential_id={cred['id']}, ")
+    assert log[1]["details"].endswith("actor=owner, outcome=allowed")
+    assert not any("wallet_id" in r for r in log)
+
+
+def test_a_secret_in_the_scheme_slot_is_not_echoed(vault_dir):
+    secret = "0123456789abcdef0123456789abcdef"
+    with pytest.raises(Exception) as created:
+        ows.create_credential("c", "midnight", secret, "pw", vault_dir)
+    assert secret not in str(created.value)
+    with pytest.raises(Exception) as imported:
+        ows.import_credential("c", "midnight", "jubjub", secret, "pw", vault_dir)
+    assert secret not in str(imported.value)

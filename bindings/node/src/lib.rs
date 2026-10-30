@@ -46,6 +46,33 @@ impl From<ows_lib::WalletInfo> for WalletInfo {
     }
 }
 
+/// Credential information. The key itself is never returned.
+#[napi(object)]
+pub struct CredentialInfo {
+    pub id: String,
+    pub name: String,
+    pub chain: String,
+    pub scheme: String,
+    pub public_key: String,
+    /// "generated" or "imported".
+    pub origin: String,
+    pub created_at: String,
+}
+
+impl From<ows_lib::CredentialInfo> for CredentialInfo {
+    fn from(c: ows_lib::CredentialInfo) -> Self {
+        CredentialInfo {
+            id: c.id,
+            name: c.name,
+            chain: c.chain.to_string(),
+            scheme: c.scheme,
+            public_key: c.public_key,
+            origin: c.origin.as_str().to_string(),
+            created_at: c.created_at,
+        }
+    }
+}
+
 /// Result from a signing operation.
 #[napi(object)]
 pub struct SignResult {
@@ -195,6 +222,95 @@ pub fn rename_wallet(
         &new_name,
         vault_path(vault_path_opt).as_deref(),
     )
+    .map_err(map_err)
+}
+
+/// Generate a credential key and store it encrypted under `passphrase`.
+#[napi]
+pub fn create_credential(
+    name: String,
+    chain: String,
+    scheme: Option<String>,
+    passphrase: Option<String>,
+    vault_path_opt: Option<String>,
+) -> Result<CredentialInfo> {
+    ows_lib::create_credential(
+        &name,
+        &chain,
+        scheme.as_deref(),
+        passphrase.as_deref(),
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map(CredentialInfo::from)
+    .map_err(map_err)
+}
+
+/// Store an existing credential key, given as hex in the scheme's import format.
+#[napi]
+pub fn import_credential(
+    name: String,
+    chain: String,
+    secret_hex: String,
+    scheme: Option<String>,
+    passphrase: Option<String>,
+    vault_path_opt: Option<String>,
+) -> Result<CredentialInfo> {
+    ows_lib::import_credential(
+        &name,
+        &chain,
+        scheme.as_deref(),
+        &secret_hex,
+        passphrase.as_deref(),
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map(CredentialInfo::from)
+    .map_err(map_err)
+}
+
+/// List all credentials in the vault.
+#[napi]
+pub fn list_credentials(vault_path_opt: Option<String>) -> Result<Vec<CredentialInfo>> {
+    ows_lib::list_credentials(vault_path(vault_path_opt).as_deref())
+        .map(|cs| cs.into_iter().map(CredentialInfo::from).collect())
+        .map_err(map_err)
+}
+
+/// Get a single credential by name or ID.
+#[napi]
+pub fn get_credential(
+    name_or_id: String,
+    vault_path_opt: Option<String>,
+) -> Result<CredentialInfo> {
+    ows_lib::get_credential(&name_or_id, vault_path(vault_path_opt).as_deref())
+        .map(CredentialInfo::from)
+        .map_err(map_err)
+}
+
+/// Delete a credential from the vault.
+#[napi]
+pub fn delete_credential(name_or_id: String, vault_path_opt: Option<String>) -> Result<()> {
+    ows_lib::delete_credential(&name_or_id, vault_path(vault_path_opt).as_deref()).map_err(map_err)
+}
+
+/// Sign an authorisation request (JSON) with a credential. `passphrase` is the owner's passphrase
+/// or an agent token. Returns the signature as the scheme's named fields, the object
+/// `ows credential sign --json` prints.
+#[napi]
+pub fn sign_with_credential(
+    name_or_id: String,
+    chain: String,
+    request: String,
+    passphrase: Option<String>,
+    vault_path_opt: Option<String>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    ows_lib::sign_with_credential(
+        &name_or_id,
+        &chain,
+        &request,
+        passphrase.as_deref(),
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map(|r| r.to_json())
     .map_err(map_err)
 }
 
@@ -399,10 +515,12 @@ pub fn create_api_key(
     passphrase: String,
     expires_at: Option<String>,
     vault_path_opt: Option<String>,
+    credential_ids: Option<Vec<String>>,
 ) -> Result<ApiKeyResult> {
-    let (token, key_file) = ows_lib::key_ops::create_api_key(
+    let (token, key_file) = ows_lib::key_ops::create_api_key_with_credentials(
         &name,
         &wallet_ids,
+        &credential_ids.unwrap_or_default(),
         &policy_ids,
         &passphrase,
         expires_at.as_deref(),
@@ -424,10 +542,13 @@ pub fn list_api_keys(vault_path_opt: Option<String>) -> Result<Vec<serde_json::V
         .map_err(map_err)?;
     keys.iter()
         .map(|k| {
-            // Strip wallet_secrets from the output — never expose encrypted material
+            // Strip the secret copies from the output — never expose encrypted material
             let mut v =
                 serde_json::to_value(k).map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            v.as_object_mut().map(|m| m.remove("wallet_secrets"));
+            if let Some(m) = v.as_object_mut() {
+                m.remove("wallet_secrets");
+                m.remove("credential_secrets");
+            }
             Ok(v)
         })
         .collect()
@@ -436,7 +557,9 @@ pub fn list_api_keys(vault_path_opt: Option<String>) -> Result<Vec<serde_json::V
 /// Revoke (delete) an API key by ID.
 #[napi]
 pub fn revoke_api_key(id: String, vault_path_opt: Option<String>) -> Result<()> {
-    ows_lib::key_store::delete_api_key(&id, vault_path(vault_path_opt).as_deref()).map_err(map_err)
+    ows_lib::key_ops::revoke_api_key(&id, vault_path(vault_path_opt).as_deref())
+        .map(|_| ())
+        .map_err(map_err)
 }
 
 /// Sign and broadcast a transaction. Returns the transaction hash.

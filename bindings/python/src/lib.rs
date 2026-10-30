@@ -147,6 +147,111 @@ fn rename_wallet(name_or_id: &str, new_name: &str, vault_path_opt: Option<String
         .map_err(map_err)
 }
 
+/// Generate a credential key and store it encrypted under `passphrase`.
+#[pyfunction]
+#[pyo3(signature = (name, chain, scheme=None, passphrase=None, vault_path_opt=None))]
+fn create_credential(
+    name: &str,
+    chain: &str,
+    scheme: Option<&str>,
+    passphrase: Option<&str>,
+    vault_path_opt: Option<String>,
+) -> PyResult<PyObject> {
+    let info = ows_lib::create_credential(
+        name,
+        chain,
+        scheme,
+        passphrase,
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map_err(map_err)?;
+    Python::with_gil(|py| Ok(credential_info_to_dict(py, &info)?.unbind().into()))
+}
+
+/// Store an existing credential key, given as hex in the scheme's import format.
+#[pyfunction]
+#[pyo3(signature = (name, chain, secret_hex, scheme=None, passphrase=None, vault_path_opt=None))]
+fn import_credential(
+    name: &str,
+    chain: &str,
+    secret_hex: &str,
+    scheme: Option<&str>,
+    passphrase: Option<&str>,
+    vault_path_opt: Option<String>,
+) -> PyResult<PyObject> {
+    let info = ows_lib::import_credential(
+        name,
+        chain,
+        scheme,
+        secret_hex,
+        passphrase,
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map_err(map_err)?;
+    Python::with_gil(|py| Ok(credential_info_to_dict(py, &info)?.unbind().into()))
+}
+
+/// List all credentials in the vault.
+#[pyfunction]
+#[pyo3(signature = (vault_path_opt=None))]
+fn list_credentials(vault_path_opt: Option<String>) -> PyResult<PyObject> {
+    let credentials =
+        ows_lib::list_credentials(vault_path(vault_path_opt).as_deref()).map_err(map_err)?;
+    Python::with_gil(|py| {
+        let list = pyo3::types::PyList::empty(py);
+        for c in &credentials {
+            list.append(credential_info_to_dict(py, c)?)?;
+        }
+        Ok(list.unbind().into())
+    })
+}
+
+/// Get a single credential by name or ID.
+#[pyfunction]
+#[pyo3(signature = (name_or_id, vault_path_opt=None))]
+fn get_credential(name_or_id: &str, vault_path_opt: Option<String>) -> PyResult<PyObject> {
+    let info = ows_lib::get_credential(name_or_id, vault_path(vault_path_opt).as_deref())
+        .map_err(map_err)?;
+    Python::with_gil(|py| Ok(credential_info_to_dict(py, &info)?.unbind().into()))
+}
+
+/// Delete a credential from the vault.
+#[pyfunction]
+#[pyo3(signature = (name_or_id, vault_path_opt=None))]
+fn delete_credential(name_or_id: &str, vault_path_opt: Option<String>) -> PyResult<()> {
+    ows_lib::delete_credential(name_or_id, vault_path(vault_path_opt).as_deref()).map_err(map_err)
+}
+
+/// Sign an authorisation request (JSON) with a credential. `passphrase` is the owner's passphrase
+/// or an agent token. Returns the signature as a dict of the scheme's named fields, the object
+/// `ows credential sign --json` prints.
+#[pyfunction]
+#[pyo3(signature = (name_or_id, chain, request, passphrase=None, vault_path_opt=None))]
+fn sign_with_credential(
+    name_or_id: &str,
+    chain: &str,
+    request: &str,
+    passphrase: Option<&str>,
+    vault_path_opt: Option<String>,
+) -> PyResult<PyObject> {
+    let result = ows_lib::sign_with_credential(
+        name_or_id,
+        chain,
+        request,
+        passphrase,
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map_err(map_err)?;
+    let json_str = serde_json::to_string(&result.to_json())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Python::with_gil(|py| {
+        let json_mod = py.import("json")?;
+        json_mod
+            .call_method1("loads", (json_str,))
+            .map(|o| o.unbind())
+    })
+}
+
 /// Sign a transaction.
 #[pyfunction]
 #[pyo3(signature = (wallet, chain, tx_hex, passphrase=None, index=None, vault_path_opt=None))]
@@ -400,7 +505,7 @@ fn delete_policy(id: &str, vault_path_opt: Option<String>) -> PyResult<()> {
 /// Create an API key for agent access to wallets.
 /// Returns a dict with `token` (shown once), `id`, and `name`.
 #[pyfunction]
-#[pyo3(signature = (name, wallet_ids, policy_ids, passphrase, expires_at=None, vault_path_opt=None))]
+#[pyo3(signature = (name, wallet_ids, policy_ids, passphrase, expires_at=None, vault_path_opt=None, credential_ids=None))]
 fn create_api_key(
     name: &str,
     wallet_ids: Vec<String>,
@@ -408,10 +513,12 @@ fn create_api_key(
     passphrase: &str,
     expires_at: Option<&str>,
     vault_path_opt: Option<String>,
+    credential_ids: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
-    let (token, key_file) = ows_lib::key_ops::create_api_key(
+    let (token, key_file) = ows_lib::key_ops::create_api_key_with_credentials(
         name,
         &wallet_ids,
+        &credential_ids.unwrap_or_default(),
         &policy_ids,
         passphrase,
         expires_at,
@@ -434,12 +541,15 @@ fn create_api_key(
 fn list_api_keys(vault_path_opt: Option<String>) -> PyResult<PyObject> {
     let keys = ows_lib::key_store::list_api_keys(vault_path(vault_path_opt).as_deref())
         .map_err(map_err)?;
-    // Strip wallet_secrets from output
+    // Strip the secret copies from output
     let sanitized: Vec<serde_json::Value> = keys
         .iter()
         .map(|k| {
             let mut v = serde_json::to_value(k).unwrap_or_default();
-            v.as_object_mut().map(|m| m.remove("wallet_secrets"));
+            if let Some(m) = v.as_object_mut() {
+                m.remove("wallet_secrets");
+                m.remove("credential_secrets");
+            }
             v
         })
         .collect();
@@ -457,7 +567,24 @@ fn list_api_keys(vault_path_opt: Option<String>) -> PyResult<PyObject> {
 #[pyfunction]
 #[pyo3(signature = (id, vault_path_opt=None))]
 fn revoke_api_key(id: &str, vault_path_opt: Option<String>) -> PyResult<()> {
-    ows_lib::key_store::delete_api_key(id, vault_path(vault_path_opt).as_deref()).map_err(map_err)
+    ows_lib::key_ops::revoke_api_key(id, vault_path(vault_path_opt).as_deref())
+        .map(|_| ())
+        .map_err(map_err)
+}
+
+fn credential_info_to_dict<'py>(
+    py: Python<'py>,
+    info: &ows_lib::CredentialInfo,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("id", &info.id)?;
+    dict.set_item("name", &info.name)?;
+    dict.set_item("chain", info.chain.to_string())?;
+    dict.set_item("scheme", &info.scheme)?;
+    dict.set_item("public_key", &info.public_key)?;
+    dict.set_item("origin", info.origin.as_str())?;
+    dict.set_item("created_at", &info.created_at)?;
+    Ok(dict)
 }
 
 fn wallet_info_to_dict(py: Python<'_>, info: &ows_lib::WalletInfo) -> PyResult<PyObject> {
@@ -500,6 +627,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delete_wallet, m)?)?;
     m.add_function(wrap_pyfunction!(export_wallet, m)?)?;
     m.add_function(wrap_pyfunction!(rename_wallet, m)?)?;
+    m.add_function(wrap_pyfunction!(create_credential, m)?)?;
+    m.add_function(wrap_pyfunction!(import_credential, m)?)?;
+    m.add_function(wrap_pyfunction!(list_credentials, m)?)?;
+    m.add_function(wrap_pyfunction!(get_credential, m)?)?;
+    m.add_function(wrap_pyfunction!(delete_credential, m)?)?;
+    m.add_function(wrap_pyfunction!(sign_with_credential, m)?)?;
     m.add_function(wrap_pyfunction!(sign_transaction, m)?)?;
     m.add_function(wrap_pyfunction!(sign_message, m)?)?;
     m.add_function(wrap_pyfunction!(sign_typed_data, m)?)?;

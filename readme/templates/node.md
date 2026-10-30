@@ -67,7 +67,13 @@ ows sign tx --wallet agent-treasury --chain evm --tx "deadbeef..."
 | `listPolicies(vaultPath?)` | List all registered policies |
 | `getPolicy(id, vaultPath?)` | Get a single policy by ID |
 | `deletePolicy(id, vaultPath?)` | Delete a policy by ID |
-| `createApiKey(name, walletIds, policyIds, passphrase, expiresAt?, vaultPath?)` | Create an API key for agent access |
+| `createApiKey(name, walletIds, policyIds, passphrase, expiresAt?, vaultPath?, credentialIds?)` | Create an API key for agent access |
+| `createCredential(name, chain, scheme?, passphrase?, vaultPath?)` | Generate a credential (on Midnight, a MIP-0013 device key) |
+| `importCredential(name, chain, secretHex, scheme?, passphrase?, vaultPath?)` | Import a credential key |
+| `listCredentials(vaultPath?)` | List credentials (public keys only) |
+| `getCredential(nameOrId, vaultPath?)` | Get a credential by name or ID |
+| `deleteCredential(nameOrId, vaultPath?)` | Delete a credential |
+| `signWithCredential(nameOrId, chain, request, passphrase?, vaultPath?)` | Sign an authorisation request with a credential; returns the signature as hex under `signature` and as the scheme's fields, for a Midnight device key `{signature, scheme, pk, sigR, sigS, grindNonce}` |
 | `listApiKeys(vaultPath?)` | List all API keys (tokens never returned) |
 | `revokeApiKey(id, vaultPath?)` | Revoke an API key |
 
