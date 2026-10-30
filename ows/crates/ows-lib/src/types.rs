@@ -1,4 +1,4 @@
-use ows_core::ChainType;
+use ows_core::{ChainType, CredentialOrigin};
 use ows_signer::SignOutput;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,18 @@ pub struct WalletInfo {
     pub id: String,
     pub name: String,
     pub accounts: Vec<AccountInfo>,
+    pub created_at: String,
+}
+
+/// Binding-friendly credential information (no crypto envelope exposed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialInfo {
+    pub id: String,
+    pub name: String,
+    pub chain: ChainType,
+    pub scheme: String,
+    pub public_key: String,
+    pub origin: CredentialOrigin,
     pub created_at: String,
 }
 
