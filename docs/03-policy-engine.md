@@ -139,7 +139,7 @@ Restricts which smart contracts an API key can sign EIP-712 typed data for. The 
 
 **Behavior:**
 - For `sign_message` and `sign_transaction` calls, this rule **passes through** (does not restrict).
-- For `sign_typed_data` calls where the domain includes a `verifyingContract`, the address must be in the `contracts` list (case-insensitive comparison).
+- For `sign_typed_data` calls where the domain includes a `verifyingContract`, the address must be in the `contracts` list (case-insensitive comparison, and a leading `0x` is ignored on both sides).
 - For `sign_typed_data` calls where the domain **omits** `verifyingContract`, the rule **denies** — the contract cannot be verified.
 
 **Example policy:**
@@ -244,8 +244,9 @@ The base JSON object available to policy evaluation:
 | Field | Type | Always Present | Description |
 |---|---|---|---|
 | `chain_id` | string | yes | CAIP-2 chain identifier |
-| `wallet_id` | string | yes | Wallet ID in scope for this request |
+| `wallet_id` | string | yes | Wallet ID in scope for this request. Empty (`""`) when the request signs with a credential rather than a wallet. |
 | `api_key_id` | string | yes | The ID of the API key making this request |
+| `credential_id` | string | no | The ID of the credential being signed with. Present only for credential requests (always `sign_typed_data`), where `wallet_id` is empty; omitted for wallet requests. |
 | `request_type` | string | yes | Which operation is being authorized: `sign_transaction`, `sign_message`, `sign_hash`, `sign_typed_data`, or `read_balance` (unsealing an account key to read balances, which produces no signature). **Branch on this**, not on which optional fields are populated. |
 | `transaction` | object | no | The signing payload. Present for `sign_transaction`, `sign_message`, and `sign_hash`; omitted for `sign_typed_data`, which exposes its payload via `typed_data.raw_json` instead, and for `read_balance`, which signs nothing. See below. |
 | `spending` | object | yes | Lightweight spending metadata currently exposed by the engine |

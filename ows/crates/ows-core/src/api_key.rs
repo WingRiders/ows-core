@@ -19,6 +19,12 @@ pub struct ApiKeyFile {
     /// Per-wallet encrypted secret copies, keyed by wallet ID.
     /// Each value is a CryptoEnvelope encrypted with HKDF(token).
     pub wallet_secrets: HashMap<String, serde_json::Value>,
+    /// Credential IDs this key can sign with. Absent in key files written before credentials existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_ids: Vec<String>,
+    /// Per-credential encrypted secret copies, keyed by credential ID, in the same form as `wallet_secrets`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub credential_secrets: HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -46,6 +52,8 @@ mod tests {
                     "kdfparams": { "dklen": 32, "salt": "0011", "info": "ows-api-key-v1" }
                 }),
             )]),
+            credential_ids: vec![],
+            credential_secrets: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&key).unwrap();
@@ -71,6 +79,8 @@ mod tests {
             policy_ids: vec![],
             expires_at: Some("2026-04-01T00:00:00Z".into()),
             wallet_secrets: HashMap::new(),
+            credential_ids: vec![],
+            credential_secrets: HashMap::new(),
         };
 
         let json = serde_json::to_string(&key).unwrap();
@@ -93,6 +103,8 @@ mod tests {
             policy_ids: vec![],
             expires_at: None,
             wallet_secrets: HashMap::new(),
+            credential_ids: vec![],
+            credential_secrets: HashMap::new(),
         };
 
         let json = serde_json::to_string(&key).unwrap();

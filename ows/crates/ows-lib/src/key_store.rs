@@ -164,6 +164,8 @@ mod tests {
             policy_ids: vec!["policy-1".to_string()],
             expires_at: None,
             wallet_secrets: HashMap::new(),
+            credential_ids: vec![],
+            credential_secrets: HashMap::new(),
         }
     }
 

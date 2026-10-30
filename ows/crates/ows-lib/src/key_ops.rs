@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ows_core::{ApiKeyFile, EncryptedWallet, OwsError, PolicyRequestType};
+use ows_core::{ApiKeyFile, Credential, EncryptedWallet, OwsError, PolicyRequestType};
 use ows_signer::{
     decrypt, eip712, encrypt_with_hkdf, signer_for_chain, ChainSigner, CryptoEnvelope, SecretBytes,
 };
 
+use crate::credential_audit;
+use crate::credential_ops;
+use crate::credential_store;
 use crate::error::OwsLibError;
 use crate::key_store;
 use crate::policy_engine;
@@ -28,6 +31,28 @@ pub fn create_api_key(
     expires_at: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<(String, ApiKeyFile), OwsLibError> {
+    create_api_key_with_credentials(
+        name,
+        wallet_ids,
+        &[],
+        policy_ids,
+        passphrase,
+        expires_at,
+        vault_path,
+    )
+}
+
+/// [`create_api_key`] for a key that may also sign with credentials. Each credential's secret is
+/// re-encrypted under HKDF(token) the same way a wallet's is.
+pub fn create_api_key_with_credentials(
+    name: &str,
+    wallet_ids: &[String],
+    credential_ids: &[String],
+    policy_ids: &[String],
+    passphrase: &str,
+    expires_at: Option<&str>,
+    vault_path: Option<&Path>,
+) -> Result<(String, ApiKeyFile), OwsLibError> {
     // Validate that all wallets exist and passphrase works
     let mut wallet_secrets = HashMap::new();
     let mut resolved_wallet_ids = Vec::with_capacity(wallet_ids.len());
@@ -37,8 +62,15 @@ pub fn create_api_key(
         let wallet = vault::load_wallet_by_name_or_id(wallet_id, vault_path)?;
         let envelope: CryptoEnvelope = serde_json::from_value(wallet.crypto.clone())?;
 
-        // Decrypt with owner's passphrase to verify it works
-        let secret = decrypt(&envelope, passphrase)?;
+        // Decrypt with owner's passphrase to verify it works. A key that also holds credentials
+        // takes the owner passphrase a credential is sealed under, which is never empty, while a
+        // wallet the CLI created is sealed under the empty one: such a wallet opens as `ows sign`
+        // opens it for the owner, under the empty passphrase first.
+        let secret = if credential_ids.is_empty() {
+            decrypt(&envelope, passphrase)?
+        } else {
+            decrypt(&envelope, "").or_else(|_| decrypt(&envelope, passphrase))?
+        };
 
         // Re-encrypt under HKDF(token)
         let hkdf_envelope = encrypt_with_hkdf(secret.expose(), &token)?;
@@ -48,6 +80,19 @@ pub fn create_api_key(
         // Always persist canonical wallet IDs (UUIDs). Callers may pass names or IDs;
         // agent signing checks `contains(wallet.id)` when verifying scope.
         resolved_wallet_ids.push(wallet.id.clone());
+    }
+
+    let mut credential_secrets = HashMap::new();
+    let mut resolved_credential_ids = Vec::with_capacity(credential_ids.len());
+    for credential_id in credential_ids {
+        let credential =
+            credential_store::load_credential_by_name_or_id(credential_id, vault_path)?;
+        let envelope: CryptoEnvelope = serde_json::from_value(credential.crypto.clone())?;
+        let secret = decrypt(&envelope, passphrase)?;
+        credential_ops::check_key(&credential, &secret)?;
+        let hkdf_envelope = encrypt_with_hkdf(secret.expose(), &token)?;
+        credential_secrets.insert(credential.id.clone(), serde_json::to_value(&hkdf_envelope)?);
+        resolved_credential_ids.push(credential.id);
     }
 
     // Validate that all policies exist
@@ -65,11 +110,23 @@ pub fn create_api_key(
         policy_ids: policy_ids.to_vec(),
         expires_at: expires_at.map(String::from),
         wallet_secrets,
+        credential_ids: resolved_credential_ids,
+        credential_secrets,
     };
 
     key_store::save_api_key(&key_file, vault_path)?;
+    credential_audit::api_key_credentials("create_api_key", &key_file, vault_path);
 
     Ok((token, key_file))
+}
+
+/// Revoke (delete) an API key and return the file it was. A key that held credentials leaves a
+/// record in the audit log for each of them.
+pub fn revoke_api_key(id: &str, vault_path: Option<&Path>) -> Result<ApiKeyFile, OwsLibError> {
+    let key = key_store::load_api_key(id, vault_path)?;
+    key_store::delete_api_key(id, vault_path)?;
+    credential_audit::api_key_credentials("revoke_api_key", &key, vault_path);
+    Ok(key)
 }
 
 /// Sign a transaction using an API token (agent mode).
@@ -326,6 +383,26 @@ pub fn load_authorized_wallet(
     Ok((key_file, wallet))
 }
 
+/// Token → key file lookup, expiry check, credential load + scope check, for credential signing.
+pub fn load_authorized_credential(
+    token: &str,
+    name_or_id: &str,
+    vault_path: Option<&Path>,
+) -> Result<(ApiKeyFile, Credential), OwsLibError> {
+    let token_hash = key_store::hash_token(token);
+    let key_file = key_store::load_api_key_by_token_hash(&token_hash, vault_path)?;
+    check_expiry(&key_file)?;
+
+    let credential = credential_store::load_credential_by_name_or_id(name_or_id, vault_path)?;
+    if !key_file.credential_ids.contains(&credential.id) {
+        return Err(OwsLibError::InvalidInput(format!(
+            "API key '{}' does not have access to credential '{}'",
+            key_file.name, credential.id,
+        )));
+    }
+    Ok((key_file, credential))
+}
+
 /// Assemble the `PolicyContext` around a caller-built `TransactionContext`
 /// (and optional `TypedDataContext`), run the policy engine, and decrypt
 /// the signing key on allow. `transaction` is `None` for `sign_typed_data`
@@ -348,6 +425,7 @@ pub fn enforce_policies_and_decrypt_key(
     enforce_policies(
         &key_file,
         &wallet.id,
+        None,
         chain,
         request_type,
         transaction,
@@ -360,9 +438,11 @@ pub fn enforce_policies_and_decrypt_key(
 
 /// Run every policy on the key over the request, as [`enforce_policies_and_decrypt_key`] does before
 /// it releases the key.
-fn enforce_policies(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_policies(
     key_file: &ApiKeyFile,
     wallet_id: &str,
+    credential_id: Option<&str>,
     chain: &ows_core::Chain,
     request_type: PolicyRequestType,
     transaction: Option<ows_core::policy::TransactionContext>,
@@ -382,6 +462,7 @@ fn enforce_policies(
         spending: noop_spending_context(&date),
         timestamp: now.to_rfc3339(),
         typed_data,
+        credential_id: credential_id.map(String::from),
     };
 
     let result = policy_engine::evaluate_policies(&policies, &context);
@@ -410,6 +491,7 @@ pub(crate) fn enforce_submission_policies(
     enforce_policies(
         key_file,
         wallet_id,
+        None,
         chain,
         PolicyRequestType::SignTransaction,
         Some(transaction.clone()),
@@ -455,6 +537,7 @@ pub(crate) fn enforce_effect_policies(
         spending: noop_spending_context(&date),
         timestamp: now.to_rfc3339(),
         typed_data: None,
+        credential_id: None,
     };
     let result = policy_engine::evaluate_policies(&policies, &context);
     if !result.allow {
@@ -511,6 +594,25 @@ fn load_policies_for_key(
         policies.push(policy_store::load_policy(pid, vault_path)?);
     }
     Ok(policies)
+}
+
+/// The token's copy of a credential's secret.
+pub(crate) fn decrypt_credential_from_api_key(
+    key_file: &ApiKeyFile,
+    credential: &Credential,
+    token: &str,
+) -> Result<SecretBytes, OwsLibError> {
+    let envelope_value = key_file
+        .credential_secrets
+        .get(&credential.id)
+        .ok_or_else(|| {
+            OwsLibError::InvalidInput(format!(
+                "API key has no encrypted secret for credential {}",
+                credential.id
+            ))
+        })?;
+    let envelope: CryptoEnvelope = serde_json::from_value(envelope_value.clone())?;
+    Ok(decrypt(&envelope, token)?)
 }
 
 fn decrypt_key_from_api_key(
