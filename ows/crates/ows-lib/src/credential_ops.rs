@@ -5,13 +5,16 @@ use std::path::Path;
 use std::str::FromStr;
 
 use ows_core::{ChainType, Credential, CredentialOrigin};
-use ows_signer::{credential_scheme, encrypt, CredentialKey, CredentialScheme};
+use ows_signer::{
+    credential_scheme, decrypt, encrypt, CredentialKey, CredentialScheme, CryptoEnvelope,
+    SecretBytes,
+};
 use zeroize::Zeroizing;
 
 use crate::credential_audit;
 use crate::credential_store;
 use crate::error::OwsLibError;
-use crate::types::CredentialInfo;
+use crate::types::{CredentialInfo, CredentialSignature};
 
 /// Accepts a chain name or bare namespace as well as a full chain id. A chain it does not know is
 /// not echoed back, since a caller that misplaces arguments could pass a secret in its slot.
@@ -184,6 +187,57 @@ pub fn delete_credential(name_or_id: &str, vault_path: Option<&Path>) -> Result<
     credential_store::delete_credential_file(&credential.id, vault_path)?;
     credential_audit::deleted(&credential, vault_path);
     Ok(())
+}
+
+/// A credential's encrypted key is not bound to the rest of its file, so whoever can write the
+/// vault could swap two credentials' keys. The decrypted key must be the one behind the public key
+/// the file names.
+pub(crate) fn check_key(credential: &Credential, secret: &SecretBytes) -> Result<(), OwsLibError> {
+    let scheme = credential_scheme(credential.chain, Some(&credential.scheme))?;
+    if scheme.import(secret.expose())?.public_key != credential.public_key {
+        return Err(OwsLibError::InvalidInput(format!(
+            "credential '{}' holds a key that does not match its public key",
+            credential.name
+        )));
+    }
+    Ok(())
+}
+
+/// Sign an authorisation request with a credential's key (owner path).
+///
+/// The chain and the request are checked before the key is decrypted, so a request
+/// for another chain or one the scheme rejects never reaches the passphrase.
+pub fn sign_with_credential(
+    name_or_id: &str,
+    chain: &str,
+    request: &str,
+    passphrase: Option<&str>,
+    vault_path: Option<&Path>,
+) -> Result<CredentialSignature, OwsLibError> {
+    let credential = credential_store::load_credential_by_name_or_id(name_or_id, vault_path)?;
+
+    let request_chain = parse_credential_chain(chain)?;
+    if request_chain != credential.chain {
+        return Err(OwsLibError::InvalidInput(format!(
+            "credential '{}' is for {}, not {}",
+            credential.name, credential.chain, request_chain
+        )));
+    }
+
+    let scheme = credential_scheme(credential.chain, Some(&credential.scheme))?;
+    let described = scheme.describe(request)?;
+
+    let envelope: CryptoEnvelope = serde_json::from_value(credential.crypto.clone())?;
+    let secret = decrypt(&envelope, passphrase.unwrap_or(""))?;
+    check_key(&credential, &secret)?;
+    let signature = scheme.sign(secret.expose(), request)?;
+    let fields = scheme.signature_fields(&credential.public_key, &signature)?;
+    credential_audit::signed(&credential.id, chain, &described, vault_path);
+
+    Ok(CredentialSignature {
+        signature: hex::encode(signature),
+        fields,
+    })
 }
 
 #[cfg(test)]
@@ -392,6 +446,135 @@ mod tests {
             Err(OwsLibError::InvalidInput(_))
         ));
         assert!(list_credentials(v).unwrap().is_empty());
+    }
+
+    fn withdraw_request() -> String {
+        serde_json::json!({
+            "scheme": "midnight:account:auth:v1",
+            "account": "a19612afc371b1a4d2fc2410377da895ff7ca406e74449b75dcc32a2b6df7964",
+            "circuit": "withdraw_unshielded",
+            "args": [
+                {"type": "Bytes<32>", "value": "5cd36fe5ed159246257b476bb67bc8266290581ef3844fcabd7c134b3f8b03ea"},
+                {"type": "Uint<128>", "value": "3000000"},
+                {"type": "UserAddress", "value": "0xb0c1d2e3f405162738495a6b7c8d9eafb0c1d2e3f405162738495a6b7c8d9e00"}
+            ],
+            "witnesses": [],
+            "authNonce": "3"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn owner_signature_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let request = withdraw_request();
+        let signed =
+            sign_with_credential("device", "midnight:stagenet", &request, Some(PASS), v).unwrap();
+        let sig = hex::decode(&signed.signature).unwrap();
+        assert_eq!(sig.len(), 104);
+        let scheme = credential_scheme(ChainType::Midnight, None).unwrap();
+        scheme.verify(&made.public_key, &request, &sig).unwrap();
+        assert_eq!(
+            signed.fields,
+            scheme.signature_fields(&made.public_key, &sig).unwrap()
+        );
+        assert_eq!(signed.fields["pk"], made.public_key.as_str());
+        let json = signed.to_json();
+        assert_eq!(json["signature"], signed.signature.as_str());
+        assert_eq!(json.len(), signed.fields.len() + 1);
+    }
+
+    #[test]
+    fn another_chain_is_refused_before_decrypting() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let err = sign_with_credential("device", "evm", &withdraw_request(), Some("wrong"), v)
+            .unwrap_err();
+        assert!(matches!(err, OwsLibError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn evm_typed_data_is_refused_before_decrypting() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let evm = serde_json::json!({
+            "types": {
+                "EIP712Domain": [{"name": "name", "type": "string"}],
+                "Mail": [{"name": "contents", "type": "string"}]
+            },
+            "primaryType": "Mail",
+            "domain": {"name": "Ether Mail"},
+            "message": {"contents": "hi"}
+        })
+        .to_string();
+        let err = sign_with_credential("device", "midnight", &evm, Some("wrong"), v).unwrap_err();
+        assert!(matches!(err, OwsLibError::Signer(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_wrong_passphrase_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some("nope"), v)
+            .unwrap_err();
+        assert!(matches!(err, OwsLibError::Crypto(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_key_swapped_in_from_another_credential_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        create_credential("other", "midnight", None, Some(PASS), v).unwrap();
+        let mut device = credential_store::load_credential_by_name_or_id("device", v).unwrap();
+        let other = credential_store::load_credential_by_name_or_id("other", v).unwrap();
+        device.crypto = other.crypto;
+        credential_store::save_credential_file(&device, v).unwrap();
+
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some(PASS), v)
+            .unwrap_err();
+        assert!(
+            matches!(&err, OwsLibError::InvalidInput(m) if m.contains("does not match its public key")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_owner_signature_is_audited_and_a_failed_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        sign_with_credential(
+            "device",
+            "midnight:stagenet",
+            &withdraw_request(),
+            Some(PASS),
+            v,
+        )
+        .unwrap();
+        sign_with_credential("device", "midnight", &withdraw_request(), Some("nope"), v)
+            .unwrap_err();
+
+        let log = audit_log(dir.path());
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(
+            log[1],
+            (
+                "credential_signed".to_string(),
+                format!(
+                    "credential_id={}, verifying_contract=a19612afc371b1a4d2fc2410377da895ff7ca406e74449b75dcc32a2b6df7964, primary_type=withdraw_unshielded, actor=owner, outcome=allowed",
+                    made.id
+                )
+            )
+        );
+        let last = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(last.lines().last().unwrap()).unwrap();
+        assert_eq!(last["chain_id"], "midnight:stagenet");
     }
 
     /// `(operation, details)` of each line of the vault's audit log.
