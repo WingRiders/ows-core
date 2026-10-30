@@ -1203,6 +1203,14 @@ mod tests {
                 "ows-cli/src/main.rs",
                 include_str!("../../ows-cli/src/main.rs"),
             ),
+            (
+                "bindings/node/src/lib.rs",
+                include_str!("../../../../bindings/node/src/lib.rs"),
+            ),
+            (
+                "bindings/python/src/lib.rs",
+                include_str!("../../../../bindings/python/src/lib.rs"),
+            ),
         ];
 
         let mut generic: Vec<(&str, String)> = whole_files
