@@ -4,16 +4,18 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use ows_core::{ChainType, Credential, CredentialOrigin};
+use ows_core::{ChainType, Credential, CredentialOrigin, PolicyRequestType};
 use ows_signer::{
     credential_scheme, decrypt, encrypt, CredentialKey, CredentialScheme, CryptoEnvelope,
     SecretBytes,
 };
 use zeroize::Zeroizing;
 
-use crate::credential_audit;
+use crate::credential_audit::{self, Actor, Outcome};
 use crate::credential_store;
 use crate::error::OwsLibError;
+use crate::key_ops;
+use crate::key_store::{self, TOKEN_PREFIX};
 use crate::types::{CredentialInfo, CredentialSignature};
 
 /// Accepts a chain name or bare namespace as well as a full chain id. A chain it does not know is
@@ -182,8 +184,25 @@ pub fn get_credential(
 }
 
 /// Delete a credential by ID or name.
+///
+/// Agent tokens lose their access too: the id leaves every token file's scope and the token's
+/// encrypted copy of the secret is dropped.
 pub fn delete_credential(name_or_id: &str, vault_path: Option<&Path>) -> Result<(), OwsLibError> {
     let credential = credential_store::load_credential_by_name_or_id(name_or_id, vault_path)?;
+    // Listing the keys would create `keys/` in a vault that has never held one.
+    if crate::vault::resolve_vault_path(vault_path)
+        .join("keys")
+        .is_dir()
+    {
+        for mut key in key_store::list_api_keys(vault_path)? {
+            let held = key.credential_ids.len() + key.credential_secrets.len();
+            key.credential_ids.retain(|id| id != &credential.id);
+            key.credential_secrets.remove(&credential.id);
+            if key.credential_ids.len() + key.credential_secrets.len() != held {
+                key_store::save_api_key(&key, vault_path)?;
+            }
+        }
+    }
     credential_store::delete_credential_file(&credential.id, vault_path)?;
     credential_audit::deleted(&credential, vault_path);
     Ok(())
@@ -203,7 +222,11 @@ pub(crate) fn check_key(credential: &Credential, secret: &SecretBytes) -> Result
     Ok(())
 }
 
-/// Sign an authorisation request with a credential's key (owner path).
+/// Sign an authorisation request with a credential's key.
+///
+/// A passphrase that starts with `ows_key_` is an agent token: the token must hold the
+/// credential, and every policy on it runs over the request before the token's copy of the key is
+/// decrypted. Anything else is the owner's passphrase.
 ///
 /// The chain and the request are checked before the key is decrypted, so a request
 /// for another chain or one the scheme rejects never reaches the passphrase.
@@ -214,7 +237,18 @@ pub fn sign_with_credential(
     passphrase: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<CredentialSignature, OwsLibError> {
-    let credential = credential_store::load_credential_by_name_or_id(name_or_id, vault_path)?;
+    let passphrase = passphrase.unwrap_or("");
+    let agent = if passphrase.starts_with(TOKEN_PREFIX) {
+        Some(key_ops::load_authorized_credential(
+            passphrase, name_or_id, vault_path,
+        )?)
+    } else {
+        None
+    };
+    let credential = match &agent {
+        Some((_, credential)) => credential.clone(),
+        None => credential_store::load_credential_by_name_or_id(name_or_id, vault_path)?,
+    };
 
     let request_chain = parse_credential_chain(chain)?;
     if request_chain != credential.chain {
@@ -227,12 +261,55 @@ pub fn sign_with_credential(
     let scheme = credential_scheme(credential.chain, Some(&credential.scheme))?;
     let described = scheme.describe(request)?;
 
-    let envelope: CryptoEnvelope = serde_json::from_value(credential.crypto.clone())?;
-    let secret = decrypt(&envelope, passphrase.unwrap_or(""))?;
+    let actor = if agent.is_some() {
+        Actor::ApiKey
+    } else {
+        Actor::Owner
+    };
+    let secret = match &agent {
+        Some((key_file, _)) => {
+            let policy_chain = ows_core::parse_chain(chain)
+                .unwrap_or_else(|_| ows_core::default_chain_for_type(credential.chain));
+            if let Err(e) = key_ops::enforce_policies(
+                key_file,
+                "",
+                Some(&credential.id),
+                &policy_chain,
+                PolicyRequestType::SignTypedData,
+                None,
+                Some(described.clone()),
+                vault_path,
+            ) {
+                if let Some(denied) = Outcome::denial(&e) {
+                    credential_audit::signed(
+                        &credential.id,
+                        chain,
+                        &described,
+                        &actor,
+                        &denied,
+                        vault_path,
+                    );
+                }
+                return Err(e);
+            }
+            key_ops::decrypt_credential_from_api_key(key_file, &credential, passphrase)?
+        }
+        None => {
+            let envelope: CryptoEnvelope = serde_json::from_value(credential.crypto.clone())?;
+            decrypt(&envelope, passphrase)?
+        }
+    };
     check_key(&credential, &secret)?;
     let signature = scheme.sign(secret.expose(), request)?;
     let fields = scheme.signature_fields(&credential.public_key, &signature)?;
-    credential_audit::signed(&credential.id, chain, &described, vault_path);
+    credential_audit::signed(
+        &credential.id,
+        chain,
+        &described,
+        &actor,
+        &Outcome::Allowed,
+        vault_path,
+    );
 
     Ok(CredentialSignature {
         signature: hex::encode(signature),
@@ -577,6 +654,386 @@ mod tests {
         assert_eq!(last["chain_id"], "midnight:stagenet");
     }
 
+    const CONTRACT: &str = "a19612afc371b1a4d2fc2410377da895ff7ca406e74449b75dcc32a2b6df7964";
+
+    fn contract_policy(vault: &Path, id: &str, contract: &str) -> String {
+        let policy = ows_core::Policy {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: 1,
+            created_at: "2026-03-22T10:00:00Z".to_string(),
+            rules: vec![ows_core::PolicyRule::AllowedTypedDataContracts {
+                contracts: vec![contract.to_string()],
+            }],
+            executable: None,
+            config: None,
+            action: ows_core::PolicyAction::Deny,
+        };
+        crate::policy_store::save_policy(&policy, Some(vault)).unwrap();
+        policy.id
+    }
+
+    fn agent(
+        vault: &Path,
+        credentials: &[String],
+        policies: &[String],
+        expires_at: Option<&str>,
+    ) -> String {
+        crate::key_ops::create_api_key_with_credentials(
+            "agent",
+            &[],
+            credentials,
+            policies,
+            PASS,
+            expires_at,
+            Some(vault),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn agent_signs_for_an_allowed_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let policy = contract_policy(dir.path(), "allow", &CONTRACT.to_uppercase());
+        let token = agent(dir.path(), &[made.id.clone()], &[policy], None);
+        let request = withdraw_request();
+        let signed = sign_with_credential("device", "midnight", &request, Some(&token), v).unwrap();
+        assert_eq!(signed.fields["pk"], made.public_key.as_str());
+        credential_scheme(ChainType::Midnight, None)
+            .unwrap()
+            .verify(
+                &made.public_key,
+                &request,
+                &hex::decode(&signed.signature).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn agent_is_denied_for_another_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let policy = contract_policy(dir.path(), "other-only", &"ab".repeat(32));
+        let token = agent(dir.path(), &[made.id], &[policy], None);
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v)
+            .unwrap_err();
+        match err {
+            OwsLibError::Core(ows_core::OwsError::PolicyDenied { policy_id, .. }) => {
+                assert_eq!(policy_id, "other-only")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_policy_sees_credential_id_and_empty_wallet_id() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let seen = dir.path().join("seen.json");
+        let script = dir.path().join("record.py");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env python3\nimport sys\nopen({:?}, 'w').write(sys.stdin.read())\nprint('{{\"allow\": true}}')\n",
+                seen.display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::policy_store::save_policy(
+            &ows_core::Policy {
+                id: "record".to_string(),
+                name: "record".to_string(),
+                version: 1,
+                created_at: "2026-03-22T10:00:00Z".to_string(),
+                rules: vec![],
+                executable: Some(script.display().to_string()),
+                config: None,
+                action: ows_core::PolicyAction::Deny,
+            },
+            v,
+        )
+        .unwrap();
+        let token = agent(
+            dir.path(),
+            &[made.id.clone()],
+            &["record".to_string()],
+            None,
+        );
+        sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v).unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        assert_eq!(payload["credential_id"], made.id.as_str());
+        assert_eq!(payload["wallet_id"], "");
+        assert_eq!(payload["request_type"], "sign_typed_data");
+        assert_eq!(payload["typed_data"]["verifying_contract"], CONTRACT);
+        assert_eq!(payload["typed_data"]["primary_type"], "withdraw_unshielded");
+        assert_eq!(
+            payload["typed_data"]["domain_name"],
+            "midnight:account:auth:v1"
+        );
+        assert_eq!(payload["typed_data"]["raw_json"], withdraw_request());
+        assert!(payload.get("transaction").is_none());
+    }
+
+    #[test]
+    fn a_token_without_the_credential_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let other = create_credential("other", "midnight", None, Some(PASS), v).unwrap();
+        let token = agent(dir.path(), &[other.id], &[], None);
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v)
+            .unwrap_err();
+        assert!(matches!(err, OwsLibError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn an_expired_token_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let token = agent(dir.path(), &[made.id], &[], Some("2020-01-01T00:00:00Z"));
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OwsLibError::Core(ows_core::OwsError::ApiKeyExpired { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_token_file_loads() {
+        let old = serde_json::json!({
+            "id": "k", "name": "old", "token_hash": "h", "created_at": "2026-03-22T10:30:00Z",
+            "wallet_ids": [], "policy_ids": [], "wallet_secrets": {}
+        });
+        let key: ows_core::ApiKeyFile = serde_json::from_value(old).unwrap();
+        assert!(key.credential_ids.is_empty() && key.credential_secrets.is_empty());
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(!json.contains("credential"), "{json}");
+    }
+
+    #[test]
+    fn delete_purges_token_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let gone = create_credential("gone", "midnight", None, Some(PASS), v).unwrap();
+        let kept = create_credential("kept", "midnight", None, Some(PASS), v).unwrap();
+        let token = agent(dir.path(), &[gone.id.clone(), kept.id.clone()], &[], None);
+        delete_credential("gone", v).unwrap();
+
+        let keys = crate::key_store::list_api_keys(v).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].credential_ids, vec![kept.id.clone()]);
+        assert!(!keys[0].credential_secrets.contains_key(&gone.id));
+        assert!(keys[0].credential_secrets.contains_key(&kept.id));
+        sign_with_credential("kept", "midnight", &withdraw_request(), Some(&token), v).unwrap();
+    }
+
+    #[test]
+    fn token_creation_refuses_a_swapped_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        create_credential("other", "midnight", None, Some(PASS), v).unwrap();
+        let mut device = credential_store::load_credential_by_name_or_id("device", v).unwrap();
+        device.crypto = credential_store::load_credential_by_name_or_id("other", v)
+            .unwrap()
+            .crypto;
+        credential_store::save_credential_file(&device, v).unwrap();
+
+        let err = crate::key_ops::create_api_key_with_credentials(
+            "agent",
+            &[],
+            &[made.id],
+            &[],
+            PASS,
+            None,
+            v,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OwsLibError::InvalidInput(m) if m.contains("does not match its public key")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn agent_signing_refuses_a_swapped_token_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let device = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let other = create_credential("other", "midnight", None, Some(PASS), v).unwrap();
+        let token = agent(
+            dir.path(),
+            &[device.id.clone(), other.id.clone()],
+            &[],
+            None,
+        );
+        let mut key = crate::key_store::list_api_keys(v).unwrap().remove(0);
+        let other_copy = key.credential_secrets[&other.id].clone();
+        key.credential_secrets.insert(device.id, other_copy);
+        crate::key_store::save_api_key(&key, v).unwrap();
+
+        let err = sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v)
+            .unwrap_err();
+        assert!(
+            matches!(&err, OwsLibError::InvalidInput(m) if m.contains("does not match its public key")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_token_is_refused_before_the_name_is_looked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let token = format!("{TOKEN_PREFIX}{}", "00".repeat(32));
+        for name in ["no-such-credential", "device"] {
+            if name == "device" {
+                create_credential(name, "midnight", None, Some(PASS), v).unwrap();
+            }
+            let err = sign_with_credential(name, "midnight", &withdraw_request(), Some(&token), v)
+                .unwrap_err();
+            assert!(
+                matches!(err, OwsLibError::Core(ows_core::OwsError::ApiKeyNotFound)),
+                "{name}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_does_not_create_a_keys_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        delete_credential("device", v).unwrap();
+        assert!(!dir.path().join("keys").exists());
+    }
+
+    #[test]
+    fn agent_signatures_and_denials_are_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let policy = contract_policy(dir.path(), "allow", CONTRACT);
+        let token = agent(dir.path(), std::slice::from_ref(&made.id), &[policy], None);
+        sign_with_credential("device", "midnight", &withdraw_request(), Some(&token), v).unwrap();
+        let other = withdraw_request().replace(CONTRACT, &"ab".repeat(32));
+        sign_with_credential("device", "midnight", &other, Some(&token), v).unwrap_err();
+
+        let signed: Vec<String> = audit_log(dir.path())
+            .into_iter()
+            .filter(|(op, _)| op == "credential_signed")
+            .map(|(_, details)| details)
+            .collect();
+        let head = |contract: &str| {
+            format!(
+                "credential_id={}, verifying_contract={contract}, primary_type=withdraw_unshielded, actor=api_key, ",
+                made.id
+            )
+        };
+        assert_eq!(signed.len(), 2, "{signed:?}");
+        assert_eq!(signed[0], format!("{}outcome=allowed", head(CONTRACT)));
+        assert!(
+            signed[1].starts_with(&format!(
+                "{}outcome=denied, policy=allow, reason=",
+                head(&"ab".repeat(32))
+            )),
+            "{}",
+            signed[1]
+        );
+    }
+
+    #[test]
+    fn granting_and_revoking_a_credential_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let policy = contract_policy(dir.path(), "allow", CONTRACT);
+        agent(dir.path(), std::slice::from_ref(&made.id), &[policy], None);
+        let key = crate::key_store::list_api_keys(v).unwrap().remove(0);
+        crate::key_ops::revoke_api_key(&key.id, v).unwrap();
+        assert!(crate::key_store::list_api_keys(v).unwrap().is_empty());
+
+        let details = format!(
+            "key_id={}, name=agent, credential_id={}, policies=allow",
+            key.id, made.id
+        );
+        let log = audit_log(dir.path());
+        assert_eq!(
+            log[1..],
+            [
+                ("create_api_key".to_string(), details.clone()),
+                ("revoke_api_key".to_string(), details)
+            ]
+        );
+    }
+
+    #[test]
+    fn one_token_holds_a_wallet_under_the_empty_passphrase_and_a_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Some(dir.path());
+        let wallet = crate::ops::create_wallet("pay", None, None, v).unwrap();
+        let made = create_credential("device", "midnight", None, Some(PASS), v).unwrap();
+        let wallets = std::slice::from_ref(&wallet.id);
+        let credentials = std::slice::from_ref(&made.id);
+
+        assert!(matches!(
+            crate::key_ops::create_api_key_with_credentials(
+                "agent",
+                wallets,
+                credentials,
+                &[],
+                "wrong",
+                None,
+                v
+            ),
+            Err(OwsLibError::Crypto(_))
+        ));
+        let (token, _) = crate::key_ops::create_api_key_with_credentials(
+            "agent",
+            wallets,
+            credentials,
+            &[],
+            PASS,
+            None,
+            v,
+        )
+        .unwrap();
+
+        let chain = ows_core::parse_chain("ethereum").unwrap();
+        crate::key_ops::sign_message_with_api_key(&token, "pay", &chain, b"hi", None, None, v)
+            .unwrap();
+        let request = withdraw_request();
+        let signed = sign_with_credential("device", "midnight", &request, Some(&token), v).unwrap();
+        credential_scheme(ChainType::Midnight, None)
+            .unwrap()
+            .verify(
+                &made.public_key,
+                &request,
+                &hex::decode(&signed.signature).unwrap(),
+            )
+            .unwrap();
+
+        // A key for wallets alone still opens each one under the given passphrase only.
+        assert!(matches!(
+            crate::key_ops::create_api_key("wallet-only", wallets, &[], PASS, None, v),
+            Err(OwsLibError::Crypto(_))
+        ));
+    }
+
     /// `(operation, details)` of each line of the vault's audit log.
     fn audit_log(vault: &Path) -> Vec<(String, String)> {
         let log = std::fs::read_to_string(vault.join("logs/audit.jsonl")).unwrap_or_default();
@@ -696,6 +1153,14 @@ mod tests {
                 include_str!("../../ows-core/src/credential_file.rs"),
             ),
             (
+                "ows-core/src/api_key.rs",
+                include_str!("../../ows-core/src/api_key.rs"),
+            ),
+            (
+                "ows-core/src/policy.rs",
+                include_str!("../../ows-core/src/policy.rs"),
+            ),
+            (
                 "ows-lib/src/record_store.rs",
                 include_str!("record_store.rs"),
             ),
@@ -713,13 +1178,20 @@ mod tests {
             ),
             ("ows-lib/src/error.rs", include_str!("error.rs")),
             (
+                "ows-lib/src/policy_engine.rs",
+                include_str!("policy_engine.rs"),
+            ),
+            (
                 "ows-signer/src/credential.rs",
                 include_str!("../../ows-signer/src/credential.rs"),
             ),
         ];
         // Files that also hold wallet code, which may name a chain, are scanned only in their
         // credential items.
-        let shared_files = [("ows-lib/src/types.rs", include_str!("types.rs"))];
+        let shared_files = [
+            ("ows-lib/src/types.rs", include_str!("types.rs")),
+            ("ows-lib/src/key_ops.rs", include_str!("key_ops.rs")),
+        ];
 
         let mut generic: Vec<(&str, String)> = whole_files
             .iter()

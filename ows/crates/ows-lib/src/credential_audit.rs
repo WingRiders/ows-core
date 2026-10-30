@@ -8,9 +8,10 @@ use std::io::Write;
 use std::path::Path;
 
 use ows_core::policy::TypedDataContext;
-use ows_core::Credential;
+use ows_core::{ApiKeyFile, Credential, OwsError};
 use serde::Serialize;
 
+use crate::error::OwsLibError;
 use crate::types::CredentialInfo;
 use crate::vault;
 
@@ -81,22 +82,98 @@ pub(crate) fn deleted(credential: &Credential, vault_path: Option<&Path>) {
     );
 }
 
+/// How the caller proved its authority for a signing. The token itself is never recorded.
+pub(crate) enum Actor {
+    Owner,
+    ApiKey,
+}
+
+impl Actor {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Actor::Owner => "owner",
+            Actor::ApiKey => "api_key",
+        }
+    }
+}
+
+/// The verdict on a signing. A policy denial is recorded under the same operation as an allowed
+/// signing, so a refused attempt is a record rather than an absence.
+pub(crate) enum Outcome<'a> {
+    Allowed,
+    Denied { policy_id: &'a str, reason: &'a str },
+}
+
+/// Longest policy-supplied `reason` a record carries. It is an executable policy's own output.
+const MAX_REASON: usize = 500;
+
+impl Outcome<'_> {
+    /// The verdict `err` carries, or `None` when the operation failed for any other reason.
+    pub(crate) fn denial(err: &OwsLibError) -> Option<Outcome<'_>> {
+        match err {
+            OwsLibError::Core(OwsError::PolicyDenied { policy_id, reason }) => {
+                Some(Outcome::Denied { policy_id, reason })
+            }
+            _ => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Outcome::Allowed => "outcome=allowed".to_string(),
+            Outcome::Denied { policy_id, reason } => {
+                let reason = if reason.len() > MAX_REASON {
+                    format!("{}…", &reason[..reason.floor_char_boundary(MAX_REASON)])
+                } else {
+                    (*reason).to_string()
+                };
+                format!("outcome=denied, policy={policy_id}, reason={reason}")
+            }
+        }
+    }
+}
+
 /// A signature is a bearer artifact, so each one is traced, with the account and the circuit the
-/// request names.
+/// request names, and so is each policy denial.
 pub(crate) fn signed(
     credential_id: &str,
     chain_id: &str,
     request: &TypedDataContext,
+    actor: &Actor,
+    outcome: &Outcome,
     vault_path: Option<&Path>,
 ) {
     append(
         "credential_signed",
         Some(chain_id),
         format!(
-            "credential_id={credential_id}, verifying_contract={}, primary_type={}, actor=owner, outcome=allowed",
+            "credential_id={credential_id}, verifying_contract={}, primary_type={}, actor={}, {}",
             request.verifying_contract.as_deref().unwrap_or("none"),
             request.primary_type,
+            actor.as_str(),
+            outcome.describe(),
         ),
         vault_path,
     );
+}
+
+/// Each credential an API key is granted when it is created, or loses when it is revoked, with the
+/// policies that gate it.
+pub(crate) fn api_key_credentials(operation: &str, key: &ApiKeyFile, vault_path: Option<&Path>) {
+    let policies = if key.policy_ids.is_empty() {
+        "none".to_string()
+    } else {
+        key.policy_ids.join(" ")
+    };
+    for credential_id in &key.credential_ids {
+        append(
+            operation,
+            None,
+            format!(
+                "key_id={}, name={}, credential_id={credential_id}, policies={policies}",
+                key.id, key.name
+            ),
+            vault_path,
+        );
+    }
 }

@@ -75,6 +75,9 @@ pub struct PolicyContext {
     /// EIP-712 typed data context (only present for `sign_typed_data` calls).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub typed_data: Option<TypedDataContext>,
+    /// The credential being signed with. Present only for credential requests, where `wallet_id` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +261,7 @@ mod tests {
             },
             timestamp: "2026-03-22T10:35:22Z".into(),
             typed_data: None,
+            credential_id: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
@@ -385,6 +389,7 @@ mod tests {
             },
             timestamp: "2026-03-30T12:00:00Z".into(),
             typed_data: None,
+            credential_id: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
@@ -405,6 +410,7 @@ mod tests {
             },
             timestamp: "2026-03-30T12:00:00Z".into(),
             typed_data: None,
+            credential_id: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&ctx).unwrap();
