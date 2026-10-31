@@ -822,9 +822,11 @@ imbalance, funds the merged tx's DUST fee, seals its half, and `Transaction::mer
   its own intent spends, so the taker's half also spends that coin and returns it whole. Both halves
   sit in the guaranteed section, and every NIGHT coin either side spends or receives there adds to the
   time the node takes to check the merged transaction. A merge that moves several NIGHT coins can take
-  longer than its size allows (the time-to-dismiss bound) and is refused before proving. An unshielded
-  token swapped for NIGHT that the taker pays from one NIGHT coin fits with one DUST spend; shielded
-  coins on either side add proof bytes that raise the bound.
+  longer than its size allows (the time-to-dismiss bound); the taker then adds a DUST spend per round
+  from another of its notes, as for the mempool wall under `balanceUnsealedTransaction`, and is refused
+  before proving only when its DUST is in too few notes. An unshielded token swapped for NIGHT that the
+  taker pays from one NIGHT coin fits with one DUST spend; shielded coins on either side add proof
+  bytes that raise the bound.
 
 #### `balanceUnsealedTransaction`
 
@@ -902,10 +904,17 @@ this bites: `Single.record` costs 6.3ms to check, but a registration needs the w
 input and its change in the guaranteed section — another 9.5ms — and adds almost no bytes, so
 a 3.6kB transaction at 15.9ms is refused. A proof-bearing DUST spend adds the bytes that lift
 the bound (the same call funded by one spend lands at 8.6ms of 15ms), so the fee loop falls
-back to one. A wallet-funded call tree runs close to the wall (the landed `pay_from_wallet`
-payment used 20.3ms of 21.9ms), which is one more reason the coin reserved for a registration
-is dropped when a spend pays: it would back nothing and cost another 3.4ms. A wallet that can
-pay only by registration (no generated DUST yet) cannot get such a transaction past the
+back to one. A spend adds about 3kB, which buys 6ms, and costs 2.3ms to check, so when one spend
+still leaves a transaction refused for its size, the loop adds another, each extra DUST note
+paying one star of the fee. A higher fee alone would not do it: the note that covered the fee
+covers a higher one too, and the section stays the same size. A 10 NIGHT deposit into a
+contract, funded by one NIGHT input and its change, takes 15.1ms with one spend against 15ms
+for its 6.9kB, and 17.4ms against 20.1ms with two. A wallet whose DUST sits in fewer notes than
+that needs is refused before proving, with the wall's numbers and its note count. A
+wallet-funded call tree runs close to the wall (the landed `pay_from_wallet` payment used 20.3ms
+of 21.9ms), which is one more reason the coin reserved for a registration is dropped when a
+spend pays: it would back nothing and cost another 3.4ms. A wallet that can pay only by
+registration (no generated DUST yet) cannot get such a transaction past the
 mempool; it is refused **before proving**, with the node's own numbers:
 
 ```
