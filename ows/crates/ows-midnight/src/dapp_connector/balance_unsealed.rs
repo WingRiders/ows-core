@@ -2,6 +2,8 @@
 //! planning. The dapp hands the wallet an already-**proven** (`proof,embedded-fr`) unsealed tx; the
 //! wallet balances it against its own inputs, then signs and seals.
 
+use std::path::Path;
+
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
@@ -61,8 +63,9 @@ fn default_pay_fees() -> bool {
     true
 }
 
+/// The spec's options bag. Any other key is refused rather than ignored.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PayFeesOptions {
     #[serde(default = "default_pay_fees")]
     pay_fees: bool,
@@ -99,6 +102,7 @@ pub(super) fn plan(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     json: &str,
+    vault_path: Option<&Path>,
 ) -> Result<ConnectorPlan, std::io::Error> {
     let request = parse_balance_unsealed_json(json)?;
     match classify_unsealed_payload(&request.tx_bytes) {
@@ -110,6 +114,7 @@ pub(super) fn plan(
                 crypto_provider,
                 &request.tx_bytes,
                 request.pay_fees,
+                vault_path,
             )?;
             Ok(ConnectorPlan::BalanceUnsealed(Box::new(plan)))
         }
@@ -143,6 +148,14 @@ mod tests {
             parse_balance_unsealed_json(r#"{"tx":"0x00","options":{"payFees":false}}"#).unwrap();
         assert_eq!(req.tx_bytes, vec![0x00]);
         assert!(!req.pay_fees);
+    }
+
+    #[test]
+    fn rejects_an_unknown_option() {
+        let err = parse_balance_unsealed_json(r#"{"tx":"0x00","options":{"payfees":false}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

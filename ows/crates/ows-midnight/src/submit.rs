@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::urls::{http_url_to_ws_url, without_credentials};
+use super::urls::{http_url_to_ws_url, is_loopback, without_credentials};
 
 fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
@@ -23,7 +23,7 @@ const LEDGER_BALANCE_CHECK_OVERSPEND: u16 = 138;
 /// Input references a UTXO absent from ledger state (`InvalidTransaction::Custom(195)`).
 const LEDGER_INPUT_NOT_IN_UTXOS: u16 = 195;
 
-type SealedTx = midnight_ledger::structure::Transaction<
+pub(crate) type SealedTx = midnight_ledger::structure::Transaction<
     midnight_base_crypto::signatures::Signature,
     midnight_ledger::structure::ProofMarker,
     <midnight_ledger::structure::ProofMarker as midnight_ledger::structure::ProofKind<
@@ -82,7 +82,7 @@ fn is_swap_shaped_offer(
 
 /// Detect sealed txs that the ledger will reject on submit (error 138), using the ledger's own
 /// per-segment balance aggregation rather than an inputs-vs-outputs heuristic.
-fn preflight_sealed_tx_submit(tx: &SealedTx) -> Result<(), std::io::Error> {
+pub(crate) fn preflight_sealed_tx_submit(tx: &SealedTx) -> Result<(), std::io::Error> {
     use midnight_ledger::structure::Transaction;
 
     let Transaction::Standard(stx) = tx else {
@@ -198,15 +198,7 @@ fn require_tls_unless_loopback(node_rpc_url: &str) -> Result<(), std::io::Error>
         "http" | "ws" => {}
         _ => return Err(invalid_scheme(node_rpc_url)),
     }
-    let loopback = url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if loopback {
+    if is_loopback(&url) {
         Ok(())
     } else {
         Err(err(format!(
