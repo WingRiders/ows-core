@@ -1126,6 +1126,7 @@ impl BalancedPlan {
         let dust = DustFeePlan::Spend {
             plan: DustSpendPlan {
                 fee_dust,
+                min_spends: 1,
                 dust_ctime,
                 intent_ttl,
                 seg_id,
@@ -1165,6 +1166,16 @@ pub(crate) fn dust_state_with_one_note(
     night_value: u128,
     ctime: Timestamp,
 ) -> DustLocalState<InMemoryDB> {
+    dust_state_with_notes(dust_seed, &[night_value], ctime)
+}
+
+/// [`dust_state_with_one_note`] for several notes, one per NIGHT value, each backed by its own NIGHT.
+#[cfg(test)]
+pub(crate) fn dust_state_with_notes(
+    dust_seed: &[u8; 32],
+    night_values: &[u128],
+    ctime: Timestamp,
+) -> DustLocalState<InMemoryDB> {
     use midnight_base_crypto::hash::HashOutput;
     use midnight_ledger::dust::{
         dust_nonce, DustGenerationInfo, DustSecretKey, InitialNonce, QualifiedDustOutput,
@@ -1174,37 +1185,43 @@ pub(crate) fn dust_state_with_one_note(
 
     let dsk = DustSecretKey::derive_secret_key(dust_seed);
     let owner = DustPublicKey::from(dsk.clone());
-    let backing_night = InitialNonce(HashOutput([7u8; 32]));
-    let event = Event {
-        source: EventSource {
-            transaction_hash: TransactionHash(HashOutput([0u8; 32])),
-            logical_segment: 0,
-            physical_segment: 0,
-        },
-        content: EventDetails::DustInitialUtxo {
-            output: QualifiedDustOutput {
-                initial_value: night_value
-                    .saturating_mul(INITIAL_DUST_PARAMETERS.night_dust_ratio as u128),
-                owner,
-                nonce: dust_nonce(&backing_night, 0, &dsk),
-                seq: 0,
-                ctime,
-                backing_night,
-                mt_index: 0,
-            },
-            generation: DustGenerationInfo {
-                value: night_value,
-                owner,
-                nonce: backing_night,
-                dtime: Timestamp::from_secs(u64::MAX),
-            },
-            generation_index: 0,
-            block_time: ctime,
-        },
-    };
+    let events: Vec<_> = night_values
+        .iter()
+        .enumerate()
+        .map(|(i, &night_value)| {
+            let backing_night = InitialNonce(HashOutput([7u8 + i as u8; 32]));
+            Event {
+                source: EventSource {
+                    transaction_hash: TransactionHash(HashOutput([i as u8; 32])),
+                    logical_segment: 0,
+                    physical_segment: 0,
+                },
+                content: EventDetails::DustInitialUtxo {
+                    output: QualifiedDustOutput {
+                        initial_value: night_value
+                            .saturating_mul(INITIAL_DUST_PARAMETERS.night_dust_ratio as u128),
+                        owner,
+                        nonce: dust_nonce(&backing_night, 0, &dsk),
+                        seq: 0,
+                        ctime,
+                        backing_night,
+                        mt_index: i as u64,
+                    },
+                    generation: DustGenerationInfo {
+                        value: night_value,
+                        owner,
+                        nonce: backing_night,
+                        dtime: Timestamp::from_secs(u64::MAX),
+                    },
+                    generation_index: i as u64,
+                    block_time: ctime,
+                },
+            }
+        })
+        .collect();
     DustLocalState::new(INITIAL_DUST_PARAMETERS)
-        .replay_events(&dsk, std::iter::once(&event))
-        .expect("replay the initial dust utxo")
+        .replay_events(&dsk, events.iter())
+        .expect("replay the initial dust utxos")
 }
 
 /// Whether two proven transactions are the same apart from their proof bytes. Compared with every
@@ -3737,6 +3754,7 @@ mod tests {
         let spend = DustFeePlan::Spend {
             plan: DustSpendPlan {
                 fee_dust: 42,
+                min_spends: 1,
                 dust_ctime,
                 intent_ttl: Timestamp::from_secs(3_600),
                 seg_id: 1,
@@ -4061,6 +4079,7 @@ mod tests {
         let spend = plan_paying(DustFeePlan::Spend {
             plan: DustSpendPlan {
                 fee_dust: 42,
+                min_spends: 1,
                 dust_ctime: Timestamp::from_secs(0),
                 intent_ttl: Timestamp::from_secs(0),
                 seg_id: 3,
@@ -5340,6 +5359,82 @@ mod tests {
             "{e}"
         );
         assert!(e.contains("paying it with a DUST spend instead:"), "{e}");
+    }
+
+    /// A 10 NIGHT `deposit_unshielded` into a Passport account contract (the Midnight Passport
+    /// playground's), as OWS funded it on stagenet — one NIGHT input and its change in the guaranteed
+    /// section — with its DUST section left out.
+    fn funded_deposit_tx() -> TxProven {
+        let bytes =
+            hex::decode(include_str!("testdata/contract_calls/deposit_funded.tx.hex").trim())
+                .unwrap();
+        tagged_deserialize(&mut &bytes[..]).unwrap()
+    }
+
+    /// `tx` paying `fee_dust` with at least `min_spends` DUST spends from `notes`, mock-proven.
+    fn with_dust_section(
+        tx: &TxProven,
+        notes: &DustLocalState<InMemoryDB>,
+        fee_dust: u128,
+        min_spends: usize,
+    ) -> TxProven {
+        let Transaction::Standard(stx) = tx else {
+            unreachable!()
+        };
+        let (seg_id, mut intent) = only_intent(stx);
+        let plan = DustSpendPlan {
+            fee_dust,
+            min_spends,
+            dust_ctime: Timestamp::from_secs(1_000 + 30 * 24 * 3600),
+            intent_ttl: intent.ttl,
+            seg_id,
+            binding_commitment: intent.binding_commitment,
+        };
+        let section = MidnightSigner::mainnet()
+            .crypto_provider(&packed_signing_key(UNSHIELDED_SEED_HEX))
+            .unwrap()
+            .mock_dust_spends(notes, &plan, &stx.network_id)
+            .unwrap();
+        intent.dust_actions = Some(Sp::new(section));
+        let mut stx = stx.clone();
+        stx.intents = stx.intents.insert(seg_id, intent);
+        Transaction::Standard(stx)
+    }
+
+    /// The wall one DUST note cannot clear. Paid by one spend, the deposit takes 15.1ms to check and its
+    /// 6.9kB may take 15ms, so the node refuses it whatever it pays, and a higher fee target spends the
+    /// same note again. A second spend clears it: its proof adds 3kB, which buys 6ms more, and costs
+    /// 2.3ms to check.
+    #[test]
+    fn a_second_dust_spend_clears_the_mempool_wall_one_cannot() {
+        use midnight_base_crypto::cost_model::CostDuration;
+        let params = stagenet_params();
+        let deposit = funded_deposit_tx();
+        let night = 1_000 * midnight_ledger::structure::STARS_PER_NIGHT;
+        let notes =
+            dust_state_with_notes(&[0x22; 32], &[night, night], Timestamp::from_secs(1_000));
+        let fee = 1_000_000_000_000_000;
+
+        let one = with_dust_section(&deposit, &notes, fee, 1);
+        let verdict = fee_sizing::fee_gate(&one, &params).unwrap();
+        let fee_sizing::FeeGate::TooCostlyForItsSize {
+            time_to_dismiss,
+            allowed,
+            size,
+        } = verdict
+        else {
+            panic!("the gate admits it: {verdict}");
+        };
+        assert_eq!(allowed, CostDuration::from_picoseconds(15_000_000_000));
+        let ms = time_to_dismiss.into_picoseconds() / 1_000_000;
+        assert!((15_100..15_200).contains(&ms), "{verdict}");
+        assert!((6_800..7_000).contains(&size), "{verdict}");
+
+        let two = with_dust_section(&deposit, &notes, fee, 2);
+        assert_eq!(
+            fee_sizing::fee_gate(&two, &params).unwrap(),
+            fee_sizing::FeeGate::Covered
+        );
     }
 
     /// Every contract-call transaction OWS funded on stagenet and the node admitted, as the chain holds

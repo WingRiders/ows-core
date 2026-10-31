@@ -493,6 +493,10 @@ pub(super) fn size_dust_fee(
     // The last time the gate refused a candidate for its size, not its fee — what to report when no
     // candidate gets through, since "the fee is not covered" would send the caller after more DUST.
     let mut wall: Option<FeeGate> = None;
+    // The same for a DUST-spend candidate, and the spends the next section must hold: a spend's proof
+    // adds more to what the mempool allows the transaction than checking it costs.
+    let mut spend_wall: Option<FeeGate> = None;
+    let mut min_spends = 1;
 
     for attempt in 0..MAX_FEE_ITERS {
         if let Some(reg) = try_registration_dust_actions(
@@ -550,6 +554,7 @@ pub(super) fn size_dust_fee(
         let synced = dust_state.as_ref().expect("dust state synced above");
         let plan = DustSpendPlan {
             fee_dust: fee_target,
+            min_spends,
             dust_ctime,
             intent_ttl,
             seg_id: ctx.seg_id,
@@ -558,7 +563,13 @@ pub(super) fn size_dust_fee(
         let dust_actions = ctx
             .crypto_provider
             .mock_dust_spends(synced, &plan, &ctx.stx.network_id)
-            .map_err(|e| with_wall(err(e.to_string())))?;
+            .map_err(|e| match &spend_wall {
+                Some(refused) => err(format!(
+                    "cannot pay for this transaction: {refused}; another DUST spend would lift \
+                     it, but {e}"
+                )),
+                None => with_wall(err(e.to_string())),
+            })?;
         let tx_check = wrap_proven_standard(
             ctx.stx,
             ctx.seg_id,
@@ -581,13 +592,21 @@ pub(super) fn size_dust_fee(
                     intent_ttl,
                 ))
             }
-            refused @ FeeGate::TooCostlyForItsSize { .. } => wall = Some(refused),
-            FeeGate::Uncovered => wall = None,
+            // A higher fee target does not grow the section when one note covers it, so ask for
+            // another spend outright.
+            refused @ FeeGate::TooCostlyForItsSize { .. } => {
+                spend_wall = Some(refused);
+                min_spends = dust_actions.spends.len() + 1;
+            }
+            FeeGate::Uncovered => {
+                wall = None;
+                spend_wall = None;
+            }
         }
 
         // Re-estimate against the section we just built — margined, and via `fees_with_margin`'s
-        // `enforce_time_to_dismiss: false`, so a tx still over the time-to-dismiss bound grows its
-        // section here instead of erroring out (the bytes of more spends are what lift the bound).
+        // `enforce_time_to_dismiss: false`, so a tx still over the time-to-dismiss bound is priced
+        // here instead of erroring out; the next section carries the extra spend that lifts it.
         let actual_fee = with_drift_margin(
             tx_check
                 .fees_with_margin(&params, FEE_BLOCKS_MARGIN)
@@ -601,7 +620,7 @@ pub(super) fn size_dust_fee(
             .max(fee_target.saturating_add(1))
             .max(dust_paid.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {
-            if let Some(refused) = wall {
+            if let Some(refused) = spend_wall.or(wall) {
                 return Err(err(format!(
                     "cannot pay for this transaction: {refused}, and {MAX_FEE_ITERS} DUST \
                      sections did not lift it"
@@ -801,9 +820,15 @@ pub(crate) fn size_merge_dust_fee(
             .map_err(|e| err(format!("merged DUST fee estimate failed: {e:?}")))?,
     );
 
+    // A merged transaction the gate refuses for its size gets one more DUST spend per round: a spend's
+    // proof adds more to what the mempool allows than checking it costs.
+    let mut spend_wall: Option<FeeGate> = None;
+    let mut min_spends = 1;
+
     for attempt in 0..MAX_FEE_ITERS {
         let plan = DustSpendPlan {
             fee_dust: fee_target,
+            min_spends,
             dust_ctime,
             intent_ttl,
             seg_id: dust_seg,
@@ -811,7 +836,13 @@ pub(crate) fn size_merge_dust_fee(
         };
         let dust_actions = crypto_provider
             .mock_dust_spends(&dust_state, &plan, &taker_base.network_id)
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| match &spend_wall {
+                Some(refused) => err(format!(
+                    "cannot pay for the merged transaction: {refused}; another DUST spend would \
+                     lift it, but {e}"
+                )),
+                None => err(e.to_string()),
+            })?;
         let merged = merged_with_taker_dust(
             maker,
             taker_base,
@@ -819,51 +850,44 @@ pub(crate) fn size_merge_dust_fee(
             Some(dust_actions.clone()),
             intent_ttl,
         )?;
-        // Charge the node's real fee, enforcing the time-to-dismiss bound as `well_formed` does.
-        let fee = match merged.fees(&ledger_params, true) {
-            Ok(fee) => fee,
-            // `OutsideTimeToDismiss` is a size-vs-compute bound, not a fee shortfall: checking the
-            // merged tx takes longer than its serialized size allows the node to spend dismissing it.
-            // A DUST spend adds more to that allowance than it costs to check only once the transaction
-            // is past the size floor, which can take several spends, so fail with the node's numbers
-            // rather than spinning the loop.
-            Err(e) if format!("{e:?}").contains("OutsideTimeToDismiss") => {
-                return Err(err(format!(
-                    "the merged transaction cannot satisfy the node's time-to-dismiss bound ({e:?}): \
-                     checking it takes longer than its size allows. Every NIGHT coin either side \
-                     spends or receives in the guaranteed section adds to that time, so a swap paid \
-                     from fewer NIGHT coins fits more easily; shielded coins on either side add proof \
-                     bytes that raise the bound."
-                )));
+        match fee_gate(&merged, &ledger_params)? {
+            FeeGate::Covered => {
+                return Ok(MergeDustFee {
+                    plan,
+                    dust_state: Box::new(dust_state),
+                    ledger_params,
+                })
             }
-            Err(e) => return Err(err(format!("merged DUST fee check failed: {e:?}"))),
-        };
-        let balances = merged
-            .balance(Some(fee))
-            .map_err(|e| err(format!("merged balance check failed: {e:?}")))?;
-        if balances.into_iter().all(|(_, bal)| bal >= 0) {
-            return Ok(MergeDustFee {
-                plan,
-                dust_state: Box::new(dust_state),
-                ledger_params,
-            });
+            refused @ FeeGate::TooCostlyForItsSize { .. } => {
+                spend_wall = Some(refused);
+                min_spends = dust_actions.spends.len() + 1;
+            }
+            FeeGate::Uncovered => spend_wall = None,
         }
 
-        // The DUST section under-covers the fee: grow the target — to the *margined* fee of the tx we
-        // just measured, so the next round's section survives the price drift too — and re-size.
+        // The DUST section under-covers the fee, or the next one carries another spend: grow the
+        // target — to the *margined* fee of the tx we just measured, so the next round's section
+        // survives the price drift too — and re-size.
+        let fee = merged
+            .fees(&ledger_params, false)
+            .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?;
         let margin_fee = with_drift_margin(
             merged
                 .fees_with_margin(&ledger_params, FEE_BLOCKS_MARGIN)
                 .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?,
-            merged
-                .fees(&ledger_params, false)
-                .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?,
+            fee,
         );
         let dust_paid = sum_dust_v_fee(dust_actions.spends.iter_deref());
         fee_target = margin_fee
             .max(fee_target.saturating_add(1))
             .max(dust_paid.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {
+            if let Some(refused) = spend_wall {
+                return Err(err(format!(
+                    "cannot pay for the merged transaction: {refused}, and {MAX_FEE_ITERS} DUST \
+                     sections did not lift it"
+                )));
+            }
             return Err(err(format!(
                 "failed to cover the merged DUST fee after {MAX_FEE_ITERS} attempts \
                  (target={fee_target}, paid={dust_paid}, fee={fee})"
