@@ -24,15 +24,15 @@ pub enum UnsealedKind {
 }
 
 const TAG_PROOF_EMBEDDED_FR: &[u8] =
-    b"midnight:transaction[v9](signature[v1],proof,embedded-fr[v1]):";
+    b"midnight:transaction[v12](signature[v2],proof,embedded-fr[v1]):";
 const TAG_PROOF_PREIMAGE_EMBEDDED_FR: &[u8] =
-    b"midnight:transaction[v9](signature[v1],proof-preimage,embedded-fr[v1]):";
+    b"midnight:transaction[v12](signature[v2],proof-preimage,embedded-fr[v1]):";
 /// A fully sealed (`proof,pedersen-schnorr`) transaction — a maker offer whose Zswap offers must be
 /// *merged* with the taker's, not balanced against the wallet's own inputs.
 const TAG_PROOF_PEDERSEN_SCHNORR: &[u8] =
-    b"midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):";
+    b"midnight:transaction[v12](signature[v2],proof,pedersen-schnorr[v1]):";
 
-/// Classify a tagged v9 Midnight transaction blob, or `None` if it is already sealed (or another
+/// Classify a tagged v12 Midnight transaction blob, or `None` if it is already sealed (or another
 /// shape the wallet pipeline does not handle).
 pub fn classify_unsealed_payload(tx_bytes: &[u8]) -> Option<UnsealedKind> {
     if tx_bytes.starts_with(TAG_PROOF_PREIMAGE_EMBEDDED_FR) {
@@ -51,7 +51,7 @@ pub fn is_sealed_maker_payload(tx_bytes: &[u8]) -> bool {
     tx_bytes.starts_with(TAG_PROOF_PEDERSEN_SCHNORR)
 }
 
-/// A parsed `balanceUnsealedTransaction` connector request: the tagged v9 transaction to balance and
+/// A parsed `balanceUnsealedTransaction` connector request: the tagged v12 transaction to balance and
 /// whether the wallet should register DUST to pay fees.
 #[derive(Debug, Clone)]
 pub struct BalanceUnsealedRequest {
@@ -74,7 +74,7 @@ struct PayFeesOptions {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BalanceUnsealedJson {
-    /// The tagged v9 transaction, hex-encoded. A top-level `method` key (if present) is used for
+    /// The tagged v12 transaction, hex-encoded. A top-level `method` key (if present) is used for
     /// routing upstream and ignored here.
     tx: String,
     #[serde(default)]
@@ -174,7 +174,7 @@ mod tests {
             Some(UnsealedKind::ProofPreimage)
         );
         assert_eq!(
-            classify_unsealed_payload(b"midnight:transaction[v9]sealed"),
+            classify_unsealed_payload(b"midnight:transaction[v12]sealed"),
             None
         );
     }

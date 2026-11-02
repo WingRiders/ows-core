@@ -10,19 +10,21 @@
 #
 # The wallet can be one already in your vault (give its name) or a fresh import from a mnemonic
 # (give a new name + the words). It also serves as a live check of the runtime dust gating: on a
-# network whose dust ledger is active (Preview/Preprod), the "Dust status" section must appear.
+# network whose dust ledger is active (Stagenet, Preview, Preprod), the "Dust status" section
+# must appear.
 #
-# Usage:  ./midnight-fund-balance.sh [network]   # network defaults to midnight:preview
+# Usage:  ./midnight-fund-balance.sh [network]   # network defaults to midnight:stagenet (ledger 9)
 # Env:    CHAIN=midnight:preprod   PROFILE=debug (faster build, slower sync)   FRESH=1 (no cache)
 #
-# Only preview ships a default indexer. For mainnet/preprod, first set `rpc."midnight:<network>"`
-# in ~/.ows/config.json (see docs/midnight.md, "Fund balance" > "Configuration").
+# Only preview and stagenet ship a default indexer. For mainnet/preprod, first set
+# `rpc."midnight:<network>"` in ~/.ows/config.json (see docs/midnight.md, "Fund balance" >
+# "Configuration"). This build is against ledger 9, which only stagenet runs.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preview}}"
+CHAIN="${1:-${CHAIN:-midnight:stagenet}}"
 
 # Colours — bold-blue headings, cyan commands, dim asides, green/red pass-fail. Suppressed when
 # stdout is not a terminal, so a piped/headless run stays free of escape codes.
@@ -78,7 +80,7 @@ else
 fi
 [ -x "$OWS" ] || { printf '%s✗ build did not produce %s%s\n' "$RED" "$OWS" "$RESET"; exit 1; }
 
-# Fail early when the network has no indexer (only preview ships one). Checked quietly: the URL
+# Fail early when the network has no indexer (only preview and stagenet ship one). Checked quietly: the URL
 # can carry an API key. Not `grep -q`: it stops reading at the match, `ows` then fails writing
 # the rest, and pipefail reports the pipeline as failed.
 if ! "$OWS" config show 2>/dev/null | grep "^  $CHAIN " >/dev/null; then

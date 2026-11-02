@@ -7,8 +7,9 @@
 # it never looks for a prebuilt binary), then walks every path the signer milestone unlocks:
 #
 #   • `ows mnemonic derive --chain midnight:<network>` — the unshielded Night address, checked
-#     BYTE-FOR-BYTE against the pinned abandon-phrase vectors across mainnet / preview / preprod,
-#     the `midnight` alias, an ad-hoc `feature-x`, a fully custom network, and --index 1;
+#     BYTE-FOR-BYTE against the pinned abandon-phrase vectors across mainnet / preview / preprod /
+#     stagenet, the `midnight` and `midnight-stagenet` aliases, an ad-hoc `feature-x`, a fully
+#     custom network, and --index 1;
 #   • arbitrary / custom networks — any `midnight:<network>` is carried verbatim into the HRP;
 #   • malformed-network REJECTION — uppercase, bad charset, leading/trailing hyphen, empty are
 #     rejected (non-zero exit) rather than coerced to mainnet;
@@ -107,6 +108,7 @@ DATA_PREFIX="dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35q"
 MAINNET_ADDR="mn_addr1${DATA_PREFIX}w3dyt6"
 PREVIEW_ADDR="mn_addr_preview1${DATA_PREFIX}4y8xms"
 PREPROD_ADDR="mn_addr_preprod1${DATA_PREFIX}49ekgd"
+STAGENET_ADDR="mn_addr_stagenet1${DATA_PREFIX}z2gd7g"
 FEATUREX_ADDR="mn_addr_feature-x1${DATA_PREFIX}gl8r2t"
 PREVIEW_IDX1_ADDR="mn_addr_preview1kpq4jf9d35tjnw0jtx7vaexaavq7xyj0x497pcqzwqetuyrc7nrq37rt92"
 # The same account's shielded and dust addresses, which derive prints on stderr from the keys alone.
@@ -144,7 +146,7 @@ run "config: vault path + endpoints (URL queries redacted)" "ows config show" co
 
 # ── 3. Derive the unshielded Night address across the known networks (byte-for-byte) ──────
 say ""
-say "Address derivation — pinned vectors (mainnet / preview / preprod / alias / index)"
+say "Address derivation — pinned vectors (mainnet / preview / preprod / stagenet / alias / index)"
 
 expect "derive midnight:mainnet" \
   "ows mnemonic derive --chain midnight:mainnet" \
@@ -175,6 +177,11 @@ expect "derive midnight:preprod (HRP suffix _preprod, same data part)" \
   "ows mnemonic derive --chain midnight:preprod" \
   "$PREPROD_ADDR" \
   "$OWS" mnemonic derive --chain midnight:preprod
+
+expect "derive midnight-stagenet (alias for midnight:stagenet, the ledger-9 network)" \
+  "ows mnemonic derive --chain midnight-stagenet" \
+  "$STAGENET_ADDR" \
+  "$OWS" mnemonic derive --chain midnight-stagenet
 
 expect "derive midnight:feature-x (ad-hoc reference kept verbatim)" \
   "ows mnemonic derive --chain midnight:feature-x" \

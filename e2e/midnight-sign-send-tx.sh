@@ -10,24 +10,26 @@
 # real balanceUnsealed connector JSON against the live node.
 #
 # A live submission needs a funded wallet and a proven (proof,embedded-fr) balanceUnsealed input,
-# which a DApp normally supplies. This checkout bundles one for preview and one for preprod
-# (shielded-movement-cap/tx-proven-<network>.hex), so on either the live submit runs out of the box;
+# which a DApp normally supplies. This checkout bundles one each for stagenet (ledger 9, what this
+# build talks to) and for preview and preprod (ledger 8)
+# (shielded-movement-cap/tx-proven-<network>.hex), so on stagenet the live submit runs out of the box;
 # point TX_JSON at your own connector-request file to override it. Proving runs in-process by
 # default (circuit keys fetched on first use), or against rpc["midnight:<net>:prover"] when set.
 # The offline reject check runs regardless.
 #
-# Only preview ships default indexer and node URLs. For the live run on mainnet/preprod, first set
-# `rpc."midnight:<network>"` (indexer) and `rpc."midnight:<network>:node"` (node) in ~/.ows/config.json
-# (see docs/midnight.md, "Fund balance" > "Configuration" and "Sign and send" > "Node RPC").
+# Only preview and stagenet ship default indexer and node URLs. For the live run on mainnet/preprod,
+# first set `rpc."midnight:<network>"` (indexer) and `rpc."midnight:<network>:node"` (node) in
+# ~/.ows/config.json (see docs/midnight.md, "Fund balance" > "Configuration" and "Sign and send" >
+# "Node RPC").
 #
-# Usage:  ./midnight-sign-send-tx.sh [network]   # network defaults to midnight:preview
+# Usage:  ./midnight-sign-send-tx.sh [network]   # network defaults to midnight:stagenet (ledger 9)
 # Env:    CHAIN=midnight:preprod   PROFILE=debug (faster build, slower prove)   TX_JSON=<path-to-json>
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$SCRIPT_DIR/../ows"
-CHAIN="${1:-${CHAIN:-midnight:preview}}"
+CHAIN="${1:-${CHAIN:-midnight:stagenet}}"
 
 # Colours — bold-blue headings, cyan commands, dim asides, green/red pass-fail. Suppressed when
 # stdout is not a terminal, so a piped/headless run stays free of escape codes.
@@ -120,8 +122,8 @@ fi
 
 # ── 4. Live run: seal (sign tx, no broadcast) then submit (sign send-tx) a balanceUnsealed request ─
 # TX_JSON, if set, points at your own connector-request file. Otherwise fall back to the bundled
-# proven maker for this network (shielded-movement-cap/tx-proven-<network>.hex, shipped for preview
-# and preprod) so the live run works by default. A maker is proven for one network and fails on others.
+# proven maker for this network (shielded-movement-cap/tx-proven-<network>.hex, shipped for stagenet,
+# preview and preprod) so the live run works by default. A maker is proven for one network and fails on others.
 # Each step's pause() lets you Ctrl-C before it runs — the seal step never broadcasts, only send-tx does.
 NET="${CHAIN##*:}"
 ARTIFACT="$SCRIPT_DIR/shielded-movement-cap/tx-proven-$NET.hex"

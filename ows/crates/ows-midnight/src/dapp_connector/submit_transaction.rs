@@ -98,12 +98,12 @@ impl SubmitTransactionRequest {
 mod tests {
     use super::*;
     use midnight_base_crypto::hash::HashOutput;
-    use midnight_base_crypto::signatures::{Signature as MnSig, SigningKey};
+    use midnight_base_crypto::signatures::SigningKey;
     use midnight_base_crypto::time::Timestamp;
     use midnight_coin_structure::coin::{UserAddress, NIGHT};
     use midnight_ledger::structure::{
-        Intent, IntentHash, ProofMarker, StandardTransaction, UnshieldedOffer, UtxoOutput,
-        UtxoSpend,
+        Intent, IntentHash, ProofMarker, Signature as MnSig, SignatureVerifyingKey,
+        StandardTransaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
     };
     use midnight_serialize::tagged_serialize;
     use midnight_storage::arena::Sp;
@@ -123,7 +123,9 @@ mod tests {
     /// guaranteed section. Its input is unsigned, which the node refuses and the balance check does not
     /// look at.
     fn spending_into(outputs: &[u128]) -> ProvenBase {
-        let owner = SigningKey::from_bytes(&[0x11; 32]).unwrap().verifying_key();
+        let owner = SignatureVerifyingKey::Schnorr(
+            SigningKey::from_bytes(&[0x11; 32]).unwrap().verifying_key(),
+        );
         let offer = UnshieldedOffer {
             inputs: vec![UtxoSpend {
                 value: 1_000_000,
@@ -260,7 +262,7 @@ mod tests {
             "trailing bytes"
         );
 
-        let tagged_only = b"midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):";
+        let tagged_only = b"midnight:transaction[v12](signature[v2],proof,pedersen-schnorr[v1]):";
         assert!(
             refusal(tagged_only).contains("failed to parse"),
             "a bare tag"
