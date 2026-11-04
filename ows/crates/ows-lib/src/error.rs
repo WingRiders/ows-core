@@ -14,6 +14,17 @@ pub enum OwsLibError {
     #[error("wallet name already exists: '{0}'")]
     WalletNameExists(String),
 
+    #[error("credential not found: '{0}'")]
+    CredentialNotFound(String),
+
+    #[error(
+        "ambiguous credential name '{name}' matches {count} credentials; use the credential ID instead"
+    )]
+    AmbiguousCredential { name: String, count: usize },
+
+    #[error("credential name already exists: '{0}'")]
+    CredentialNameExists(String),
+
     #[error("invalid input: {0}")]
     InvalidInput(String),
 

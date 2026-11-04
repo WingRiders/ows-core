@@ -4,6 +4,7 @@ pub mod cosmos;
 pub mod evm;
 pub mod filecoin;
 pub mod midnight;
+pub mod midnight_credential;
 pub mod nano;
 pub mod near;
 pub mod solana;
@@ -22,6 +23,7 @@ pub use self::midnight::{
     wrap_merge_envelope, DustSpendPlan, MidnightCryptoProvider, MidnightNetwork, MidnightSigner,
     ShieldedAuthorized, ShieldedSpendPlan,
 };
+pub use self::midnight_credential::JubjubCredential;
 pub use self::nano::NanoSigner;
 pub use self::near::NearSigner;
 pub use self::solana::SolanaSigner;
@@ -31,6 +33,7 @@ pub use self::ton::TonSigner;
 pub use self::tron::TronSigner;
 pub use self::xrpl::XrplSigner;
 
+use crate::credential::CredentialScheme;
 use crate::traits::{ChainSigner, SignerError};
 use ows_core::{default_chain_for_type, Chain, ChainType};
 
@@ -63,4 +66,70 @@ pub fn signer_for_chain(chain: &Chain) -> Result<Box<dyn ChainSigner>, SignerErr
 /// Get a default signer for a given chain family (first registry entry per family).
 pub fn signer_for_chain_type(chain_type: ChainType) -> Result<Box<dyn ChainSigner>, SignerError> {
     signer_for_chain(&default_chain_for_type(chain_type))
+}
+
+/// Resolve the credential scheme `scheme` of a chain family, or the family's default
+/// scheme when `scheme` is `None`.
+pub fn credential_scheme(
+    chain: ChainType,
+    scheme: Option<&str>,
+) -> Result<Box<dyn CredentialScheme>, SignerError> {
+    let default: Option<Box<dyn CredentialScheme>> = match chain {
+        ChainType::Midnight => Some(Box::new(JubjubCredential)),
+        _ => None,
+    };
+    default
+        .filter(|found| scheme.is_none_or(|name| name == found.name()))
+        // The scheme argument is not echoed: a caller that misplaces arguments could pass a
+        // secret in its slot.
+        .ok_or_else(|| {
+            SignerError::UnsupportedChain(match scheme {
+                Some(_) => format!("{chain} has no credential scheme of that name"),
+                None => format!("{chain} has no credential scheme"),
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ows_core::ALL_CHAIN_TYPES;
+
+    #[test]
+    fn no_other_chain_has_a_credential_scheme() {
+        for chain in ALL_CHAIN_TYPES
+            .into_iter()
+            .filter(|c| *c != ChainType::Midnight)
+        {
+            for scheme in [None, Some("jubjub")] {
+                assert!(
+                    matches!(
+                        credential_scheme(chain, scheme),
+                        Err(SignerError::UnsupportedChain(_))
+                    ),
+                    "{chain} {scheme:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            credential_scheme(ChainType::Midnight, Some("k1")),
+            Err(SignerError::UnsupportedChain(_))
+        ));
+        for scheme in [None, Some("jubjub")] {
+            let found = credential_scheme(ChainType::Midnight, scheme).unwrap();
+            assert_eq!(found.name(), "jubjub");
+        }
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_not_echoed() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        for chain in [ChainType::Midnight, ChainType::Evm] {
+            let refusal = credential_scheme(chain, Some(secret))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(!refusal.contains(secret), "{refusal}");
+        }
+    }
 }

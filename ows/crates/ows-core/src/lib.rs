@@ -3,6 +3,7 @@ pub mod caip;
 pub mod cardano_rpc;
 pub mod chain;
 pub mod config;
+pub mod credential_file;
 pub mod error;
 pub mod policy;
 pub mod sync_cache;
@@ -21,6 +22,7 @@ pub use chain::{
     UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES,
 };
 pub use config::Config;
+pub use credential_file::{Credential, CredentialOrigin, CREDENTIAL_FILE_VERSION};
 pub use error::{OwsError, OwsErrorCode};
 pub use policy::{
     Policy, PolicyAction, PolicyContext, PolicyRequestType, PolicyResult, PolicyRule,

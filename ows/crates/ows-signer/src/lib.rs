@@ -1,5 +1,6 @@
 pub mod chains;
 pub mod cose;
+pub mod credential;
 pub mod crypto;
 pub mod curve;
 pub mod eip712;
@@ -11,7 +12,8 @@ pub mod rlp;
 pub mod traits;
 pub mod zeroizing;
 
-pub use chains::{signer_for_chain, signer_for_chain_type};
+pub use chains::{credential_scheme, signer_for_chain, signer_for_chain_type};
+pub use credential::{CredentialKey, CredentialScheme};
 pub use crypto::{
     decrypt, encrypt, encrypt_with_hkdf, CipherParams, CryptoEnvelope, CryptoError, HkdfKdfParams,
     KdfParams, KdfParamsVariant,

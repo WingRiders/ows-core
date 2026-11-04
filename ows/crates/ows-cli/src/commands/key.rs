@@ -4,12 +4,13 @@ use crate::{audit, CliError};
 pub fn create(
     name: &str,
     wallet_names: &[String],
+    credential_names: &[String],
     policy_ids: &[String],
     expires_at: Option<&str>,
 ) -> Result<(), CliError> {
-    if wallet_names.is_empty() {
+    if wallet_names.is_empty() && credential_names.is_empty() {
         return Err(CliError::InvalidArgs(
-            "at least one --wallet is required".into(),
+            "at least one --wallet or --credential is required".into(),
         ));
     }
 
@@ -20,12 +21,19 @@ pub fn create(
         wallet_ids.push(info.id);
     }
 
+    let mut credential_ids = Vec::with_capacity(credential_names.len());
+    for name_or_id in credential_names {
+        let info = ows_lib::get_credential(name_or_id, None)?;
+        credential_ids.push(info.id);
+    }
+
     // Read passphrase (needed to decrypt wallet mnemonics for re-encryption)
     let passphrase = super::read_passphrase();
 
-    let (token, key_file) = ows_lib::key_ops::create_api_key(
+    let (token, key_file) = ows_lib::key_ops::create_api_key_with_credentials(
         name,
         &wallet_ids,
+        &credential_ids,
         policy_ids,
         &passphrase,
         expires_at,
@@ -36,7 +44,12 @@ pub fn create(
 
     println!("API key created: {}", key_file.id);
     println!("Name:            {name}");
-    println!("Wallets:         {}", wallet_ids.join(", "));
+    if !wallet_ids.is_empty() {
+        println!("Wallets:         {}", wallet_ids.join(", "));
+    }
+    if !credential_ids.is_empty() {
+        println!("Credentials:     {}", credential_ids.join(", "));
+    }
     if !policy_ids.is_empty() {
         println!("Policies:        {}", policy_ids.join(", "));
     }
@@ -60,14 +73,21 @@ pub fn list() -> Result<(), CliError> {
     }
 
     for k in &keys {
-        println!("ID:       {}", k.id);
-        println!("Name:     {}", k.name);
-        println!("Wallets:  {}", k.wallet_ids.join(", "));
-        println!("Policies: {}", k.policy_ids.join(", "));
-        if let Some(ref exp) = k.expires_at {
-            println!("Expires:  {exp}");
+        // Labels only widen for a key that holds credentials, so a wallet-only key prints as before.
+        let w = if k.credential_ids.is_empty() { 10 } else { 13 };
+        println!("{:<w$}{}", "ID:", k.id);
+        println!("{:<w$}{}", "Name:", k.name);
+        if !k.wallet_ids.is_empty() || k.credential_ids.is_empty() {
+            println!("{:<w$}{}", "Wallets:", k.wallet_ids.join(", "));
         }
-        println!("Created:  {}", k.created_at);
+        if !k.credential_ids.is_empty() {
+            println!("{:<w$}{}", "Credentials:", k.credential_ids.join(", "));
+        }
+        println!("{:<w$}{}", "Policies:", k.policy_ids.join(", "));
+        if let Some(ref exp) = k.expires_at {
+            println!("{:<w$}{exp}", "Expires:");
+        }
+        println!("{:<w$}{}", "Created:", k.created_at);
         println!();
     }
 
@@ -83,8 +103,7 @@ pub fn revoke(id: &str, confirm: bool) -> Result<(), CliError> {
         ));
     }
 
-    let key = ows_lib::key_store::load_api_key(id, None)?;
-    ows_lib::key_store::delete_api_key(id, None)?;
+    let key = ows_lib::key_ops::revoke_api_key(id, None)?;
 
     audit::log_api_key_revoked(&key.id, &key.name, &key.wallet_ids);
 

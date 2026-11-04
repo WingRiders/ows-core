@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,6 +27,12 @@ import {
   createApiKey,
   listApiKeys,
   revokeApiKey,
+  createCredential,
+  importCredential,
+  listCredentials,
+  getCredential,
+  deleteCredential,
+  signWithCredential,
 } from '../index.js';
 
 describe('@open-wallet-standard/core', () => {
@@ -694,5 +700,153 @@ describe('@open-wallet-standard/core', () => {
     revokeApiKey(key.id, vaultDir);
     deletePolicy('test-hash-base-only', vaultDir);
     deleteWallet(wallet.id, vaultDir);
+  });
+
+  // ---- Credentials ----
+
+  const ACCOUNT = 'a19612afc371b1a4d2fc2410377da895ff7ca406e74449b75dcc32a2b6df7964';
+  const COLOR = '5cd36fe5ed159246257b476bb67bc8266290581ef3844fcabd7c134b3f8b03ea';
+  const RECIPIENT = 'b0c1d2e3f405162738495a6b7c8d9eafb0c1d2e3f405162738495a6b7c8d9e00';
+
+  const withdrawUnshielded = () => JSON.stringify({
+    scheme: 'midnight:account:auth:v1',
+    account: ACCOUNT,
+    circuit: 'withdraw_unshielded',
+    args: [
+      { type: 'Bytes<32>', value: COLOR },
+      { type: 'Uint<128>', value: '3000000' },
+      { type: 'UserAddress', value: `0x${RECIPIENT}` },
+    ],
+    witnesses: [],
+    authNonce: '3',
+  });
+
+  it('creates, lists, signs with and deletes a credential', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      const cred = createCredential('passport-device', 'midnight', null, 'pw', dir);
+      assert.equal(cred.name, 'passport-device');
+      assert.equal(cred.chain, 'midnight');
+      assert.equal(cred.origin, 'generated');
+      assert.equal(cred.publicKey.length, 128);
+      assert.equal(Object.keys(cred).some((k) => /secret|crypto/i.test(k)), false);
+
+      const listed = listCredentials(dir);
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0].publicKey, cred.publicKey);
+
+      const got = getCredential('passport-device', dir);
+      assert.equal(got.id, cred.id);
+
+      const sig = signWithCredential('passport-device', 'midnight', withdrawUnshielded(), 'pw', dir);
+      assert.deepEqual(Object.keys(sig).sort(), ['grindNonce', 'pk', 'scheme', 'sigR', 'sigS', 'signature']);
+      assert.equal(sig.scheme, 'midnight:account:auth:v1');
+      assert.equal(sig.pk, cred.publicKey);
+      assert.match(sig.sigR, /^[0-9a-f]{128}$/);
+      assert.match(sig.sigS, /^[0-9a-f]{64}$/);
+      assert.ok(Number.isInteger(sig.grindNonce));
+      assert.equal(sig.signature, sig.sigR + sig.sigS + sig.grindNonce.toString(16).padStart(16, '0'));
+
+      deleteCredential(cred.id, dir);
+      assert.equal(listCredentials(dir).length, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('imports a credential and marks it imported', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      const cred = importCredential('imported', 'midnight', '00'.repeat(31) + '7b', null, 'pw', dir);
+      assert.equal(cred.origin, 'imported');
+      assert.equal(cred.publicKey.length, 128);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a request for the wrong chain', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      createCredential('c', 'midnight', null, 'pw', dir);
+      assert.throws(() => signWithCredential('c', 'evm', withdrawUnshielded(), 'pw', dir));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('createApiKey accepts credentialIds and still works without them', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      const wallet = createWallet('w', 'pw', 12, dir);
+      const cred = createCredential('c', 'midnight', null, 'pw', dir);
+      const plain = createApiKey('plain', [wallet.id], [], 'pw', null, dir);
+      assert.ok(plain.token.startsWith('ows_key_'));
+      const key = createApiKey('with-cred', [wallet.id], [], 'pw', null, dir, [cred.id]);
+      const sig = signWithCredential('c', 'midnight', withdrawUnshielded(), key.token, dir);
+      assert.equal(sig.pk, cred.publicKey);
+      assert.match(sig.sigR, /^[0-9a-f]{128}$/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('listApiKeys returns no encrypted copies for a key holding a credential', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      const wallet = createWallet('w', 'pw', 12, dir);
+      const cred = createCredential('c', 'midnight', null, 'pw', dir);
+      createApiKey('with-cred', [wallet.id], [], 'pw', null, dir, [cred.id]);
+      const [listed] = listApiKeys(dir);
+      assert.deepEqual(listed.credential_ids, [cred.id]);
+      assert.equal('wallet_secrets' in listed, false);
+      assert.equal('credential_secrets' in listed, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes the same audit records for credentials as the CLI', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    try {
+      const cred = createCredential('c', 'midnight', null, 'pw', dir);
+      signWithCredential('c', 'midnight:preview', withdrawUnshielded(), 'pw', dir);
+      const key = createApiKey('agent', [], [], 'pw', null, dir, [cred.id]);
+      revokeApiKey(key.id, dir);
+      deleteCredential('c', dir);
+      const log = readFileSync(join(dir, 'logs', 'audit.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(log.map((r) => r.operation), [
+        'credential_created',
+        'credential_signed',
+        'create_api_key',
+        'revoke_api_key',
+        'credential_deleted',
+      ]);
+      assert.equal(log[1].chain_id, 'midnight:preview');
+      assert.match(log[1].details, new RegExp(`^credential_id=${cred.id}, .*actor=owner, outcome=allowed$`));
+      assert.equal(log.some((r) => 'wallet_id' in r), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not echo a secret passed in the scheme slot', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ows-node-cred-'));
+    const secret = '0123456789abcdef0123456789abcdef';
+    try {
+      assert.throws(
+        () => createCredential('c', 'midnight', secret, 'pw', dir),
+        (e) => !e.message.includes(secret),
+      );
+      assert.throws(
+        () => importCredential('c', 'midnight', 'jubjub', secret, 'pw', dir),
+        (e) => !e.message.includes(secret),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

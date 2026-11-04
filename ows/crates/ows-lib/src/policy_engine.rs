@@ -76,6 +76,15 @@ fn eval_expires_at(policy_id: &str, timestamp: &str, ctx: &PolicyContext) -> Pol
     }
 }
 
+/// Contract identifiers are hex that is written with or without `0x` and in either case.
+fn normalize_contract(contract: &str) -> String {
+    contract
+        .strip_prefix("0x")
+        .or_else(|| contract.strip_prefix("0X"))
+        .unwrap_or(contract)
+        .to_lowercase()
+}
+
 fn eval_allowed_typed_data_contracts(
     policy_id: &str,
     contracts: &[String],
@@ -96,8 +105,11 @@ fn eval_allowed_typed_data_contracts(
         Some(c) => c,
     };
 
-    let contract_lower = contract.to_lowercase();
-    if contracts.iter().any(|c| c.to_lowercase() == contract_lower) {
+    let contract_normalized = normalize_contract(contract);
+    if contracts
+        .iter()
+        .any(|c| normalize_contract(c) == contract_normalized)
+    {
         PolicyResult::allowed()
     } else {
         PolicyResult::denied(
@@ -254,6 +266,7 @@ mod tests {
             },
             timestamp: "2026-03-22T10:35:22Z".to_string(),
             typed_data: None,
+            credential_id: None,
         }
     }
 
@@ -643,5 +656,34 @@ mod tests {
         );
         let result = evaluate_policies(&[policy], &ctx);
         assert!(result.allow);
+    }
+
+    #[test]
+    fn allowlist_matches_with_or_without_0x() {
+        let mut ctx = base_context();
+        let td = |c: &str| TypedDataContext {
+            verifying_contract: Some(c.to_string()),
+            domain_chain_id: None,
+            primary_type: "T".into(),
+            domain_name: None,
+            domain_version: None,
+            raw_json: "{}".into(),
+        };
+        let allow = |list: &str| vec![list.to_string()];
+        for (ctx_side, list_side) in [
+            ("0xABCDEF", "abcdef"),
+            ("abcdef", "0XAbCdEf"),
+            ("abcdef", "ABCDEF"),
+            ("0xabcdef", "0xabcdef"),
+        ] {
+            ctx.typed_data = Some(td(ctx_side));
+            assert!(
+                eval_allowed_typed_data_contracts("p", &allow(list_side), &ctx).allow,
+                "{ctx_side} vs {list_side}"
+            );
+        }
+        ctx.typed_data = Some(td("abcdef"));
+        assert!(!eval_allowed_typed_data_contracts("p", &allow("0x0abcdef"), &ctx).allow);
+        assert!(!eval_allowed_typed_data_contracts("p", &allow("0x0xabcdef"), &ctx).allow);
     }
 }

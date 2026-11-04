@@ -1,4 +1,4 @@
-use ows_core::ChainType;
+use ows_core::{ChainType, CredentialOrigin};
 use ows_signer::SignOutput;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,37 @@ pub struct WalletInfo {
     pub name: String,
     pub accounts: Vec<AccountInfo>,
     pub created_at: String,
+}
+
+/// Binding-friendly credential information (no crypto envelope exposed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialInfo {
+    pub id: String,
+    pub name: String,
+    pub chain: ChainType,
+    pub scheme: String,
+    pub public_key: String,
+    pub origin: CredentialOrigin,
+    pub created_at: String,
+}
+
+/// A credential's signature over an authorisation request.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialSignature {
+    /// Hex of the scheme's signature bytes.
+    pub signature: String,
+    /// The signature as the named fields the verifier takes it in, as the scheme renders them.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CredentialSignature {
+    /// The object `ows credential sign --json` and the bindings return: the scheme's fields,
+    /// and the signature bytes as hex under `signature`.
+    pub fn to_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut json = self.fields.clone();
+        json.insert("signature".to_string(), self.signature.clone().into());
+        json
+    }
 }
 
 /// Result from a signing operation.

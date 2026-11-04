@@ -18,5 +18,10 @@
 | `ows key create` | Create an API key for agent access |
 | `ows key list` | List all API keys |
 | `ows key revoke` | Revoke an API key |
+| `ows credential create` | Generate a credential key, a signer that is not a wallet |
+| `ows credential import` | Import an existing credential key |
+| `ows credential list` | List all credentials |
+| `ows credential sign` | Sign an authorisation request with a credential |
+| `ows credential delete` | Delete a credential |
 | `ows update` | Update ows and bindings |
 | `ows uninstall` | Remove ows from the system |

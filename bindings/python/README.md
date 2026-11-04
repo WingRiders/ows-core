@@ -58,7 +58,13 @@ print(sig["signature"])
 | `list_policies(vault_path?)` | List all registered policies |
 | `get_policy(id, vault_path?)` | Get a single policy by ID |
 | `delete_policy(id, vault_path?)` | Delete a policy by ID |
-| `create_api_key(name, wallet_ids, policy_ids, passphrase, expires_at?, vault_path?)` | Create an API key for agent access |
+| `create_api_key(name, wallet_ids, policy_ids, passphrase, expires_at?, vault_path?, credential_ids?)` | Create an API key for agent access |
+| `create_credential(name, chain, scheme?, passphrase?, vault_path?)` | Generate a credential (on Midnight, a MIP-0013 device key) |
+| `import_credential(name, chain, secret_hex, scheme?, passphrase?, vault_path?)` | Import a credential key |
+| `list_credentials(vault_path?)` | List credentials (public keys only) |
+| `get_credential(name_or_id, vault_path?)` | Get a credential by name or ID |
+| `delete_credential(name_or_id, vault_path?)` | Delete a credential |
+| `sign_with_credential(name_or_id, chain, request, passphrase?, vault_path?)` | Sign an authorisation request with a credential; returns the signature as hex under `signature` and as the scheme's fields, for a Midnight device key `{signature, scheme, pk, sigR, sigS, grindNonce}` |
 | `list_api_keys(vault_path?)` | List all API keys (tokens never returned) |
 | `revoke_api_key(id, vault_path?)` | Revoke an API key |
 
