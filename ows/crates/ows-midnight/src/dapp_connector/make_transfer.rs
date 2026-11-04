@@ -116,6 +116,7 @@ pub(super) fn plan(
         crypto_provider,
         &bytes,
         req.pay_fees,
+        &crate::contracts::Disclosures::default(),
         vault_path,
     )?;
     Ok(TransferPlan { preimage, plan })

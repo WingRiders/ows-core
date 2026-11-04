@@ -2,7 +2,9 @@ use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
 use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
 use midnight_base_crypto::time::Timestamp;
-use midnight_coin_structure::coin::{Info as CoinInfo, QualifiedInfo, ShieldedTokenType};
+use midnight_coin_structure::coin::{
+    Commitment as CoinCommitment, Info as CoinInfo, QualifiedInfo, ShieldedTokenType,
+};
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{
     DustActions, DustLocalState, DustOutput, DustPublicKey, DustRegistration, DustSecretKey,
@@ -660,6 +662,18 @@ impl MidnightCryptoProvider {
         &self,
         offer: &ZswapOffer<P, InMemoryDB>,
     ) -> Vec<(ShieldedTokenType, u128)> {
+        self.recognize_shielded_coins(offer)
+            .into_iter()
+            .map(|(_, token, value)| (token, value))
+            .collect()
+    }
+
+    /// The same receipts as [`Self::recognize_shielded_inflow`], each with the commitment it is
+    /// recognized by — so a coin a contract pays the wallet can be matched to the contract's claim.
+    pub fn recognize_shielded_coins<P: midnight_storage::Storable<InMemoryDB>>(
+        &self,
+        offer: &ZswapOffer<P, InMemoryDB>,
+    ) -> Vec<(CoinCommitment, ShieldedTokenType, u128)> {
         offer
             .outputs
             .iter_deref()
@@ -669,7 +683,8 @@ impl MidnightCryptoProvider {
                     .as_ref()
                     .and_then(|ciph| self.shielded_keys.try_decrypt(ciph))?;
                 let recipient = transfer::Recipient::User(self.shielded_keys.coin_public_key());
-                (ci.commitment(&recipient) == o.coin_com).then_some((ci.type_, ci.value))
+                (ci.commitment(&recipient) == o.coin_com)
+                    .then_some((o.coin_com, ci.type_, ci.value))
             })
             .collect()
     }
@@ -788,17 +803,18 @@ impl MidnightCryptoProvider {
         })
     }
 
-    /// Build proof-preimage dust spends sufficient to cover `fee_dust`. Offline — no proving, no
-    /// network. Shared by [`Self::authorize_dust`] (which proves them) and [`Self::mock_dust_spends`]
-    /// (which mock-proves them). The preimages carry the dust secret key, so they never leave the
-    /// provider.
+    /// Build proof-preimage dust spends sufficient to cover `fee_dust`, at least `min_spends` of them.
+    /// Offline — no proving, no network. Shared by [`Self::authorize_dust`] (which proves them) and
+    /// [`Self::mock_dust_spends`] (which mock-proves them). The preimages carry the dust secret key, so
+    /// they never leave the provider.
     fn build_preimage_dust_spends(
         &self,
         st: DustLocalState<InMemoryDB>,
         fee_dust: u128,
+        min_spends: usize,
         dust_ctime: Timestamp,
     ) -> Result<Vec<DustSpend<ProofPreimageMarker, InMemoryDB>>, SignerError> {
-        select_dust_spends_preimage(st, &self.dust_sk, fee_dust, dust_ctime)
+        select_dust_spends_preimage(st, &self.dust_sk, fee_dust, min_spends, dust_ctime)
     }
 
     /// Authorize the wallet's DUST fee. Builds proof-preimage dust spends using the already-held
@@ -882,8 +898,12 @@ impl MidnightCryptoProvider {
         plan: &DustSpendPlan,
     ) -> Result<Intent<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>, SignerError>
     {
-        let spends =
-            self.build_preimage_dust_spends(dust_state.clone(), plan.fee_dust, plan.dust_ctime)?;
+        let spends = self.build_preimage_dust_spends(
+            dust_state.clone(),
+            plan.fee_dust,
+            plan.min_spends,
+            plan.dust_ctime,
+        )?;
         let dust_preimage: DustActions<MnSignature, ProofPreimageMarker, InMemoryDB> =
             DustActions {
                 spends: spends.into_iter().collect(),
@@ -954,37 +974,69 @@ fn mock_prove_shielded_offer(
 /// sizing and inclusion belongs in `fee_dust` itself — the balancer sizes it with
 /// `Transaction::fees_with_margin`, which prices the ledger's per-block fee adjustment properly
 /// rather than guessing a multiplier.
+///
+/// At least `min_spends` notes are spent. The mempool refuses a transaction that takes longer to check
+/// than its size allows, and a DUST spend adds more allowance (its proof's bytes) than checking it
+/// costs, so the balancer asks for another spend when one note would cover the fee but leave the
+/// transaction too small. Each extra note pays one star of the fee, taken from an earlier spend, so the
+/// total stays exactly `fee_dust` and no spend pays nothing.
 fn select_dust_spends_preimage(
     mut st: DustLocalState<InMemoryDB>,
     dsk: &DustSecretKey,
     fee_dust: u128,
+    min_spends: usize,
     dust_ctime: Timestamp,
 ) -> Result<Vec<DustSpend<ProofPreimageMarker, InMemoryDB>>, SignerError> {
+    let notes: Vec<_> = st
+        .utxos()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|qdo| {
+            let gen_info = st.generation_info(&qdo)?;
+            let value = DustOutput::from(qdo).updated_value(&gen_info, dust_ctime, &st.params);
+            (value > 0).then_some((qdo, value))
+        })
+        .collect();
+
     let mut need = fee_dust;
-    let mut spends = Vec::new();
-    for qdo in st.utxos().collect::<Vec<_>>() {
+    let mut fees = Vec::new();
+    for (_, value) in &notes {
         if need == 0 {
             break;
         }
-        let Some(gen_info) = st.generation_info(&qdo) else {
-            continue;
-        };
-        let value = DustOutput::from(qdo).updated_value(&gen_info, dust_ctime, &st.params);
-        if value == 0 {
-            continue;
-        }
-        let v_fee = u128::min(value, need);
-        let (st2, spend) = st
-            .spend(dsk, &qdo, v_fee, dust_ctime)
-            .map_err(|e| SignerError::SigningFailed(format!("dust spend build failed: {e}")))?;
-        st = st2;
-        spends.push(spend);
-        need = need.saturating_sub(v_fee);
+        let v_fee = u128::min(*value, need);
+        fees.push(v_fee);
+        need -= v_fee;
     }
     if need > 0 {
         return Err(SignerError::SigningFailed(
             "insufficient DUST balance to pay fees via a proof-bearing dust spend".into(),
         ));
+    }
+    if min_spends > notes.len() {
+        return Err(SignerError::SigningFailed(format!(
+            "{min_spends} DUST spends are needed, and the wallet's DUST is in {} note{}",
+            notes.len(),
+            if notes.len() == 1 { "" } else { "s" }
+        )));
+    }
+    while fees.len() < min_spends {
+        let donor = fees.iter_mut().find(|v_fee| **v_fee > 1).ok_or_else(|| {
+            SignerError::SigningFailed(format!(
+                "a fee of {fee_dust} cannot be split across {min_spends} DUST spends"
+            ))
+        })?;
+        *donor -= 1;
+        fees.push(1);
+    }
+
+    let mut spends = Vec::with_capacity(fees.len());
+    for ((qdo, _), v_fee) in notes.iter().zip(fees) {
+        let (st2, spend) = st
+            .spend(dsk, qdo, v_fee, dust_ctime)
+            .map_err(|e| SignerError::SigningFailed(format!("dust spend build failed: {e}")))?;
+        st = st2;
+        spends.push(spend);
     }
     Ok(spends)
 }
@@ -995,6 +1047,9 @@ fn select_dust_spends_preimage(
 /// transaction's real intent so the proved section splices back in.
 pub struct DustSpendPlan {
     pub fee_dust: u128,
+    /// The fewest DUST spends the section may hold — more than `fee_dust` alone needs when the
+    /// transaction must grow to get past the mempool (see [`select_dust_spends_preimage`]).
+    pub min_spends: usize,
     pub dust_ctime: Timestamp,
     pub intent_ttl: Timestamp,
     pub seg_id: u16,
@@ -1456,7 +1511,7 @@ mod tests {
             .unwrap();
         let st = DustLocalState::new(midnight_ledger::dust::INITIAL_DUST_PARAMETERS);
         let e = provider
-            .build_preimage_dust_spends(st, 10_000, Timestamp::from_secs(2_000))
+            .build_preimage_dust_spends(st, 10_000, 1, Timestamp::from_secs(2_000))
             .unwrap_err();
         assert!(
             format!("{e}").contains("insufficient DUST balance"),
@@ -1472,6 +1527,16 @@ mod tests {
         night_value: u128,
         ctime: Timestamp,
     ) -> DustLocalState<InMemoryDB> {
+        dust_state_with_notes(dsk, &[night_value], ctime)
+    }
+
+    /// [`dust_state_with_one_note`] for several notes, one per NIGHT value, each backed by its own
+    /// NIGHT and generating from `ctime`.
+    fn dust_state_with_notes(
+        dsk: &DustSecretKey,
+        night_values: &[u128],
+        ctime: Timestamp,
+    ) -> DustLocalState<InMemoryDB> {
         use midnight_base_crypto::hash::HashOutput;
         use midnight_ledger::dust::{
             dust_nonce, DustGenerationInfo, InitialNonce, QualifiedDustOutput,
@@ -1481,37 +1546,43 @@ mod tests {
         use midnight_ledger::structure::TransactionHash;
 
         let owner = DustPublicKey::from(dsk.clone());
-        let backing_night = InitialNonce(HashOutput([7u8; 32]));
-        let event = Event {
-            source: EventSource {
-                transaction_hash: TransactionHash(HashOutput([0u8; 32])),
-                logical_segment: 0,
-                physical_segment: 0,
-            },
-            content: EventDetails::DustInitialUtxo {
-                output: QualifiedDustOutput {
-                    initial_value: night_value
-                        .saturating_mul(INITIAL_DUST_PARAMETERS.night_dust_ratio as u128),
-                    owner,
-                    nonce: dust_nonce(&backing_night, 0, dsk),
-                    seq: 0,
-                    ctime,
-                    backing_night,
-                    mt_index: 0,
-                },
-                generation: DustGenerationInfo {
-                    value: night_value,
-                    owner,
-                    nonce: backing_night,
-                    dtime: Timestamp::from_secs(u64::MAX),
-                },
-                generation_index: 0,
-                block_time: ctime,
-            },
-        };
+        let events: Vec<_> = night_values
+            .iter()
+            .enumerate()
+            .map(|(i, &night_value)| {
+                let backing_night = InitialNonce(HashOutput([7u8 + i as u8; 32]));
+                Event {
+                    source: EventSource {
+                        transaction_hash: TransactionHash(HashOutput([i as u8; 32])),
+                        logical_segment: 0,
+                        physical_segment: 0,
+                    },
+                    content: EventDetails::DustInitialUtxo {
+                        output: QualifiedDustOutput {
+                            initial_value: night_value
+                                .saturating_mul(INITIAL_DUST_PARAMETERS.night_dust_ratio as u128),
+                            owner,
+                            nonce: dust_nonce(&backing_night, 0, dsk),
+                            seq: 0,
+                            ctime,
+                            backing_night,
+                            mt_index: i as u64,
+                        },
+                        generation: DustGenerationInfo {
+                            value: night_value,
+                            owner,
+                            nonce: backing_night,
+                            dtime: Timestamp::from_secs(u64::MAX),
+                        },
+                        generation_index: i as u64,
+                        block_time: ctime,
+                    },
+                }
+            })
+            .collect();
         DustLocalState::new(INITIAL_DUST_PARAMETERS)
-            .replay_events(dsk, std::iter::once(&event))
-            .expect("replay the initial dust utxo")
+            .replay_events(dsk, events.iter())
+            .expect("replay the initial dust utxos")
     }
 
     /// The selected spends pay **exactly** the requested fee — no cushion. Every star of `v_fee` is
@@ -1534,11 +1605,58 @@ mod tests {
 
         for fee in [1u128, 10_000, 999_999] {
             let spends = provider
-                .build_preimage_dust_spends(st.clone(), fee, now)
+                .build_preimage_dust_spends(st.clone(), fee, 1, now)
                 .unwrap_or_else(|e| panic!("build spends for fee {fee}: {e}"));
             let paid: u128 = spends.iter().map(|s| s.v_fee).sum();
             assert_eq!(paid, fee, "spends must pay exactly the requested fee");
         }
+    }
+
+    /// A transaction the mempool refuses for its size needs the bytes of another DUST spend, even when
+    /// one note covers the fee. Asked for more spends, the selection spends more notes, each paying
+    /// part of the fee, and together they still pay exactly the fee.
+    #[test]
+    fn dust_spends_reach_the_requested_count_and_still_pay_exactly_the_fee() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&signing_key_blob()))
+            .unwrap();
+        let ctime = Timestamp::from_secs(1_000);
+        let night = midnight_ledger::structure::STARS_PER_NIGHT;
+        let st = dust_state_with_notes(&provider.dust_sk, &[night, night, night], ctime);
+        let now = Timestamp::from_secs(1_000 + 3_600);
+
+        for (min_spends, expected) in [(0, 1), (1, 1), (2, 2), (3, 3)] {
+            let spends = provider
+                .build_preimage_dust_spends(st.clone(), 10_000, min_spends, now)
+                .unwrap_or_else(|e| panic!("build {min_spends} spends: {e}"));
+            assert_eq!(spends.len(), expected, "min_spends {min_spends}");
+            assert!(spends.iter().all(|s| s.v_fee > 0), "every spend pays");
+            let paid: u128 = spends.iter().map(|s| s.v_fee).sum();
+            assert_eq!(paid, 10_000, "min_spends {min_spends}");
+        }
+    }
+
+    /// More spends than the wallet has notes cannot be built; the error says how many notes there are,
+    /// since the owner's way out is to hold their DUST in more notes, not to get more of it.
+    #[test]
+    fn dust_spends_beyond_the_wallets_notes_are_refused() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&signing_key_blob()))
+            .unwrap();
+        let ctime = Timestamp::from_secs(1_000);
+        let st = dust_state_with_one_note(
+            &provider.dust_sk,
+            midnight_ledger::structure::STARS_PER_NIGHT,
+            ctime,
+        );
+        let e = provider
+            .build_preimage_dust_spends(st, 10_000, 2, Timestamp::from_secs(1_000 + 3_600))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("2 DUST spends are needed, and the wallet's DUST is in 1 note"),
+            "{e}"
+        );
     }
 
     /// `recognize_shielded_inflow` picks up exactly the zswap outputs routed to this wallet — the

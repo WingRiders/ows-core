@@ -1,0 +1,17 @@
+pragma language_version 0.26;
+
+// (d) shielded deposit: the dApp creates a coin addressed to this contract, the
+// circuit claims it with receiveShielded, and the wallet must fund the coin
+// with its own shielded inputs (as the playground's deposit_shielded does).
+
+import CompactStandardLibrary;
+
+export ledger deposits: Counter;
+
+constructor() {
+}
+
+export circuit deposit_shielded(coin: ShieldedCoinInfo): [] {
+  receiveShielded(disclose(coin));
+  deposits.increment(1);
+}

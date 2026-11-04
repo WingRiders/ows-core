@@ -779,8 +779,9 @@ imbalance, funds the merged tx's DUST fee, seals its half, and `Transaction::mer
   unshielded offer, or an imbalance in a fallible segment is refused, since that segment could
   fail on its own while the taker's payment stands.
 - The maker must both give and want a token, in whatever form it arrives (MIP-0006): a give-only
-  or want-only transaction is refused, as is one already balanced. So is a maker built for another
-  network, before the taker's half is proven.
+  or want-only transaction is refused. One already balanced leaves the taker only its fee, so it
+  is completed only with `payFees: true` (a sponsor's half, below) and refused otherwise. A
+  maker built for another network is refused too, before the taker's half is proven.
 - Before it plans its half, the taker checks the maker against the chain tip, as MIP-0005 asks of a
   receiver. It refuses an offer whose earliest intent TTL is less than a minute past the tip, since
   the merged transaction could not land in time. It refuses one whose proofs or signatures do not
@@ -803,9 +804,11 @@ imbalance, funds the merged tx's DUST fee, seals its half, and `Transaction::mer
   its own intent spends, so the taker's half also spends that coin and returns it whole. Both halves
   sit in the guaranteed section, and every NIGHT coin either side spends or receives there adds to the
   time the node takes to check the merged transaction. A merge that moves several NIGHT coins can take
-  longer than its size allows (the time-to-dismiss bound) and is refused before proving. An unshielded
-  token swapped for NIGHT that the taker pays from one NIGHT coin fits with one DUST spend; shielded
-  coins on either side add proof bytes that raise the bound.
+  longer than its size allows (the time-to-dismiss bound); the taker then adds a DUST spend per round
+  from another of its notes, as for the mempool wall under `balanceUnsealedTransaction`, and is refused
+  before proving only when its DUST is in too few notes. An unshielded token swapped for NIGHT that the
+  taker pays from one NIGHT coin fits with one DUST spend; shielded coins on either side add proof
+  bytes that raise the bound.
 
 #### `balanceUnsealedTransaction`
 
@@ -815,6 +818,39 @@ seals. This is the original method (and the default when `method` is absent).
 
 - A `proof-preimage` transaction is **rejected** with a precise "out-of-spec, not
   unsupported" message — the dApp must prove its own part first.
+- The transaction may carry **contract calls** — a single call or a whole call tree. The
+  wallet funds whatever value the calls take in (a contract's unshielded intake, a shielded coin
+  the dApp sends a contract) and claims whatever they pay out, counting each movement of its own
+  value once however many contracts it passes through.
+- **`disclose`** (an OWS extension, optional) — what the tooling that built the calls reveals
+  about them, so a policy can judge what a call *asks*, not just whom it calls:
+
+  ```json
+  { "method": "balanceUnsealedTransaction", "tx": "…",
+    "disclose": {
+      "calls": [ { "input":  { "value": ["3930", "0102…20"], "alignment": [ … ] },
+                   "output": { "value": ["3930"], "alignment": [ … ] },
+                   "communicationCommitmentRand": "73…",
+                   "address": "2afd…", "entryPoint": "record" } ],
+      "coins": [ { "nonce": "986e…", "color": "1ff3…", "value": "1000" } ] } }
+  ```
+
+  A call's arguments are private inputs to its proof, so the transaction does not carry them —
+  but every Compact circuit proves that the call's public **communication commitment** is
+  `transient_commit(input ‖ output, rand)`. The tooling holds all three (it built the call: they
+  are what the JS ledger API's `ContractCallPrototype` takes), so the wallet recomputes the
+  commitment and accepts the arguments only for the call they open. `input`/`output` are
+  `AlignedValue`s in the JS API's shape with each atom hex-encoded; `rand` is the hex the API's
+  `communicationCommitmentRandomness()` returned (midnight-js draws a root call's inside
+  `createUnprovenLedgerCallTx`). A `coins` entry opens a shielded coin a contract in the
+  transaction claims, the same way, through its coin commitment. A disclosure that opens nothing
+  in the transaction is **refused** before any policy runs — the tooling claimed something about
+  the transaction that is not true of it.
+- A **sponsored** transaction — nothing for the wallet to fund or claim, and `payFees: false`
+  because someone else pays the fee — is passed through **untouched**: the same bytes come
+  back sealed, the wallet's effects are empty, and it signs nothing. The policy pass still sees
+  the transaction's contract calls. A sponsor completes it with `balanceSealedTransaction`,
+  merging in the half that pays the fee.
 
 > The only **rejected-by-design** input is a `proof-preimage` maker (above) — out of spec,
 > not unsupported. `makeIntent` shielded inputs, the sealed-maker merge, and the MIP-0005 /
@@ -837,6 +873,42 @@ rotated through a fallible offer so change returns cleanly. Which mode a plan ta
 DUST it can burn and the registration it signs reach the policy pass as `chain_extra.fee` and
 `chain_extra.dust_registrations` (see
 [How the wallet pays](#how-the-wallet-pays--chain_extrafee-and-chain_extradust_registrations)).
+
+**The mempool wall.** The node's fee gate does not only charge the fee: it refuses a
+transaction whose validation and guaranteed work take longer to check than its size buys it —
+`OutsideTimeToDismiss`, at least `min_time_to_dismiss` (15ms on stagenet), plus
+`time_to_dismiss_per_byte` (2µs) per byte above that. Fee sizing judges every candidate DUST
+section exactly as the gate does and grows it until it passes. A small contract call is where
+this bites: `Single.record` costs 6.3ms to check, but a registration needs the wallet's NIGHT
+input and its change in the guaranteed section — another 9.5ms — and adds almost no bytes, so
+a 3.6kB transaction at 15.9ms is refused. A proof-bearing DUST spend adds the bytes that lift
+the bound (the same call funded by one spend lands at 8.6ms of 15ms), so the fee loop falls
+back to one. A spend adds about 3kB, which buys 6ms, and costs 2.3ms to check, so when one spend
+still leaves a transaction refused for its size, the loop adds another, each extra DUST note
+paying one star of the fee. A higher fee alone would not do it: the note that covered the fee
+covers a higher one too, and the section stays the same size. A 10 NIGHT deposit into a
+contract, funded by one NIGHT input and its change, takes 15.1ms with one spend against 15ms
+for its 6.9kB, and 17.4ms against 20.1ms with two. A wallet whose DUST sits in fewer notes than
+that needs is refused before proving, with the wall's numbers and its note count. Because a
+wallet-funded call tree runs close to the wall (the landed `pay_from_wallet` payment used 20.3ms
+of 21.9ms), the coin reserved for a registration is dropped from the guaranteed section whenever
+the fee ends up paid by a spend instead — it would back nothing and cost another 3.4ms. A wallet
+that can pay only by registration (no generated DUST yet) cannot get such a transaction past the
+mempool; it is refused **before proving**, with the node's own numbers:
+
+```
+paying the DUST fee by registration: the node would refuse it at the mempool
+(OutsideTimeToDismiss): it takes 15.866ms to check, a 3635-byte transaction may take at most
+15.000ms; paying it with a DUST spend instead: …
+```
+
+**A DUST spend's time.** A spend proof carries the roots of the wallet's synced dust trees, and the
+node checks it against the roots it recorded for the last block at or before the spend's `ctime`.
+The synced state and the chain tip are two reads of the indexer, so `ctime` is the tip's time only
+when the tip's dust roots (`dustCommitmentMerkleTreeRoot`, `dustGenerationMerkleTreeRoot`) are the
+synced state's; otherwise it is the time of the last block the sync folded. A `ctime` taken from the
+tip alone was refused (ledger error 170, `InvalidDustSpendProof`) whenever a block that changed the
+dust trees landed between the two reads — intermittently, and a resend passed.
 
 ### The effect model (what the policy seam gates on)
 
@@ -1331,12 +1403,17 @@ performs, so a policy can gate on *who* as well as *how much*:
 ```json
 { "segment": 0,
   "kind": "call",
-  "address": "9f3c…",
-  "entry_point": "swap",
-  "sent_to":       [["0000…", "1000"]],
-  "received_from": [["a71b…", "25"]],
-  "payouts": [{ "token": "a71b…", "amount": "25", "recipient": "3e08…",
-                "recipient_kind": "user", "to_wallet": true }] }
+  "address": "6af1…",
+  "entry_point": "pay_from_wallet",
+  "call": "73cb…",
+  "verifier_key": "2db0d5ab…",
+  "arguments": { "input":  [ { "type": "bytes", "length": 32, "hex": "0000…" },
+                             { "type": "bytes", "length": 16, "hex": "40420f…", "uint": "1000000" } ],
+                 "output": [] },
+  "sent_to":       [["0000…", "1000000"]],
+  "received_from": [["0000…", "1000000"]],
+  "payouts":       [ { "token": "0000…", "amount": "1000000", "recipient": "da21…",
+                      "recipient_kind": "contract", "to_wallet": false } ] }
 ```
 
 - **`segment`** — the segment this action executes in, same convention as the effects: `0`
@@ -1346,16 +1423,40 @@ performs, so a policy can gate on *who* as well as *how much*:
   rather than by where it sits in the list. Entry count tracks transcripts, not intents.
 - **`kind`** — `call`, `deploy`, or `maintain`. Only a `call` names an `entry_point`; a
   deploy or a maintenance update declares no value movement, so its amounts are empty.
-- **`sent_to` / `received_from`** — per token, the **total** value the contract's transcript
-  declares it takes in and pays out, as a decimal string like the effects' deltas. The names are
-  kept for compatibility, but neither is the wallet's own: `sent_to` is what every party to the
-  transaction pays the contract together, and `received_from` is what the contract pays out to
-  every recipient together, the wallet or not.
+- **`call`** / **`caller`** — a call's identity is its communication commitment (hex, as the
+  JS ledger API renders it); `caller` is the `call` of the call whose transcript claims this
+  one. A composed transaction is a **tree of calls**, and each record carries its own place in
+  it: a root call has no `caller`, every callee names its caller. The tree is judged whole —
+  the chain applies it all-or-nothing, so one unacceptable record should deny the transaction.
+- **`verifier_key`** — SHA-256 of the verifier key the ledger checks this call's proof against,
+  read from the contract's state on chain before the policy pass. It equals `sha256sum` of the
+  compiled `<circuit>.verifier`. A contract's maintenance authority can replace the key at the
+  same address, so an allow-list that should not follow an upgrade it never audited pins this.
+- **`arguments`** — the call's `input` (its arguments) and `output` (its result), present only
+  when the request [disclosed](#balanceunsealedtransaction) them and they opened the call's
+  commitment. Each is the value's atoms in declaration order: a `Uint<64>` is one 8-byte atom, a
+  `Bytes<32>` one 32-byte atom, a struct its fields' atoms; a byte atom carries its full-width
+  little-endian `hex` and, up to 16 bytes, the same bytes as a decimal `uint`, so a policy caps
+  an amount with an integer comparison. Without a disclosure there are no arguments — a policy
+  that constrains them should deny their absence.
+- **`sent_to` / `received_from`** — per token, the **total** unshielded value the contract's
+  transcript declares it takes in and pays out, as a decimal string like the effects' deltas. The
+  names are kept for compatibility, but neither is the wallet's own: `sent_to` is what every party
+  to the transaction pays the contract together, and `received_from` is what the contract pays out
+  to every recipient together, the wallet or not.
 - **`payouts`** — who `received_from` goes to: one entry per token and recipient the call's
   transcript declares an unshielded payout to, with the recipient's hex address (a user's address
   hash, or a contract's address), `recipient_kind` (`user` or `contract`) and `to_wallet`, whether
   the recipient is the wallet's own unshielded address. A deploy or a maintenance update has none.
-  Mints and shielded transfers a call declares are not reported here.
+  Value moving between two contracts of a tree shows on both: the payer's payout names the payee,
+  the payee's `sent_to` takes it in — so a policy can tell the value that stays inside the tree
+  from the value that comes from outside it.
+- **`minted`** — per token, the unshielded value the contract mints (its own token type).
+- **`shielded`** — the coins the contract takes in (`sent_to`) and creates (`received_from`),
+  each by commitment, with `token` and `value` when the wallet could open it (a disclosed coin,
+  or one paid to the wallet itself), how many of its own coins it `spends`, and what it
+  `minted`. A shielded coin's value is hidden in its commitment, so an unopened coin is a
+  commitment only.
 
 Only the `balance*` methods can carry contract actions — they complete a transaction someone
 else authored. `makeTransfer` and `makeIntent` build the wallet's own transfer from the
@@ -1371,16 +1472,28 @@ request alone, so their `contracts` is always empty.
 > `received_from` covers its `sent_to` would allow one that pays everything to a third party:
 > if a rule must reason about a payout, read the `payouts` with `to_wallet`.
 
+A policy that allows one circuit of one contract, pinned to the code it audited, and caps its
+first argument — denying any other call anywhere in the tree:
+
 ```python
 #!/usr/bin/env python3
 import sys, json
+ALLOWED = {"2afd….record": {"verifier_key": "8ca590c7…", "max_amount": 20000}}
 ctx = json.load(sys.stdin)
-extra = (ctx.get("transaction") or {}).get("chain_extra") or {}
-called = {c["address"] for c in extra.get("contracts", []) if c["kind"] == "call"}
-unknown = called - {"9f3c…"}
-print(json.dumps({"allow": not unknown,
-                  "reason": f"unapproved contracts: {sorted(unknown)}"}))
+extra = (ctx.get("transaction") or {}).get("chain_extra")
+def verdict(allow, reason): print(json.dumps({"allow": allow, "reason": reason})); sys.exit()
+if extra is None: verdict(True, "first pass")
+for c in extra["contracts"]:
+    if c["kind"] != "call": continue
+    rule = ALLOWED.get(f"{c['address']}.{c['entry_point']}")
+    if rule is None: verdict(False, f"{c['entry_point']} is not allowed")
+    if c.get("verifier_key") != rule["verifier_key"]: verdict(False, "the contract changed")
+    if not c.get("arguments"): verdict(False, "arguments not disclosed")
+    if int(c["arguments"]["input"][0]["uint"]) > rule["max_amount"]: verdict(False, "over the cap")
+verdict(True, "allowed")
 ```
+
+`e2e/midnight-contract-calls.sh` runs exactly this kind of policy against real calls on stagenet.
 
 ### How the wallet pays — `chain_extra.fee` and `chain_extra.dust_registrations`
 

@@ -1,0 +1,45 @@
+{
+  "calls": [
+    {
+      "address": "2afdd190bea07e2001467ce3b0ac2d269c91c58ae7c99f47e6c6aa297593481f",
+      "entryPoint": "record",
+      "input": {
+        "value": [
+          "3930",
+          "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          },
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 32
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [
+          "3930"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 8
+            }
+          }
+        ]
+      },
+      "communicationCommitmentRand": "7370c59b0315439b44e4645107c7ad99076312369c3e66e65e5f4e40e94402f223"
+    }
+  ]
+}

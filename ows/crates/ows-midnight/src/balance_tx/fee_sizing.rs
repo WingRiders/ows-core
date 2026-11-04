@@ -186,31 +186,84 @@ fn sync_spendable_dust_state(
     ))
 }
 
-/// Re-read the chain tip once the dust state is synced.
+/// Re-read the chain tip once the dust state is synced, and pick the `ctime` a DUST spend from that
+/// state must carry.
 ///
 /// The sync replays every ledger event the wallet has not seen — a handful when its snapshot is warm,
 /// tens of thousands on a cold cache — and the node re-prices fees *every block* while it runs. The tip
 /// handed to the sizing call was read before that replay, so pricing against it spends the whole drift
 /// margin before sizing even begins. The same staleness bounds a dust spend: its `ctime` has to land
 /// inside the ledger's validity window (`OutOfDustValidityWindow`), which a long replay can walk out of.
+/// So the fee and the intent TTL derive from the fresher tip — leaving only proving and submission
+/// between pricing and inclusion, which is what [`FEE_BLOCKS_MARGIN`] is sized for.
 ///
-/// So the tip is re-read here, and the fee, the dust ctime and the intent TTL all derive from the
-/// fresher one — leaving only proving and submission between pricing and inclusion, which is what
-/// [`FEE_BLOCKS_MARGIN`] is sized for.
+/// The `ctime` is held to the synced state: see [`aligned_dust_ctime`].
 fn reprice_after_sync(
     indexer_url: &str,
-    priced_at: Timestamp,
+    priced_at: Option<Timestamp>,
+    dust_state: &DustLocalState<InMemoryDB>,
 ) -> Result<(LedgerParameters, Timestamp), std::io::Error> {
-    let (params, tip_secs) = crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
-    let fresh = Timestamp::from_secs(tip_secs);
+    let tip = crate::block_on(crate::ledger_params::fetch_indexer_tip_with_dust_roots(
+        indexer_url,
+    ))?;
     // How far the chain ran while we synced is the whole reason this call exists, so say it: a warm
     // sync moves the tip by seconds, a cold one by hours, and the second case is unreadable from a
     // fee number alone.
-    let drift = tip_secs.saturating_sub(priced_at.to_secs());
+    let drift = priced_at.map_or(0, |t| tip.timestamp_secs.saturating_sub(t.to_secs()));
     if drift > 0 {
         eprintln!("[ows-midnight] dust sync advanced the tip by {drift}s; re-pricing the DUST fee");
     }
-    Ok((params, fresh))
+    let ctime = aligned_dust_ctime(dust_state, tip.timestamp_secs, tip.dust_roots.as_ref());
+    let grace = tip.ledger_parameters.dust.dust_grace_period;
+    if Timestamp::from_secs(tip.timestamp_secs) - ctime > grace {
+        return Err(err(format!(
+            "the synced DUST state ends at {}s, more than the {}s the node accepts behind the tip \
+             ({}s); sync again",
+            ctime.to_secs(),
+            grace.as_seconds(),
+            tip.timestamp_secs
+        )));
+    }
+    Ok((tip.ledger_parameters, ctime))
+}
+
+/// The `ctime` a DUST spend proved from `dust_state` must carry. The proof carries the state's two dust
+/// Merkle roots, and the node checks it against the roots it recorded for the last block at or before
+/// `ctime`. The state and the tip come from two reads of the indexer, so a block that changed the dust
+/// trees between them leaves them disagreeing, and a `ctime` taken from the tip then makes the node
+/// refuse the spend (ledger error 170, `InvalidDustSpendProof`) — intermittently, since only blocks that
+/// change the dust trees matter, and a resend re-syncs and re-reads both. So the tip's time is used only
+/// when the tip's roots are the state's (the chain has not changed the dust trees since the sync);
+/// otherwise the state's own `sync_time`, the time of the last block it folded, whose roots it carries
+/// by construction.
+pub(super) fn aligned_dust_ctime(
+    dust_state: &DustLocalState<InMemoryDB>,
+    tip_secs: u64,
+    tip_roots: Option<&crate::ledger_params::DustRoots>,
+) -> Timestamp {
+    let tip = Timestamp::from_secs(tip_secs);
+    match (tip_roots, local_dust_roots(dust_state)) {
+        (Some(tip_roots), Some(local)) if *tip_roots == local => tip.max(dust_state.sync_time),
+        _ => dust_state.sync_time,
+    }
+}
+
+/// The synced state's dust roots, serialized as the indexer reports them; `None` before the trees are
+/// hashed.
+fn local_dust_roots(
+    dust_state: &DustLocalState<InMemoryDB>,
+) -> Option<crate::ledger_params::DustRoots> {
+    use midnight_serialize::Serializable as _;
+    let hex_of = |root: Option<_>| {
+        let root: transient_crypto::merkle_tree::MerkleTreeDigest = root?;
+        let mut bytes = Vec::new();
+        root.serialize(&mut bytes).ok()?;
+        Some(hex::encode(bytes))
+    };
+    Some(crate::ledger_params::DustRoots {
+        commitment: hex_of(dust_state.commitment_tree.root())?,
+        generation: hex_of(dust_state.generating_tree.root())?,
+    })
 }
 
 /// The transaction context a DUST fee section is sized against: the proven standard tx and its
@@ -288,37 +341,109 @@ impl DustFeePlan {
     }
 }
 
-/// Whether `tx`'s DUST section covers the fee the node will charge. Mirrors the node's fee gate
-/// (`well_formed` computes `fees(params, true)` then rejects any segment/token whose `balance` of that
-/// fee goes negative): unlike `tx_balance_imbalances` (which uses `balance(None)` and so ignores the
-/// fee entirely), this charges the real fee, so a DUST section that only satisfies structural balance
-/// but under-covers the fee is correctly rejected. `fees(_, true)` enforces the guaranteed-compute
-/// time-to-dismiss bound; a tx still too small to satisfy it is reported as not-covered so the caller
-/// keeps growing the section (the proof-bearing spend adds the bytes that lift the bound).
-fn dust_section_covers_fee<B>(
-    tx: &Transaction<MnSig, ProofMarker, B, InMemoryDB>,
+/// How the node's fee gate judges a transaction. The gate (`well_formed`) computes `fees(params,
+/// true)` — which refuses a transaction whose validation and guaranteed work take longer to check than
+/// its size buys it (`OutsideTimeToDismiss`: at least `min_time_to_dismiss`, more for larger
+/// transactions), the mempool wall a small call plus a funding offer runs into — then rejects any
+/// segment/token whose `balance` of that fee goes negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FeeGate {
+    /// Admitted: the DUST section covers the fee.
+    Covered,
+    /// The DUST section pays less than the fee.
+    Uncovered,
+    /// Refused whatever DUST it carries: checking it takes `time_to_dismiss`, a transaction of `size`
+    /// bytes may take at most `allowed`. Only more bytes per unit of work get it through — a
+    /// proof-bearing DUST spend adds both, a registration adds work and almost no bytes.
+    TooCostlyForItsSize {
+        time_to_dismiss: midnight_base_crypto::cost_model::CostDuration,
+        allowed: midnight_base_crypto::cost_model::CostDuration,
+        size: u64,
+    },
+}
+
+impl std::fmt::Display for FeeGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeeGate::Covered => write!(f, "the DUST section covers the fee"),
+            FeeGate::Uncovered => write!(f, "the DUST section pays less than the fee"),
+            FeeGate::TooCostlyForItsSize {
+                time_to_dismiss,
+                allowed,
+                size,
+            } => write!(
+                f,
+                "the node would refuse it at the mempool (OutsideTimeToDismiss): it takes \
+                 {time_to_dismiss:?} to check, a {size}-byte transaction may take at most {allowed:?}"
+            ),
+        }
+    }
+}
+
+/// Judge `tx` as the node's fee gate does — see [`FeeGate`]. Unlike `tx_balance_imbalances` (which
+/// uses `balance(None)` and so ignores the fee entirely), this charges the real fee, so a DUST section
+/// that only satisfies structural balance but under-covers the fee is correctly rejected.
+pub(super) fn fee_gate<T: FeeChecked>(
+    tx: &T,
     params: &LedgerParameters,
-) -> Result<bool, std::io::Error>
-where
-    B: midnight_storage::Storable<InMemoryDB>
-        + midnight_ledger::structure::PedersenDowngradeable<InMemoryDB>
-        + midnight_serialize::Serializable,
-    Transaction<MnSig, ProofMarker, B, InMemoryDB>: midnight_serialize::Serializable,
-{
+) -> Result<FeeGate, std::io::Error> {
     use midnight_ledger::error::FeeCalculationError;
-    let fee = match tx.fees(params, true) {
+    let fee = match tx.gate_fees(params) {
         Ok(f) => f,
-        // `OutsideTimeToDismiss` means the tx's guaranteed compute exceeds the size-derived
-        // time-to-dismiss bound — not coverable by more dust as-is, so report not-covered and let the
-        // caller grow the section (the proof-bearing spend adds the bytes that lift the bound).
-        Err(FeeCalculationError::OutsideTimeToDismiss { .. }) => return Ok(false),
+        Err(FeeCalculationError::OutsideTimeToDismiss {
+            time_to_dismiss,
+            allowed_time_to_dismiss,
+            size,
+        }) => {
+            return Ok(FeeGate::TooCostlyForItsSize {
+                time_to_dismiss,
+                allowed: allowed_time_to_dismiss,
+                size,
+            })
+        }
         Err(e) => return Err(err(format!("DUST fee check failed: {e:?}"))),
     };
-    let balances = tx
-        .balance(Some(fee))
-        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?;
-    Ok(balances.into_iter().all(|(_, bal)| bal >= 0))
+    let covered = tx
+        .gate_balance(fee)
+        .map_err(|e| err(format!("transaction balance check failed: {e}")))?;
+    Ok(if covered {
+        FeeGate::Covered
+    } else {
+        FeeGate::Uncovered
+    })
 }
+
+/// The two ledger calls the fee gate makes, for an unsealed or a sealed transaction alike.
+pub(super) trait FeeChecked {
+    fn gate_fees(
+        &self,
+        params: &LedgerParameters,
+    ) -> Result<u128, midnight_ledger::error::FeeCalculationError>;
+    /// Whether every segment and token still balances once `fee` is charged.
+    fn gate_balance(&self, fee: u128) -> Result<bool, String>;
+}
+
+macro_rules! fee_checked {
+    ($binding:ty) => {
+        impl FeeChecked for Transaction<MnSig, ProofMarker, $binding, InMemoryDB> {
+            fn gate_fees(
+                &self,
+                params: &LedgerParameters,
+            ) -> Result<u128, midnight_ledger::error::FeeCalculationError> {
+                self.fees(params, true)
+            }
+            fn gate_balance(&self, fee: u128) -> Result<bool, String> {
+                Ok(self
+                    .balance(Some(fee))
+                    .map_err(|e| format!("{e:?}"))?
+                    .into_iter()
+                    .all(|(_, bal)| bal >= 0))
+            }
+        }
+    };
+}
+fee_checked!(PedersenRandomness);
+fee_checked!(PureGeneratorPedersen);
 
 /// Size the DUST fee section that balances the transaction, **without** real proving. The fee depends
 /// on the tx (dust-section bytes included), so estimate → build section → re-check, converging within
@@ -365,6 +490,13 @@ pub(super) fn size_dust_fee(
 
     // The dust state is expensive to sync, so pull it only when the spend fallback is first needed.
     let mut dust_state: Option<DustLocalState<InMemoryDB>> = None;
+    // The last time the gate refused a candidate for its size, not its fee — what to report when no
+    // candidate gets through, since "the fee is not covered" would send the caller after more DUST.
+    let mut wall: Option<FeeGate> = None;
+    // The same for a DUST-spend candidate, and the spends the next section must hold: a spend's proof
+    // adds more to what the mempool allows the transaction than checking it costs.
+    let mut spend_wall: Option<FeeGate> = None;
+    let mut min_spends = 1;
 
     for attempt in 0..MAX_FEE_ITERS {
         if let Some(reg) = try_registration_dust_actions(
@@ -385,21 +517,36 @@ pub(super) fn size_dust_fee(
                     intent_ttl,
                 ),
             );
-            if dust_section_covers_fee(&tx_check, &params)? {
-                return Ok((DustFeePlan::Registration(reg), intent_ttl));
+            match fee_gate(&tx_check, &params)? {
+                FeeGate::Covered => return Ok((DustFeePlan::Registration(reg), intent_ttl)),
+                refused @ FeeGate::TooCostlyForItsSize { .. } => wall = Some(refused),
+                FeeGate::Uncovered => {}
             }
         }
+        // Past here only a proof-bearing DUST spend can pay. When the registration was refused for its
+        // size, say so alongside whatever stops the spend: a wallet with no generated DUST cannot clear
+        // the wall at all, and that is the actionable part.
+        let with_wall = |e: std::io::Error| match &wall {
+            Some(refused) => err(format!(
+                "paying the DUST fee by registration: {refused}; paying it with a DUST spend \
+                 instead: {e}"
+            )),
+            None => e,
+        };
 
         if dust_state.is_none() {
-            dust_state = Some(sync_spendable_dust_state(
-                ctx.indexer_url,
-                ctx.crypto_provider,
-                ctx.scope,
-            )?);
+            dust_state = Some(
+                sync_spendable_dust_state(ctx.indexer_url, ctx.crypto_provider, ctx.scope)
+                    .map_err(with_wall)?,
+            );
             // The sync just moved the chain on; re-price against where it actually is now. The loop
             // is self-correcting from here — a fee target the fresher params outgrow simply fails the
             // coverage check below and is raised on the next attempt.
-            let (fresh_params, fresh_ctime) = reprice_after_sync(ctx.indexer_url, dust_ctime)?;
+            let (fresh_params, fresh_ctime) = reprice_after_sync(
+                ctx.indexer_url,
+                Some(dust_ctime),
+                dust_state.as_ref().expect("dust state synced above"),
+            )?;
             params = fresh_params;
             dust_ctime = fresh_ctime;
             intent_ttl = chain_aligned_intent_ttl(dust_ctime);
@@ -407,6 +554,7 @@ pub(super) fn size_dust_fee(
         let synced = dust_state.as_ref().expect("dust state synced above");
         let plan = DustSpendPlan {
             fee_dust: fee_target,
+            min_spends,
             dust_ctime,
             intent_ttl,
             seg_id: ctx.seg_id,
@@ -415,7 +563,13 @@ pub(super) fn size_dust_fee(
         let dust_actions = ctx
             .crypto_provider
             .mock_dust_spends(synced, &plan, &ctx.stx.network_id)
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| match &spend_wall {
+                Some(refused) => err(format!(
+                    "cannot pay for this transaction: {refused}; another DUST spend would lift \
+                     it, but {e}"
+                )),
+                None => with_wall(err(e.to_string())),
+            })?;
         let tx_check = wrap_proven_standard(
             ctx.stx,
             ctx.seg_id,
@@ -427,21 +581,32 @@ pub(super) fn size_dust_fee(
                 intent_ttl,
             ),
         );
-        if dust_section_covers_fee(&tx_check, &params)? {
-            return Ok((
-                DustFeePlan::Spend {
-                    plan,
-                    dust_state: Box::new(synced.clone()),
-                    ledger_params: Box::new(params.clone()),
-                },
-                intent_ttl,
-            ));
+        match fee_gate(&tx_check, &params)? {
+            FeeGate::Covered => {
+                return Ok((
+                    DustFeePlan::Spend {
+                        plan,
+                        dust_state: Box::new(synced.clone()),
+                        ledger_params: Box::new(params.clone()),
+                    },
+                    intent_ttl,
+                ))
+            }
+            // A higher fee target does not grow the section when one note covers it, so ask for
+            // another spend outright.
+            refused @ FeeGate::TooCostlyForItsSize { .. } => {
+                spend_wall = Some(refused);
+                min_spends = dust_actions.spends.len() + 1;
+            }
+            FeeGate::Uncovered => {
+                wall = None;
+                spend_wall = None;
+            }
         }
 
         // Re-estimate against the section we just built — margined, and via `fees_with_margin`'s
-        // `enforce_time_to_dismiss: false`, so a tx still under the time-to-dismiss bound grows its
-        // section here instead of erroring out (which is what `dust_section_covers_fee` returning
-        // not-covered for `OutsideTimeToDismiss` asks the loop to do).
+        // `enforce_time_to_dismiss: false`, so a tx still over the time-to-dismiss bound is priced
+        // here instead of erroring out; the next section carries the extra spend that lifts it.
         let actual_fee = with_drift_margin(
             tx_check
                 .fees_with_margin(&params, FEE_BLOCKS_MARGIN)
@@ -455,6 +620,12 @@ pub(super) fn size_dust_fee(
             .max(fee_target.saturating_add(1))
             .max(dust_paid.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {
+            if let Some(refused) = spend_wall.or(wall) {
+                return Err(err(format!(
+                    "cannot pay for this transaction: {refused}, and {MAX_FEE_ITERS} DUST \
+                     sections did not lift it"
+                )));
+            }
             return Err(err(format!(
                 "failed to cover the DUST fee after {MAX_FEE_ITERS} attempts \
                  (target={fee_target}, paid={dust_paid}, fee={actual_fee})"
@@ -581,12 +752,18 @@ pub(crate) fn size_merge_registration_fee(
         };
         let merged =
             merged_with_taker_dust(maker, taker_base, dust_seg, Some(reg.clone()), intent_ttl)?;
-        if dust_section_covers_fee(&merged, ledger_params)? {
-            return Ok(Some(MergeRegistrationFee {
-                dust_actions: reg,
-                intent_ttl,
-                binding_commitment,
-            }));
+        match fee_gate(&merged, ledger_params)? {
+            FeeGate::Covered => {
+                return Ok(Some(MergeRegistrationFee {
+                    dust_actions: reg,
+                    intent_ttl,
+                    binding_commitment,
+                }))
+            }
+            // A registration adds work and almost no bytes, so a larger one never clears the wall; the
+            // taker pays with a DUST spend instead.
+            FeeGate::TooCostlyForItsSize { .. } => return Ok(None),
+            FeeGate::Uncovered => {}
         }
         fee_target = with_drift_margin(
             merged
@@ -619,8 +796,6 @@ pub(crate) fn size_merge_dust_fee(
     dust_seg: u16,
     binding_commitment: PedersenRandomness,
     crypto_provider: &MidnightCryptoProvider,
-    dust_ctime: Timestamp,
-    ledger_params: &LedgerParameters,
     indexer_url: &str,
     scope: &SyncCacheScope,
 ) -> Result<MergeDustFee, std::io::Error> {
@@ -630,11 +805,8 @@ pub(crate) fn size_merge_dust_fee(
     // it once up front — then re-price, since the sync moved the chain on (see `reprice_after_sync`).
     // Doing this before the first estimate keeps every number below on the same, fresher tip.
     let dust_state = sync_spendable_dust_state(indexer_url, crypto_provider, scope)?;
-    let (ledger_params, dust_ctime) = match reprice_after_sync(indexer_url, dust_ctime) {
-        Ok(fresh) => fresh,
-        // A re-price failure is not worth losing the sync over: fall back to the tip the caller read.
-        Err(_) => (ledger_params.clone(), dust_ctime),
-    };
+    // No fallback to the tip the caller read: that `ctime` would not match the synced state's roots.
+    let (ledger_params, dust_ctime) = reprice_after_sync(indexer_url, None, &dust_state)?;
     let intent_ttl = chain_aligned_intent_ttl(dust_ctime);
 
     // First estimate: the merged fee with no DUST section yet.
@@ -648,9 +820,15 @@ pub(crate) fn size_merge_dust_fee(
             .map_err(|e| err(format!("merged DUST fee estimate failed: {e:?}")))?,
     );
 
+    // A merged transaction the gate refuses for its size gets one more DUST spend per round: a spend's
+    // proof adds more to what the mempool allows than checking it costs.
+    let mut spend_wall: Option<FeeGate> = None;
+    let mut min_spends = 1;
+
     for attempt in 0..MAX_FEE_ITERS {
         let plan = DustSpendPlan {
             fee_dust: fee_target,
+            min_spends,
             dust_ctime,
             intent_ttl,
             seg_id: dust_seg,
@@ -658,7 +836,13 @@ pub(crate) fn size_merge_dust_fee(
         };
         let dust_actions = crypto_provider
             .mock_dust_spends(&dust_state, &plan, &taker_base.network_id)
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| match &spend_wall {
+                Some(refused) => err(format!(
+                    "cannot pay for the merged transaction: {refused}; another DUST spend would \
+                     lift it, but {e}"
+                )),
+                None => err(e.to_string()),
+            })?;
         let merged = merged_with_taker_dust(
             maker,
             taker_base,
@@ -666,51 +850,44 @@ pub(crate) fn size_merge_dust_fee(
             Some(dust_actions.clone()),
             intent_ttl,
         )?;
-        // Charge the node's real fee, enforcing the time-to-dismiss bound as `well_formed` does.
-        let fee = match merged.fees(&ledger_params, true) {
-            Ok(fee) => fee,
-            // `OutsideTimeToDismiss` is a size-vs-compute bound, not a fee shortfall: checking the
-            // merged tx takes longer than its serialized size allows the node to spend dismissing it.
-            // A DUST spend adds more to that allowance than it costs to check only once the transaction
-            // is past the size floor, which can take several spends, so fail with the node's numbers
-            // rather than spinning the loop.
-            Err(e) if format!("{e:?}").contains("OutsideTimeToDismiss") => {
-                return Err(err(format!(
-                    "the merged transaction cannot satisfy the node's time-to-dismiss bound ({e:?}): \
-                     checking it takes longer than its size allows. Every NIGHT coin either side \
-                     spends or receives in the guaranteed section adds to that time, so a swap paid \
-                     from fewer NIGHT coins fits more easily; shielded coins on either side add proof \
-                     bytes that raise the bound."
-                )));
+        match fee_gate(&merged, &ledger_params)? {
+            FeeGate::Covered => {
+                return Ok(MergeDustFee {
+                    plan,
+                    dust_state: Box::new(dust_state),
+                    ledger_params,
+                })
             }
-            Err(e) => return Err(err(format!("merged DUST fee check failed: {e:?}"))),
-        };
-        let balances = merged
-            .balance(Some(fee))
-            .map_err(|e| err(format!("merged balance check failed: {e:?}")))?;
-        if balances.into_iter().all(|(_, bal)| bal >= 0) {
-            return Ok(MergeDustFee {
-                plan,
-                dust_state: Box::new(dust_state),
-                ledger_params,
-            });
+            refused @ FeeGate::TooCostlyForItsSize { .. } => {
+                spend_wall = Some(refused);
+                min_spends = dust_actions.spends.len() + 1;
+            }
+            FeeGate::Uncovered => spend_wall = None,
         }
 
-        // The DUST section under-covers the fee: grow the target — to the *margined* fee of the tx we
-        // just measured, so the next round's section survives the price drift too — and re-size.
+        // The DUST section under-covers the fee, or the next one carries another spend: grow the
+        // target — to the *margined* fee of the tx we just measured, so the next round's section
+        // survives the price drift too — and re-size.
+        let fee = merged
+            .fees(&ledger_params, false)
+            .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?;
         let margin_fee = with_drift_margin(
             merged
                 .fees_with_margin(&ledger_params, FEE_BLOCKS_MARGIN)
                 .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?,
-            merged
-                .fees(&ledger_params, false)
-                .map_err(|e| err(format!("merged DUST fee re-estimate failed: {e:?}")))?,
+            fee,
         );
         let dust_paid = sum_dust_v_fee(dust_actions.spends.iter_deref());
         fee_target = margin_fee
             .max(fee_target.saturating_add(1))
             .max(dust_paid.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {
+            if let Some(refused) = spend_wall {
+                return Err(err(format!(
+                    "cannot pay for the merged transaction: {refused}, and {MAX_FEE_ITERS} DUST \
+                     sections did not lift it"
+                )));
+            }
             return Err(err(format!(
                 "failed to cover the merged DUST fee after {MAX_FEE_ITERS} attempts \
                  (target={fee_target}, paid={dust_paid}, fee={fee})"
@@ -885,6 +1062,69 @@ mod tests {
             dust_spend_v_fee(7),
         ];
         assert_eq!(sum_dust_v_fee(spends.iter()), 3_507);
+    }
+
+    /// A synced dust state at `sync_time`, and the indexer's report of a tip whose dust roots are the
+    /// state's (`same`) or not.
+    fn synced_at(sync_time: u64) -> DustLocalState<InMemoryDB> {
+        let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
+        state.sync_time = Timestamp::from_secs(sync_time);
+        state
+    }
+
+    fn tip_roots(
+        state: &DustLocalState<InMemoryDB>,
+        same: bool,
+    ) -> crate::ledger_params::DustRoots {
+        let mut roots = local_dust_roots(state).expect("a blank tree is hashed");
+        if !same {
+            // A block after the sync added a dust commitment: the commitment tree's root moved.
+            roots.commitment = format!("73{}", "ab".repeat(32));
+        }
+        roots
+    }
+
+    /// The node checks a DUST spend proof against the dust roots of the last block at or before its
+    /// `ctime`, and the proof carries the synced state's roots. When no block has changed the dust trees
+    /// since the sync, the tip's roots are the state's and the tip's time is safe to use.
+    #[test]
+    fn a_spend_takes_the_tips_time_when_the_tip_has_the_synced_roots() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, true);
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, Some(&tip)),
+            Timestamp::from_secs(1_060)
+        );
+    }
+
+    /// A block that changed the dust trees landed between the sync and the tip read: a `ctime` at the
+    /// tip would check the proof against roots it was not built from (ledger error 170). The state's
+    /// own sync time names the block whose roots it carries.
+    #[test]
+    fn a_spend_takes_the_synced_states_time_when_the_tip_moved_the_dust_trees() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, false);
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, Some(&tip)),
+            Timestamp::from_secs(1_000)
+        );
+        // An indexer that does not report the roots cannot vouch for the tip either.
+        assert_eq!(
+            aligned_dust_ctime(&state, 1_060, None),
+            Timestamp::from_secs(1_000)
+        );
+    }
+
+    /// The tip read can also lag the sync (a stale replica): never step back behind the block the
+    /// state was synced to.
+    #[test]
+    fn a_lagging_tip_never_moves_the_spend_behind_the_synced_state() {
+        let state = synced_at(1_000);
+        let tip = tip_roots(&state, true);
+        assert_eq!(
+            aligned_dust_ctime(&state, 994, Some(&tip)),
+            Timestamp::from_secs(1_000)
+        );
     }
 
     /// The live-run trigger for the proof-bearing fallback: a fully dust-registered wallet has no

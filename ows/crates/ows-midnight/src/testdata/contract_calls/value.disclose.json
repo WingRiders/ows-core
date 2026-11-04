@@ -1,0 +1,66 @@
+{
+  "calls": [
+    {
+      "address": "da2172e0aef2418711220fada839e87e98dfecf4688832b2eb685c8a4ddf2ad6",
+      "entryPoint": "take_unshielded",
+      "input": {
+        "value": [
+          "",
+          "40420f"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 32
+            }
+          },
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 16
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [],
+        "alignment": []
+      },
+      "communicationCommitmentRand": "7360a2a095a199a47f87eb5f1c54d804de12af2e4961bd93b4172dc3959c8d4b45"
+    },
+    {
+      "address": "6af1a747a98ebaa9bb2d7914177cfa6dc075a0f5f8ceae5916dd60a72e545050",
+      "entryPoint": "pay_from_wallet",
+      "input": {
+        "value": [
+          "",
+          "40420f"
+        ],
+        "alignment": [
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 32
+            }
+          },
+          {
+            "tag": "atom",
+            "value": {
+              "tag": "bytes",
+              "length": 16
+            }
+          }
+        ]
+      },
+      "output": {
+        "value": [],
+        "alignment": []
+      },
+      "communicationCommitmentRand": "73df586d5d3a3276739e385394f7b5493c21d33e3c752c24c03a4736527fc3a66e"
+    }
+  ]
+}
