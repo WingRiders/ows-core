@@ -1,0 +1,39 @@
+pragma language_version 0.26;
+
+// (c) root of the value-moving pair. Unlike experiments/.../payer.compact the
+// value comes from the WALLET, not from an in-circuit mint:
+//
+//   pay_from_wallet      the root receives `amount` from the transaction's
+//                        unshielded inputs (the wallet must fund it), sends it
+//                        on to the Till and drives the Till's claim.
+//   forward_from_wallet  the root only calls Till.take_unshielded: the
+//                        SUB-call's unshielded intake is what the wallet funds.
+
+import CompactStandardLibrary;
+
+contract Till {
+  circuit take_unshielded(color: Bytes<32>, amount: Uint<128>): [];
+}
+
+export ledger till: Till;
+export ledger till_addr: ContractAddress;
+export ledger ops: Counter;
+
+constructor(t: Till, t_addr: ContractAddress) {
+  till = disclose(t);
+  till_addr = disclose(t_addr);
+}
+
+export circuit pay_from_wallet(color: Bytes<32>, amount: Uint<128>): [] {
+  const c = disclose(color);
+  const v = disclose(amount);
+  receiveUnshielded(c, v);
+  sendUnshielded(c, v, left<ContractAddress, UserAddress>(till_addr));
+  till.take_unshielded(c, v);
+  ops.increment(1);
+}
+
+export circuit forward_from_wallet(color: Bytes<32>, amount: Uint<128>): [] {
+  till.take_unshielded(disclose(color), disclose(amount));
+  ops.increment(1);
+}
