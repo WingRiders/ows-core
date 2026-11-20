@@ -86,6 +86,7 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Midnight | `midnight:mainnet` |
 | Midnight Preview | `midnight:preview` |
 | Midnight Preprod | `midnight:preprod` |
+| Midnight Stagenet | `midnight:stagenet` |
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
@@ -126,6 +127,7 @@ cardano-preview  → cip34:0-2
 midnight         → midnight:mainnet
 midnight-preview → midnight:preview
 midnight-preprod → midnight:preprod
+midnight-stagenet → midnight:stagenet
 ```
 
 Aliases MUST be resolved to full CAIP-2 identifiers before any processing. They MUST NOT appear in wallet files, policy files, or audit logs.
