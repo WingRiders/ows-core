@@ -167,7 +167,7 @@ ows policy delete --id base-only --confirm
 
 ### `ows key create`
 
-Create an API key for agent access to one or more wallets. The owner's passphrase is required to re-encrypt the mnemonic under the token.
+Create an API key for agent access to one or more wallets or credentials. The owner's passphrase is required to re-encrypt each secret under the token.
 
 ```bash
 ows key create --name "claude-agent" \
@@ -180,10 +180,13 @@ ows key create --name "claude-agent" \
 |------|-------------|
 | `--name <NAME>` | Key name (required) |
 | `--wallet <NAME>` | Wallet name or ID (repeatable) |
+| `--credential <NAME>` | Credential name or ID (repeatable) |
 | `--policy <ID>` | Policy ID to attach (repeatable) |
 | `--expires-at <TS>` | Optional expiry (ISO-8601) |
 
-Output includes the raw token (`ows_key_...`) — shown once. The agent uses this token in place of the passphrase.
+At least one `--wallet` or `--credential` is required. Output includes the raw token (`ows_key_...`), shown once. The agent uses this token in place of the passphrase.
+
+One key can hold wallets and credentials together. A credential always has an owner passphrase, while a wallet created by `ows wallet create` is sealed under the empty one, so a key with `--credential` opens each wallet as `ows sign` does, under the empty passphrase first, and the owner passphrase opens the rest.
 
 ### `ows key list`
 
@@ -191,7 +194,7 @@ Output includes the raw token (`ows_key_...`) — shown once. The agent uses thi
 ows key list
 ```
 
-Lists all keys with ID, name, wallets, policies, and creation time. Tokens are never displayed.
+Lists all keys with ID, name, wallets, credentials, policies, and creation time. Tokens are never displayed.
 
 ### `ows key revoke`
 
@@ -200,6 +203,73 @@ ows key revoke --id <key-id> --confirm
 ```
 
 Deletes the key file. The encrypted secret copy is gone — the token becomes useless.
+
+## Credential Commands
+
+A credential is a key that another account, such as a contract, registered as one of its signers. It is not a wallet. It has no addresses and no balance, its key is generated or imported and never derived, and it cannot be exported. Credentials live in `~/.ows/credentials/`, which no `ows wallet` or `ows sign` command reads. A wallet and a credential may share a name.
+
+A credential signs only the authorisation request its scheme accepts. The chain selects the scheme. The scheme, the request format, the signature's fields and the account flow for each chain are in that chain's document, for example [Midnight](midnight#account-device-keys-ows-credential).
+
+### `ows credential create`
+
+Generate a new credential key.
+
+```bash
+ows credential create --name "device-key" --chain <chain>
+```
+
+| Flag | Description |
+|------|-------------|
+| `--name <NAME>` | Credential name (required) |
+| `--chain <CHAIN>` | Chain the credential is for (required) |
+| `--scheme <SCHEME>` | Signature scheme. Defaults to the chain's scheme. |
+
+The key is encrypted under `OWS_PASSPHRASE`, or under a passphrase the command prompts for on a terminal. Unlike a wallet's, it may not be empty: under an empty passphrase anyone who can run `ows` on the vault would sign as the owner, past every token policy. An `ows_key_...` token is refused too. The command prints the ID, name, chain, scheme, origin and public key, then any step the scheme says comes next. Register the public key with the account that will accept it.
+
+### `ows credential import`
+
+Import an existing credential key. The secret, as hex, is read from `OWS_PRIVATE_KEY` or stdin. The accepted range is the scheme's.
+
+```bash
+OWS_PRIVATE_KEY=<hex> ows credential import --name "device-key" --chain <chain>
+```
+
+Takes the same flags and the same passphrase as `ows credential create`. The origin is recorded as `imported`. An imported key may also live elsewhere, such as another wallet, a device or a backup. OWS cannot stop another signer from using it, and its policies bind only this vault. The command prints a warning to this effect, and the scheme's next step as `create` does.
+
+### `ows credential list`
+
+```bash
+ows credential list
+```
+
+Lists each credential with its ID, name, chain, scheme, origin, public key and creation time. The key itself is never shown.
+
+### `ows credential sign`
+
+Sign an authorisation request with a credential.
+
+```bash
+ows credential sign --credential "device-key" --chain <chain>:<network> --request "$REQUEST"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--credential <NAME>` | Credential name or ID |
+| `--chain <CHAIN>` | Chain, as `<chain>:<network>`. It must be the credential's chain. |
+| `--request <JSON>` | The authorisation request, as JSON, in the scheme's format |
+| `--json` | Output the signature as the scheme's named fields |
+
+Without `--json` the command prints the signature as hex. With `--json` it prints a JSON object with the same hex under `signature` and the signature's parts in fields the scheme names. For Midnight those are `scheme` (the request's scheme identifier), `pk`, `sigR`, `sigS` and `grindNonce`. The chain and the request are checked against the credential's scheme before the key is decrypted. A request for another chain, or one the scheme rejects, fails without the passphrase being used.
+
+`OWS_PASSPHRASE` holds the owner's passphrase, or an `ows_key_...` token. With a token, every policy on the key runs before the key is decrypted, and the key must have been created with `--credential` for this credential. Each signature and each policy denial is written to the audit log; an attempt that fails for any other reason is not. When `OWS_PASSPHRASE` is unset the command prompts for it on a terminal, and without a terminal it fails. The variable is cleared from the process environment once read.
+
+### `ows credential delete`
+
+```bash
+ows credential delete --credential "device-key" --confirm
+```
+
+Removes the credential file and its ID and encrypted copy from every API key. The key cannot be recovered. Deleting does not undo any registration the account made for the public key. That is done on the account, using the chain's own mechanism, and the command prints the scheme's warning about it before it deletes, and when `--confirm` is missing.
 
 ## End-to-End Example: Agent Access
 
@@ -408,6 +478,8 @@ ows uninstall --purge  # also remove ~/.ows (all wallet data)
     <uuid>.json             # Encrypted wallet (AES-256-GCM + scrypt)
   policies/
     <id>.json               # Policy definitions (not secret)
+  credentials/
+    <uuid>.json             # Encrypted credential (one per credential)
   keys/
     <uuid>.json             # API key files (0600 permissions)
   logs/
